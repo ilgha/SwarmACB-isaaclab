@@ -57,7 +57,13 @@ def main():
         # run everything in inference mode
         with torch.inference_mode():
             # sample actions from -1 to 1
-            actions = 2 * torch.rand(env.action_space.shape, device=env.unwrapped.device) - 1
+            if callable(getattr(env, "action_space", None)):
+                actions = {
+                    agent: 2 * torch.rand(env.action_space(agent).shape, device=env.unwrapped.device) - 1
+                    for agent in env.possible_agents
+                }
+            else:
+                actions = 2 * torch.rand(env.action_space.shape, device=env.unwrapped.device) - 1
             # apply actions
             env.step(actions)
 

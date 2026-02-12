@@ -57,7 +57,13 @@ def main():
         # run everything in inference mode
         with torch.inference_mode():
             # compute zero actions
-            actions = torch.zeros(env.action_space.shape, device=env.unwrapped.device)
+            if callable(getattr(env, "action_space", None)):
+                actions = {
+                    agent: torch.zeros(env.action_space(agent).shape, device=env.unwrapped.device)
+                    for agent in env.possible_agents
+                }
+            else:
+                actions = torch.zeros(env.action_space.shape, device=env.unwrapped.device)
             # apply actions
             env.step(actions)
 
