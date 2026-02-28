@@ -354,36 +354,21 @@ class POCATrainer:
                 # (E, N, C, H, W) -> (E, N, C*H*W)
                 obs_stacked = obs_stacked.view(obs_stacked.shape[0], obs_stacked.shape[1], -1)
 
-            # ── sample actions from shared actor (ONE decision) ───
+            # ── sample actions from shared actor (batched over all agents) ──
+            # Reshape (E, N, obs) → (E*N, obs) for a SINGLE forward pass
+            flat_obs = obs_stacked.reshape(-1, obs_stacked.shape[-1])  # (E*N, obs)
+            dist = self.actor.get_dist(flat_obs)
+
             if self.discrete:
-                all_actions = torch.zeros(
-                    self.num_envs, self.num_agents, 1,
-                    device=self.device, dtype=torch.long,
-                )
-                all_log_probs = torch.zeros(
-                    self.num_envs, self.num_agents, 1, device=self.device,
-                )
-                for i, a in enumerate(agents):
-                    dist = self.actor.get_dist(obs_stacked[:, i])
-                    act = dist.sample()              # (E,) integers
-                    log_p = dist.log_prob(act)        # (E,)
-                    all_actions[:, i, 0] = act
-                    all_log_probs[:, i, 0] = log_p
+                flat_act = dist.sample()                       # (E*N,)
+                flat_logp = dist.log_prob(flat_act)            # (E*N,)
+                all_actions = flat_act.view(self.num_envs, self.num_agents, 1)
+                all_log_probs = flat_logp.view(self.num_envs, self.num_agents, 1)
             else:
-                all_actions = torch.zeros(
-                    self.num_envs, self.num_agents, self.act_dim,
-                    device=self.device,
-                )
-                all_log_probs = torch.zeros(
-                    self.num_envs, self.num_agents, self.act_dim,
-                    device=self.device,
-                )
-                for i, a in enumerate(agents):
-                    dist = self.actor.get_dist(obs_stacked[:, i])
-                    act = dist.sample()                        # (E, act_dim)
-                    log_p = dist.log_prob(act)                 # (E, act_dim)
-                    all_actions[:, i] = act
-                    all_log_probs[:, i] = log_p
+                flat_act = dist.sample()                       # (E*N, act_dim)
+                flat_logp = dist.log_prob(flat_act)            # (E*N, act_dim)
+                all_actions = flat_act.view(self.num_envs, self.num_agents, self.act_dim)
+                all_log_probs = flat_logp.view(self.num_envs, self.num_agents, self.act_dim)
 
             # ── critic: team value V(s) — obs only ────────────────
             team_val = self.critic.critic_pass(obs_stacked).squeeze(-1)  # (E,)
@@ -480,26 +465,29 @@ class POCATrainer:
 
                 MB, N = obs.shape[:2]
 
-                # ── policy loss (per-agent, per-dim, shared actor) ─
-                policy_loss = torch.tensor(0.0, device=self.device)
-                entropy_sum = torch.tensor(0.0, device=self.device)
+                # ── policy loss (batched over all agents, shared actor) ─
+                # Reshape (MB, N, obs) → (MB*N, obs) for single forward pass
+                flat_obs = obs.reshape(-1, obs.shape[-1])              # (MB*N, obs)
+                flat_act = actions.reshape(-1, actions.shape[-1])      # (MB*N, act_dim)
+                flat_logp, flat_ent = self.actor.evaluate(flat_obs, flat_act)
+                # flat_logp: (MB*N, act_dim), flat_ent: (MB*N,)
 
-                for i in range(N):
-                    # new_logp: (MB, act_dim), ent: (MB,)
-                    new_logp, ent = self.actor.evaluate(obs[:, i], actions[:, i])
+                # Reshape back to (MB, N, act_dim) and (MB, N)
+                new_logp_all = flat_logp.view(MB, N, -1)              # (MB, N, act_dim)
+                ent_all = flat_ent.view(MB, N)                        # (MB, N)
 
-                    # Per-dim advantage broadcast: (MB,) → (MB, 1)
-                    adv_i = advantages[:, i].unsqueeze(-1)  # (MB, 1)
+                # Per-dim advantage broadcast: (MB, N) → (MB, N, 1)
+                adv_expanded = advantages.unsqueeze(-1)               # (MB, N, 1)
 
-                    # Per-dim trust-region policy loss
-                    agent_policy_loss = trust_region_policy_loss(
-                        adv_i, new_logp, old_logp[:, i], current_eps,
-                    )
-                    policy_loss += agent_policy_loss
-                    entropy_sum += ent.mean()
-
-                policy_loss = policy_loss / N
-                mean_entropy = entropy_sum / N
+                # Per-dim trust-region policy loss (vectorized over agents)
+                # Flatten agent dim into batch: (MB*N, act_dim)
+                flat_adv = adv_expanded.reshape(-1, 1)
+                flat_new_logp = new_logp_all.reshape(-1, new_logp_all.shape[-1])
+                flat_old_logp = old_logp.reshape(-1, old_logp.shape[-1])
+                policy_loss = trust_region_policy_loss(
+                    flat_adv, flat_new_logp, flat_old_logp, current_eps,
+                )
+                mean_entropy = ent_all.mean()
 
                 # ── critic: recompute V and baselines ─────────────
                 new_tv = self.critic.critic_pass(obs).squeeze(-1)       # (MB,)

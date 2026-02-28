@@ -111,14 +111,12 @@ class EpuckSensors:
         # Initialize readings at 0 (no obstacle detected)
         prox_values = torch.zeros(E, N, 8, device=device)
 
-        # --- Detect walls (line segments) ---
-        if obstacle_segments is not None:
-            for (ax, ay, bx, by) in obstacle_segments:
-                # Ray-segment intersection for all (E, N, 8) rays
-                prox_values = self._raycast_segment(
-                    agent_pos, world_dx, world_dy, prox_values,
-                    ax, ay, bx, by,
-                )
+        # --- Detect walls (batched over ALL segments at once) ---
+        if obstacle_segments is not None and len(obstacle_segments) > 0:
+            prox_values = self._raycast_segments_batched(
+                agent_pos, world_dx, world_dy, prox_values,
+                obstacle_segments,
+            )
 
         # --- Detect other robots ---
         if all_agent_pos is not None and N > 1:
@@ -177,6 +175,66 @@ class EpuckSensors:
 
         return readings
 
+    def _raycast_segments_batched(
+        self,
+        origins: torch.Tensor,      # (E, N, 2)
+        dx: torch.Tensor,           # (E, N, 8)
+        dy: torch.Tensor,           # (E, N, 8)
+        readings: torch.Tensor,     # (E, N, 8)
+        segments: list[tuple[float, float, float, float]],
+    ) -> torch.Tensor:
+        """Batch ray-segment intersection for ALL wall segments at once.
+
+        Instead of looping over S segments, we build a (S, 4) tensor and
+        compute all intersections in a single vectorized operation:
+          origins broadcast: (E, N, 1, 2)
+          segments:          (S, 4) → broadcast to (1, 1, S, ...)
+          rays:              (E, N, 8) → (E, N, 1, 8)
+        Result:              (E, N, S, 8) → reduce to (E, N, 8) via max
+        """
+        S = len(segments)
+        device = origins.device
+
+        # Build segment tensor (S, 4): [ax, ay, bx, by]
+        seg_t = torch.tensor(segments, dtype=torch.float32, device=device)  # (S, 4)
+        seg_ax = seg_t[:, 0].view(1, 1, S, 1)  # (1, 1, S, 1)
+        seg_ay = seg_t[:, 1].view(1, 1, S, 1)
+        seg_bx = seg_t[:, 2].view(1, 1, S, 1)
+        seg_by = seg_t[:, 3].view(1, 1, S, 1)
+
+        # Segment vectors
+        sx = seg_bx - seg_ax  # (1, 1, S, 1)
+        sy = seg_by - seg_ay
+
+        # Ray origins: (E, N, 1, 1)
+        ox = origins[:, :, 0:1].unsqueeze(2)  # (E, N, 1, 1)
+        oy = origins[:, :, 1:2].unsqueeze(2)
+
+        # Ray directions: (E, N, 1, 8)
+        rdx = dx.unsqueeze(2)  # (E, N, 1, 8)
+        rdy = dy.unsqueeze(2)
+
+        # Denominator: dx * sy - dy * sx → (E, N, S, 8)
+        denom = rdx * sy - rdy * sx
+        valid = denom.abs() > 1e-8
+
+        # t = ((ax - ox) * sy - (ay - oy) * sx) / denom
+        t = ((seg_ax - ox) * sy - (seg_ay - oy) * sx) / (denom + 1e-12)
+        # u = ((ax - ox) * dy - (ay - oy) * dx) / denom
+        u = ((seg_ax - ox) * rdy - (seg_ay - oy) * rdx) / (denom + 1e-12)
+
+        # Valid hit: t in [0, prox_range], u in [0, 1], not parallel
+        hit = valid & (t >= 0) & (t <= self.prox_range) & (u >= 0) & (u <= 1)
+
+        # Reading = 1 - (distance / range), 0 where no hit
+        new_reading = torch.where(hit, 1.0 - t / self.prox_range, torch.zeros_like(t))
+
+        # Max over segments dim → (E, N, 8)
+        seg_max, _ = new_reading.max(dim=2)
+        readings = torch.max(readings, seg_max)
+
+        return readings
+
     def _detect_robots_proximity(
         self,
         agent_pos: torch.Tensor,     # (E, N, 2) this agent's position
@@ -186,37 +244,42 @@ class EpuckSensors:
         all_pos: torch.Tensor,        # (E, N, 2) all robots
         robot_radius: float,
     ) -> torch.Tensor:
-        """Detect other robots in proximity sensor rays."""
+        """Detect other robots in proximity sensor rays (fully vectorized).
+
+        Uses pairwise (E, N, N) operations instead of looping over N robots.
+        """
         E, N = agent_pos.shape[:2]
+        device = agent_pos.device
 
-        for j in range(N):
-            # Vector from each agent to robot j
-            diff_x = all_pos[:, j:j+1, 0] - agent_pos[:, :, 0]  # (E, N)
-            diff_y = all_pos[:, j:j+1, 1] - agent_pos[:, :, 1]
-            dist = torch.sqrt(diff_x ** 2 + diff_y ** 2 + 1e-12)
+        # Pairwise vectors: (E, N, N) — diff[i,j] = robot_j - robot_i
+        diff_x = all_pos[:, :, 0].unsqueeze(1) - agent_pos[:, :, 0].unsqueeze(2)  # (E, N, N)
+        diff_y = all_pos[:, :, 1].unsqueeze(1) - agent_pos[:, :, 1].unsqueeze(2)
+        dist = torch.sqrt(diff_x ** 2 + diff_y ** 2 + 1e-12)  # (E, N, N)
 
-            # Skip self (distance ~ 0)
-            is_self = dist < 1e-4  # (E, N)
+        # Masks
+        is_self = dist < 1e-4                                    # (E, N, N)
+        in_range = dist < (self.prox_range + robot_radius)       # (E, N, N)
 
-            # Check if robot j is within prox_range
-            in_range = dist < (self.prox_range + robot_radius)
+        # Angular alignment with each of 8 sensors
+        # dx: (E, N, 8), diff_x: (E, N, N)
+        # We need dot product for each sensor with each target robot:
+        # (E, N, 8, 1) * (E, N, 1, N) → (E, N, 8, N)
+        dot = (dx.unsqueeze(-1) * diff_x.unsqueeze(2)
+               + dy.unsqueeze(-1) * diff_y.unsqueeze(2))        # (E, N, 8, N)
+        cos_angle = dot / (dist.unsqueeze(2) + 1e-8)            # (E, N, 8, N)
 
-            # For each of 8 sensors, check angular alignment
-            # Dot product of ray direction with direction to robot j
-            dot = dx * diff_x.unsqueeze(-1) + dy * diff_y.unsqueeze(-1)  # (E, N, 8)
-            # Normalize by distance
-            cos_angle = dot / (dist.unsqueeze(-1) + 1e-8)
+        # Hit: cos_angle > cos(15°), in range, not self
+        angular_hit = cos_angle > 0.9659                         # (E, N, 8, N)
+        hit_mask = (in_range.unsqueeze(2) & angular_hit
+                    & ~is_self.unsqueeze(2))                     # (E, N, 8, N)
 
-            # Hit if cos_angle > ~cos(15°) — narrow cone
-            angular_hit = cos_angle > 0.9659  # cos(15°)
+        # Reading: 1 - dist/range, clamped
+        reading_val = (1.0 - dist.unsqueeze(2) / (self.prox_range + robot_radius)).clamp(0, 1)
+        new_reading = torch.where(hit_mask, reading_val, torch.zeros_like(reading_val))
 
-            hit = in_range.unsqueeze(-1) & angular_hit & ~is_self.unsqueeze(-1)
-            new_reading = torch.where(
-                hit,
-                (1.0 - dist.unsqueeze(-1) / (self.prox_range + robot_radius)).clamp(0, 1),
-                torch.zeros_like(readings),
-            )
-            readings = torch.max(readings, new_reading)
+        # Max over all target robots → (E, N, 8)
+        robot_max, _ = new_reading.max(dim=-1)
+        readings = torch.max(readings, robot_max)
 
         return readings
 

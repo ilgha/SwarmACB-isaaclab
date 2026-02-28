@@ -103,6 +103,12 @@ class DirectionalGateEnv(DirectMARLEnv):
         light_vec = self.light_pos - self.arena_center
         self.light_dir = light_vec / (light_vec.norm() + 1e-8)
 
+        # ── Sensor cache (avoids double computation for discrete variants) ──
+        self._sensor_cache = None
+
+        # ── Precompute wall face normals/points for vectorized collision ──
+        self._wall_normals, self._wall_points = self._precompute_wall_faces()
+
     # ──────────────────────────────────────────────────────────────
     #  Scene setup (visual only — physics are kinematic)
     # ──────────────────────────────────────────────────────────────
@@ -256,9 +262,27 @@ class DirectionalGateEnv(DirectMARLEnv):
         return VisualizationMarkers(marker_cfg)
 
     def _update_visual_markers(self):
-        """Update robot and heading marker positions from kinematic state."""
+        """Update robot and heading marker positions from kinematic state.
+
+        Skipped when running headless (no viewport) to avoid costly GPU→CPU
+        transfers every step.  Also throttled to every 5th step when visible.
+        """
+        # Skip entirely in headless mode (no viewer)
+        if not hasattr(self, '_render_mode') or self._render_mode is None:
+            # Check if sim has a running viewer
+            try:
+                if not self.sim.has_gui():
+                    return
+            except (AttributeError, RuntimeError):
+                pass
+
+        # Throttle to every 5th step to reduce CPU overhead
+        step = getattr(self, '_marker_counter', 0)
+        self._marker_counter = step + 1
+        if step % 5 != 0:
+            return
+
         N = self.cfg.num_agents
-        E = self.num_envs
 
         # For now, visualise env 0 only (markers are shared across all envs
         # in the USD stage; we show the first env's state)
@@ -478,6 +502,18 @@ class DirectionalGateEnv(DirectMARLEnv):
                 self.agent_pos, self.agent_yaw,
             )
 
+            # Cache sensor results so _get_observations can reuse them
+            self._sensor_cache = {
+                "prox_vals": prox_vals,
+                "prox_value": prox_value,
+                "prox_angle": prox_angle,
+                "light_vals": light_vals,
+                "light_value": light_value,
+                "light_angle": light_angle,
+                "ztilde": ztilde,
+                "rab_proj": rab_proj,
+            }
+
             # RAB aggregate angle in body frame for attraction / repulsion
             rab_sum_angle = torch.atan2(
                 rab_proj[:, :, 1] + rab_proj[:, :, 3],  # sin components
@@ -528,41 +564,63 @@ class DirectionalGateEnv(DirectMARLEnv):
     #  Collision resolution
     # ──────────────────────────────────────────────────────────────
 
-    def _resolve_wall_collisions(self):
-        """Push robots inside the dodecagonal arena boundary."""
+    def _precompute_wall_faces(self):
+        """Precompute wall face normals and reference points as tensors.
+
+        Returns:
+            normals: (n, 2) — inward normal for each face
+            points:  (n, 2) — point on each face (at inradius)
+        """
         R = self.cfg.arena_circumradius
-        r = self.cfg.robot_radius
         n = self.cfg.arena_num_sides
         inradius = R * math.cos(math.pi / n)
 
+        normals_list = []
+        points_list = []
         for i in range(n):
             angle = 2 * math.pi * i / n + math.pi / n
-            next_angle = (
-                2 * math.pi * ((i + 1) % n) / n
-                + math.pi / n
-            )
+            next_angle = 2 * math.pi * ((i + 1) % n) / n + math.pi / n
             mid_angle = (angle + next_angle) / 2.0
             # Inward normal (toward center)
             nx = -math.cos(mid_angle)
             ny = -math.sin(mid_angle)
-            # Point on the wall face (at inradius)
+            # Point on the wall face
             wx = inradius * math.cos(mid_angle)
             wy = inradius * math.sin(mid_angle)
+            normals_list.append([nx, ny])
+            points_list.append([wx, wy])
 
-            dx = self.agent_pos[:, :, 0] - wx
-            dy = self.agent_pos[:, :, 1] - wy
-            signed_dist = dx * nx + dy * ny
+        normals = torch.tensor(normals_list, dtype=torch.float32, device=self.device)  # (n, 2)
+        points = torch.tensor(points_list, dtype=torch.float32, device=self.device)    # (n, 2)
+        return normals, points
 
-            penetration = r - signed_dist
-            push_mask = penetration > 0
-            self.agent_pos[:, :, 0] += torch.where(
-                push_mask, penetration * nx,
-                torch.zeros_like(penetration),
-            )
-            self.agent_pos[:, :, 1] += torch.where(
-                push_mask, penetration * ny,
-                torch.zeros_like(penetration),
-            )
+    def _resolve_wall_collisions(self):
+        """Push robots inside the dodecagonal arena boundary (fully vectorized)."""
+        r = self.cfg.robot_radius
+        normals = self._wall_normals   # (n, 2)
+        points = self._wall_points     # (n, 2)
+
+        # Agent positions: (E, N, 2)
+        # Broadcast: pos (E, N, 1, 2) - points (1, 1, n, 2) → (E, N, n, 2)
+        diff = self.agent_pos.unsqueeze(2) - points.view(1, 1, -1, 2)   # (E, N, n, 2)
+
+        # Signed distance to each face: dot(diff, normal) → (E, N, n)
+        n_vec = normals.view(1, 1, -1, 2)                                # (1, 1, n, 2)
+        signed_dist = (diff * n_vec).sum(dim=-1)                         # (E, N, n)
+
+        # Penetration = robot_radius - signed_dist
+        penetration = r - signed_dist                                     # (E, N, n)
+
+        # Only push where penetrating (pen > 0)
+        push_mask = penetration > 0                                       # (E, N, n)
+        penetration = penetration * push_mask.float()                     # zero out non-penetrating
+
+        # Push displacement per face: pen * normal → (E, N, n, 2)
+        push = penetration.unsqueeze(-1) * n_vec                         # (E, N, n, 2)
+
+        # Sum pushes from all penetrating faces
+        total_push = push.sum(dim=2)                                      # (E, N, 2)
+        self.agent_pos = self.agent_pos + total_push
 
     def _resolve_robot_collisions(self):
         """Elastic push-out between robot pairs (one pass)."""
@@ -606,20 +664,30 @@ class DirectionalGateEnv(DirectMARLEnv):
         """Compute per-agent observations.  Layout depends on variant."""
         cfg = self.cfg
 
-        # Compute all sensors (shared across variants)
-        prox_vals, prox_value, prox_angle = self.sensors.compute_proximity(
-            self.agent_pos, self.agent_yaw,
-            obstacle_segments=self.wall_segments,
-            all_agent_pos=self.agent_pos,
-            robot_radius=cfg.robot_radius,
-        )
-        light_vals, light_value, light_angle = self.sensors.compute_light(
-            self.agent_pos, self.agent_yaw, self.light_pos,
-        )
+        # Reuse cached sensors if available (discrete variants compute them
+        # in _apply_action already), otherwise compute fresh
+        cache = self._sensor_cache
+        if cache is not None:
+            prox_vals = cache["prox_vals"]
+            light_vals = cache["light_vals"]
+            ztilde = cache["ztilde"]
+            rab_proj = cache["rab_proj"]
+            self._sensor_cache = None  # consume cache
+        else:
+            prox_vals, _, _ = self.sensors.compute_proximity(
+                self.agent_pos, self.agent_yaw,
+                obstacle_segments=self.wall_segments,
+                all_agent_pos=self.agent_pos,
+                robot_radius=cfg.robot_radius,
+            )
+            light_vals, _, _ = self.sensors.compute_light(
+                self.agent_pos, self.agent_yaw, self.light_pos,
+            )
+            ztilde, rab_proj = self.sensors.compute_rab(
+                self.agent_pos, self.agent_yaw,
+            )
+
         ground = self._ground_color(self.agent_pos)  # (E, N, 3)
-        ztilde, rab_proj = self.sensors.compute_rab(
-            self.agent_pos, self.agent_yaw,
-        )
 
         if cfg.variant in ("dandelion", "daisy"):
             obs_all = self.sensors.collect_obs_dandelion(
@@ -716,13 +784,13 @@ class DirectionalGateEnv(DirectMARLEnv):
         inradius = R * math.cos(math.pi / self.cfg.arena_num_sides)
         safe_r = inradius - self.cfg.robot_radius * 2
 
-        for ei in env_ids:
-            # Uniform in disk then rejection — for a dodecagon the disk is close enough
-            r = torch.sqrt(torch.rand(N, device=self.device)) * safe_r
-            theta = torch.rand(N, device=self.device) * 2 * math.pi
-            self.agent_pos[ei, :, 0] = r * torch.cos(theta)
-            self.agent_pos[ei, :, 1] = r * torch.sin(theta)
-            self.agent_yaw[ei] = torch.rand(N, device=self.device) * 2 * math.pi - math.pi
+        # Vectorized: generate all positions at once for len(env_ids) envs × N agents
+        n_reset = len(env_ids)
+        r_rand = torch.sqrt(torch.rand(n_reset, N, device=self.device)) * safe_r
+        theta = torch.rand(n_reset, N, device=self.device) * 2 * math.pi
+        self.agent_pos[idx, :, 0] = r_rand * torch.cos(theta)
+        self.agent_pos[idx, :, 1] = r_rand * torch.sin(theta)
+        self.agent_yaw[idx] = torch.rand(n_reset, N, device=self.device) * 2 * math.pi - math.pi
 
         # Reset y-tracking for crossing detection
         self.prev_y[idx] = self.agent_pos[idx, :, 1]

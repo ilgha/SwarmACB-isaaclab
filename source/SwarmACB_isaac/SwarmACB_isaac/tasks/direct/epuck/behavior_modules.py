@@ -84,7 +84,6 @@ def compute_wheels_from_vector(
     left = torch.where(in_front, left_fwd, left_turn)
     right = torch.where(in_front, right_fwd, right_turn)
     return left, right
-    return left, right
 
 
 # ──────────────────────────────────────────────────────────────────────

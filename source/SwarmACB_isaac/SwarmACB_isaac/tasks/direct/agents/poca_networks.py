@@ -468,18 +468,51 @@ class POCACritic(nn.Module):
         all_obs: torch.Tensor,       # (B, N, obs_dim)
         all_actions: torch.Tensor,   # (B, N, act_dim)
     ) -> torch.Tensor:
-        """Compute baselines for every agent.
+        """Compute baselines for every agent (batched — single forward pass).
+
+        Instead of N separate forward passes, we construct all N counterfactual
+        entity sets at once by stacking along the batch dimension:
+          (B*N, N, h_size) where for each "virtual batch" entry b*N+i,
+          entity 0 = obs-only embedding of agent i,
+          entities 1..N-1 = obs+act embedding of all others.
 
         Returns: (B, N)
         """
-        N = all_obs.shape[1]
-        baselines = []
-        for i in range(N):
-            other_idx = [j for j in range(N) if j != i]
-            b_i = self.baseline(
-                all_obs[:, i],
-                all_obs[:, other_idx],
-                all_actions[:, other_idx],
-            )
-            baselines.append(b_i.squeeze(-1))
-        return torch.stack(baselines, dim=1)
+        B, N, _ = all_obs.shape
+
+        # Embed all obs-only: (B, N, h)
+        obs_emb = self.obs_entity_enc(all_obs)                     # (B, N, h)
+
+        # Embed all obs+act: (B, N, h)
+        obs_act = torch.cat([all_obs, all_actions], dim=-1)        # (B, N, obs+act)
+        obs_act_emb = self.obs_act_entity_enc(obs_act)             # (B, N, h)
+
+        # For agent i's baseline:
+        #   entity 0 = obs_emb[:, i]  (obs-only)
+        #   entities 1..N-1 = obs_act_emb[:, other_indices]
+        # We build this for ALL i simultaneously by repeating and masking.
+
+        # Expand obs_emb for the "self" slot: (B, N, 1, h) — agent i's obs embedding
+        self_ent = obs_emb.unsqueeze(2)                            # (B, N, 1, h)
+
+        # Build "others" obs_act_emb for each agent i:
+        # For each i, we need all j != i. We can construct this with a rolled gather.
+        # Create index for "others": for agent i, others = [0..i-1, i+1..N-1]
+        # Efficient: tile obs_act_emb to (B, N, N, h), then remove diagonal
+        tiled = obs_act_emb.unsqueeze(1).expand(B, N, N, self.h_size)  # (B, N, N, h)
+        # Mask to remove self (diagonal)
+        mask = ~torch.eye(N, dtype=torch.bool, device=all_obs.device)  # (N, N)
+        # Gather others: (B, N, N-1, h)
+        others_ent = tiled[:, :, :, :].reshape(B * N, N, self.h_size)
+        mask_flat = mask.unsqueeze(0).expand(B, -1, -1).reshape(B * N, N)
+        others_flat = others_ent[mask_flat].reshape(B, N, N - 1, self.h_size)
+
+        # Concatenate self + others: (B, N, N, h)
+        entities = torch.cat([self_ent, others_flat], dim=2)       # (B, N, N, h)
+
+        # Reshape to (B*N, N, h) for a single RSA forward pass
+        entities_flat = entities.reshape(B * N, N, self.h_size)
+
+        # Shared tail: RSA → encoder → value head
+        values = self._encode_and_value(entities_flat, N)          # (B*N, 1)
+        return values.squeeze(-1).reshape(B, N)                    # (B, N)
