@@ -1,0 +1,66 @@
+# ═══════════════════════════════════════════════════════════════════════
+#  SwarmACB — Directional Gate × Dandelion (continuous 2D wheels)
+# ═══════════════════════════════════════════════════════════════════════
+#
+#  Structure mirrors ML-Agents YAML so you can switch between the two
+#  frameworks with minimal friction.  The top-level key under `behaviors`
+#  becomes the run-name (TensorBoard, checkpoint folder, etc.).
+#
+#  To train:
+#      python scripts/train.py --config configs/DirGate_dandelion.yaml
+#
+#  To switch variant just change `variant:` and tweak network/hypers.
+# ═══════════════════════════════════════════════════════════════════════
+
+behaviors:
+  DirGate_dandelion:
+    # ── CASA variant ────────────────────────────────────────────
+    #  dandelion  → continuous 2D wheels  (obs=24)
+    #  daisy      → discrete 6 modules    (obs=24)
+    #  lily       → discrete 6 modules    (obs=4)
+    #  tulip      → discrete 6 modules    (obs=4, small net)
+    #  cyclamen   → discrete 6 modules    (obs=4, LSTM)
+    variant: dandelion
+
+    trainer_type: poca
+
+    # ── Hyperparameters ─────────────────────────────────────────
+    hyperparameters:
+      batch_size: 2048           # mini-batch size per gradient step
+      buffer_size: 20480         # total transitions before update (= time_horizon × num_envs)
+      learning_rate: 0.0003
+      beta: 0.005                # entropy coefficient
+      epsilon: 0.2               # PPO clip range
+      lambd: 0.95                # GAE λ
+      num_epoch: 3
+
+      # Schedules: "linear" decays to 0 over training; "constant" keeps fixed
+      learning_rate_schedule: linear
+      epsilon_schedule: linear
+      beta_schedule: linear
+
+    # ── Network ─────────────────────────────────────────────────
+    network_settings:
+      hidden_units: 512
+      num_layers: 2
+      # normalize: false         # (reserved — not yet used)
+      # vis_encode_type: simple  # (reserved)
+
+    # ── Reward ──────────────────────────────────────────────────
+    reward_signals:
+      extrinsic:
+        gamma: 0.99
+        strength: 1.0            # reward multiplier (applied before trainer)
+
+    # ── Training control ────────────────────────────────────────
+    max_steps: 120000000         # total agent-decisions
+    time_horizon: 1000           # rollout length (steps per collection)
+    summary_freq: 120000         # TensorBoard log interval (agent-decisions)
+    checkpoint_interval: 120000  # save every N agent-decisions
+    keep_checkpoints: 5          # max checkpoints kept on disk
+
+    # ── Environment (SwarmACB extensions) ───────────────────────
+    environment:
+      num_envs: 5               # parallel environments
+      decision_period: 1        # env steps per decision (1 = every step)
+      episode_length_s: 120.0   # seconds per episode

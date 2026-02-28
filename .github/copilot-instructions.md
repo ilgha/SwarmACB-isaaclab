@@ -2,34 +2,30 @@
 
 ## Project Overview
 
-**SwarmACB_isaac** is an **Isaac Lab extension** for multi-agent reinforcement learning (MARL). It currently implements two environments:
-1. **Cart-Double-Pendulum** (baseline template): Two agents cooperate to balance a double pendulum
-2. **Foraging Environment** (main project): Swarm robots collect food cubes in an arena using POCA/SwarmACB algorithm
+**SwarmACB_isaac** is an **Isaac Lab extension** for multi-agent reinforcement learning (MARL) implementing the SwarmACB paper: 5 CASA variants (dandelion through cyclamen) across 5 collective missions using 20 e-puck robots with POCA training.
 
 ### Architecture at a Glance
 
 ```
 source/SwarmACB_isaac/SwarmACB_isaac/
 ├── tasks/direct/
-│   ├── swarmacb_isaac_marl/          # Baseline: Cart-double-pendulum MARL
-│   │   ├── swarmacb_isaac_marl_env.py
-│   │   ├── swarmacb_isaac_marl_env_cfg.py
-│   │   └── agents/skrl_mappo_cfg.yaml
-│   └── swarmacb_foraging/            # Main: Foraging task
-│       ├── swarmacb_foraging_env.py       # Foraging environment
-│       ├── swarmacb_foraging_env_cfg.py   # Configuration
-│       └── agents/__init__.py             # POCA config (TODO)
-├── ui_extension_example.py              # Optional Omniverse UI extension
+│   ├── agents/                         # Shared POCA agent (all variants & missions)
+│   │   ├── poca_networks.py            # Actor, DiscreteActor, POCACritic, RSA
+│   │   ├── poca_buffer.py              # Rollout buffer with lambda-returns
+│   │   └── poca_trainer.py             # Full POCA training loop
+│   ├── epuck/                          # E-puck robot model (shared)
+│   │   ├── epuck_sensors.py            # 8 prox, 8 light, 3 ground, RAB sensors
+│   │   └── behavior_modules.py         # 6 behaviour modules for ACB variants
+│   └── missions/                       # Mission environments
+│       └── directional_gate/           # DGT mission (first implemented)
+│           ├── directional_gate_env.py
+│           └── directional_gate_env_cfg.py
+├── ui_extension_example.py
 └── __init__.py                          # Package init (auto-imports tasks)
 
 scripts/
-├── zero_agent.py                        # Dummy zero-action agent
-├── random_agent.py                      # Dummy random-action agent  
-├── manual_control.py                    # Keyboard-controlled robot for testing
-├── validate_foraging_env.py             # Foraging environment validator
-└── skrl/
-    ├── train.py                         # Training script (MAPPO/POCA)
-    └── play.py                          # Inference/evaluation script
+├── train.py                             # POCA training (any mission/variant)
+└── play.py                              # Evaluation script
 ```
 
 ## Foraging Environment - Key Architecture

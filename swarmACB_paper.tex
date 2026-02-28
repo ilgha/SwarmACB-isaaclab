@@ -1,0 +1,676 @@
+% science_template.tex
+% See accompanying readme.txt for copyright statement, change log etc.
+
+% Any modification of this template, including writing a paper using it,
+% MUST rename the file i.e. use a different file name.
+
+%%%%%%%%%%%%%%%% START OF PREAMBLE %%%%%%%%%%%%%%%
+
+% Basic setup. Authors shouldn't need to adjust these commands.
+% It's annoying, but please do NOT strip these into a separate file.
+% They need to be included in this .tex for our production software to work.
+
+% Use the basic LaTeX article class, 12pt text
+\documentclass[12pt]{article}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+
+% Science uses Times font. If you don't have this installed (most LaTeX installations will be
+% fine) or prefer the old Computer Modern fonts, comment out the following line
+\usepackage{newtxtext,newtxmath}
+% Depending on your LaTeX fonts installation, you might get better results with one or both of these:
+%\usepackage{mathptmx}
+%\usepackage{txfonts}
+
+% Allow external graphics files
+\usepackage{graphicx}
+
+% Use US letter sized paper with 1 inch margins
+\usepackage[letterpaper,margin=1in]{geometry}
+
+
+% Double line spacing, including in captions
+\linespread{1.5} % For some reason double spacing is 1.5, not 2.0!
+
+% One space after each sentence
+\frenchspacing
+
+% Abstract formatting and spacing - no heading
+\renewenvironment{abstract}
+	{\quotation}
+	{\endquotation}
+
+% No date in the title section
+\date{}
+
+% Reference section heading
+\renewcommand\refname{References and Notes}
+
+
+% Figure and Table labels in bold
+\makeatletter
+\renewcommand{\fnum@figure}{\textbf{Figure \thefigure}}
+\renewcommand{\fnum@table}{\textbf{Table \thetable}}
+\makeatother
+
+% Call the accompanying scicite.sty package.
+% This formats citation numbers in Science style.
+\usepackage{scicite}
+
+% Provides the \url command, and fixes a crash if URLs or DOIs contain underscores
+\usepackage{url}
+\usepackage{float}
+\usepackage{xspace}
+\usepackage{nameref}
+\usepackage{placeins}
+\usepackage{siunitx}
+\usepackage{caption}
+%\usepackage[nomarkers,nolists]{endfloat}
+% \usepackage{draftwatermark}
+% \SetWatermarkText{DRAFT}        % the text of the watermark
+% \SetWatermarkScale{1.3}           % scale factor (1–5 is typical)
+% \SetWatermarkLightness{0.90}    % 0 = black, 1 = white
+
+%%%%%%%%%%%% CUSTOM COMMANDS AND PACKAGES %%%%%%%%%%%%
+
+% Authors can define simple custom commands e.g. as shortcuts to save on typing
+% Use \newcommand (not \def) to avoid overwriting existing commands.
+% Keep them as simple as possible and note the warning in the text below.
+\newcommand{\refmod}{RM\,1.1\xspace}
+\newcommand{\acb}{SwarmACB\xspace}
+\newcommand{\acbLong}{attention-based counterfactual policy gradients for behavior selection in robot swarms\xspace}
+\newcommand{\acbLongCaps}{Attention-based Counterfactual policy gradients for Behavior selection in robot swarms\xspace}
+\newcommand{\E}{\mathrm{E}}
+\newcommand{\casa}{CASA\xspace}
+\newcommand{\casaLongCaps}{Common Action-Space–Agnostic multi-agent reinforcement learning\xspace}
+
+% Please DO NOT import additional external packages or .sty files.
+% Those are unlikely to work with our conversion software and will cause problems later.
+% Don't add any more \usepackage{} commands.
+
+
+%%%%%%%%%%%%%%%% TITLE AND AUTHORS %%%%%%%%%%%%%%%%
+
+% Title of the paper.
+% Keep it short and understandable by any reader of Science.
+% Avoid acronyms or jargon. Use sentence case.
+\def\scititle{Structural bias enables reliable sim-to-real transfer in reinforcement learning for robot swarms}
+% Store the title in a variable for reuse in the supplement (otherwise \maketitle deletes it)
+\title{\bfseries \boldmath \scititle}
+
+% Author and institution list.
+% Institution numbers etc. should be hard-coded, do *not* use the \footnote command.
+\author{
+	% You can write out first names or use initials - either way is acceptable, but be consistent
+	Ilyes~Gharbi,$\!^{1}$
+	Miquel~Kegeleirs,$\!^{1}$
+	Guillermo~Legarda~Herranz,$\!^{1}$\\
+	Jeanne~Szpirer,$\!^{1}$
+	Ken~Hasselmann,$\!^{1,2}$ and
+	Mauro~Birattari$^{1\ast}$\and
+	% Additional lines of authors should be inserted using the \and command (not \\)
+	% Institution list, in a slightly smaller font
+	\small$^{1}\,$IRIDIA, Université libre de Bruxelles, Brussels, Belgium.\and
+	\small$^{2}\,$Royal Military Academy, Brussels, Belgium.\and
+	% Identify at least one corresponding author, with contact email address
+	\small$^\ast$Corresponding author. Email: mauro.birattari@ulb.be
+}
+
+%%%%%%%%%%%%%%%%% END OF PREAMBLE %%%%%%%%%%%%%%%%
+
+
+%%%%%%%%%%%%%%%% START OF MAIN TEXT %%%%%%%%%%%%%%%
+\begin{document} 
+% Insert the title and author list
+\maketitle
+% Abstract, in bold
+% There are strict length limits, and not all formats have abstracts.
+% Consult the journal instructions to authors for details.
+% Do not cite any references in the abstract.
+%\ \vspace*{-10mm}\pagestyle{empty}
+\begin{abstract} \noindent\bfseries\boldmath%\enlargethispage{10mm}\thispagestyle{empty}\small%
+Reinforcement learning offers a powerful framework for automatically generating control policies for robot swarms; yet, its application to physical multi-robot systems has been severely limited by the simulation-to-reality gap. Despite significant advances in multi-agent reinforcement learning, no gradient-based method has achieved systematic transfer from simulation to real robot swarms. Most work remains confined to simulation, and the few real-robot demonstrations lack evaluation across multiple runs and tasks. We show that this barrier can be overcome by embedding structural constraints into policy learning. We introduce \emph{\acbLongCaps} (\acb), a multi-agent actor–critic method in which robots arbitrate among predefined behavior modules—reactive sensorimotor routines such as phototaxis or aggregation—rather than learning low-level motor commands. This architectural choice reduces the variance of learned solutions, mitigating overfitting to simulation artifacts. Through systematic evaluation on five collective missions using 20 physical e-puck robots (250 real-robot runs), we demonstrate that \acb transfers successfully from simulation to reality, substantially outperforming continuous-action baselines. By progressively constraining policy architecture, perception, and model capacity, we show that smaller, structured policies transfer more reliably than large, unconstrained ones. These findings challenge the assumption that scale is necessary for successful transfer, demonstrating instead that principled structural design enables reinforcement learning to produce control software for robot swarms that is both learned automatically and directly deployable in the physical world.
+\end{abstract}
+
+\section*{Introduction}
+Reinforcement learning~\cite{SutBar2018book} is a powerful framework for the automatic generation of control policies. Its application to robot swarms~\cite{BraFerBirDor2013SI,YanBelDup-etal2018SCIROB,DorTheTri2020SCIROB}, however, is still in its early stages~\cite{SomBouHam-etal2024arxiv}. One of the first convincing studies was presented by H\"{u}ttenrauch et al.~\cite{HutSosNeu2017arms}, who demonstrated the feasibility of using the actor–critic framework in swarm robotics. Although subsequent studies have explored similar directions~\cite{HutSosNeu2018ants,HutSosNeu2019JMLR}, most of the literature remains confined to simulation, and no study has yet demonstrated that reinforcement learning can produce collective behaviors that transfer reliably to physical robots at scale. Despite numerous efforts to bridge the well-known simulation-to-reality (sim-to-real) gap~\cite{ZhaQueWes2020ssci,JuJuaGom-etalNATUMINT}, achieving reliable sim-to-real transfer remains an open problem in swarm robotics. The few existing demonstrations on physical platforms remain limited: some works report results without systematic evaluation across multiple runs and tasks~\cite{SadBilTur-etal2024AB,HeuPanGu-etal2024SciRob,BloPoiPin2025rs}, while recent digital-twin approaches~\cite{CaoLeiShe-etal2025} show encouraging preliminary results but are confined to a single task without comprehensive sim-to-real comparison.
+
+The challenge of bridging the sim-to-real gap has parallels in earlier swarm robotics research. Before the work of H\"{u}ttenrauch et al.~\cite{HutSosNeu2017arms}, optimization-based methods~\cite{BirLigHas2020NATUMINT} initially focused on neuroevolutionary approaches~\cite{NolFlo2000book,Tri2008book,Nol2021book} that optimize policies directly, without reconstructing a value function. Like policy gradient methods~\cite{SutBar2018book}, neuroevolutionary techniques have proven highly sensitive to the sim-to-real gap~\cite{HasLigRudBir2021NATUCOM}. However, modular approaches—in which control software is assembled from predefined components—transfer more reliably~\cite{HasLigRudBir2021NATUCOM}. Methods of the AutoMoDe family~\cite{FraBraBru-etal2014SI,FraBraBru-etal2015SI,BirLigFra2021admlsa} build robot control software by combining predefined behavior modules (e.g., ``go towards the light'', ``go towards peers'') and transition conditions into a predefined control architecture (e.g., probabilistic finite-state machines, behavior trees), searching directly in the space of possible configurations rather than in the space of all possible neural networks. This structural constraint reduces overfitting to simulation artifacts and improves sim-to-real transfer~\cite{FraBraBru-etal2014SI,FraBraBru-etal2015SI}.
+
+We hypothesize that this superior transfer reflects a fundamental principle rooted in the bias-variance tradeoff~\cite{GemBieDou1992NCO}. Policies that directly output low-level motor commands offer maximum flexibility but may overfit to simulation-specific regularities—sensor noise patterns, friction models, actuation delays—that do not generalize to physical robots. Constraining policies to select among predefined behavior modules introduces structural bias that limits this overfitting: the policy cannot exploit fine-grained simulation artifacts at the actuator level but must instead learn high-level coordination strategies, reducing solution variance across simulation and reality. If this hypothesis holds, embedding similar structural constraints into reinforcement learning should enable reliable sim-to-real transfer for robot swarms.
+
+We introduce \emph{\acbLongCaps} (\acb), a multi-agent reinforcement learning approach based on the actor–critic framework~\cite{SutBar2018book} designed to test this hypothesis. \acb follows a centralized training, decentralized execution paradigm: a centralized critic guides learning using global information during training, while each robot executes its policy independently based on local observations during deployment. We consider homogeneous swarms in which all robots have identical hardware, run the same policy, and are therefore interchangeable.
+
+In \acb, each robot is controlled by a neural-network policy that selects, at each time step, one behavior module from a predefined library rather than outputting motor commands directly. Each module implements a reactive, memoryless sensorimotor routine—such as phototaxis or aggregation—that maps sensor readings to actuator commands, although the policy itself may
+incorporate memory when selecting among modules.
+
+\acb integrates two key mechanisms from the reinforcement learning literature. First, it employs \emph{counterfactual policy gradients}~\cite{FoeFarAfo2018aaai}, allowing the critic to estimate each robot's marginal contribution while holding others fixed—an essential mechanism for credit assignment in cooperative multi-agent systems. Second, because the swarm is homogeneous and the robots are interchangeable, it adopts a \emph{self-attention mechanism}~\cite{CohTenBer-etal2021arxiv} that, without making any assumptions about the swarm size, ensures permutation invariance and models inter-robot dependencies through learned attention weights.
+
+We evaluated \acb on five collective tasks using a swarm of 20 e-puck robots~\cite{MonBonRae-etal2009arsc}. To isolate the effect of selecting among behavior modules rather than outputting actuator commands directly, we implemented a continuous-action benchmark identical to \acb in all other respects, in which the actor's neural network outputs continuous wheel-speed commands. Both methods were implemented within the \emph{\casaLongCaps} (\casa) framework, ensuring consistent implementation across conditions.
+
+Our results support the hypothesis: constraining reinforcement learning to arbitrate among predefined behavior modules enables reliable real-robot deployment of swarm policies learned in simulation. Through systematic evaluation comprising 250 real-robot runs across five missions, modular policies match the transfer reliability of AutoMoDe methods~\cite{FraBraBru-etal2014SI,FraBraBru-etal2015SI,HasLigRudBir2021NATUCOM} while substantially outperforming continuous-action reinforcement learning baselines. These findings suggest that structural bias, not increased model capacity, is the key to reliable sim-to-real transfer in multi-agent learning systems.
+
+This study is part of the ongoing research effort on the \emph{automatic off-line design of robot swarms}~\cite{BirLigBoz-etal2019FRAI,BirLigHas2020NATUMINT}, in which the generation of control software is formulated as an optimization process conducted entirely \emph{off-line}—prior to deployment, typically in simulation, and without per-mission human intervention.\footnote{Here, \emph{off-line} refers to pre-deployment optimization and should not be confused with \emph{off-line reinforcement learning}, which denotes training from fixed, previously collected datasets without further environment interaction.} The goal is to develop general methods capable of automatically generating control software for a class of missions, each with distinct goals and environmental conditions. Accordingly, the method was evaluated on five distinct missions using exactly the same design process, without any mission-specific manual adaptation.
+
+
+\section*{Results}
+We present the \acb method and its variants, describe the experimental setting and protocol, and report empirical results comparing all methods across five collective tasks with real and simulated robot swarms.
+
+\subsection*{\acb: Counterfactual policy gradients for behavior selection}
+\label{sec:acb}
+We present \acbLong (\acb), a reinforcement learning method designed to test the hypothesis that structural constraints enable reliable sim-to-real transfer in multi-agent learning systems. This section provides a high-level conceptual overview; full mathematical definitions, network architectures, and training procedures are detailed in Section~\nameref{sec:materialsmethods}.
+
+\paragraph{The method.}
+\acb is built on the multi-agent actor–critic framework: policies are decentralized, but training is centralized. Each robot executes its policy using only local sensor observations, without access to its own absolute pose or that of its peers. During training in simulation, a centralized critic observes the full swarm state and actions, enabling more accurate value estimation (see Section~\nameref{sec:casa}). Giving global information only to the critic ensures that policies remain deployable on real robots while benefiting from stronger learning signals during training.
+%
+Because swarm-level rewards depend on collective outcomes, credit assignment to individual robots is particularly challenging. \acb addresses this through \emph{counterfactual baselines}: the critic estimates each robot's contribution by comparing its action to alternatives while keeping the actions of the other robots fixed. This stabilizes learning and enables robots to acquire cooperative behaviors more efficiently and with lower variance (see Section~\nameref{sec:casa}).
+%
+To handle large homogeneous groups, the critic employs an attention mechanism that, without making any assumptions about the swarm size, treats robots as interchangeable entities and  models their dependencies (see Section~\nameref{sec:casa}).
+%
+The core innovation of \acb is constraining policies to arbitrate among predefined behavior modules rather than output motor commands directly. Instead of producing wheel velocities, the policy selects one module from a fixed library comprising \emph{exploration}, \emph{stop}, \emph{phototaxis}, \emph{anti-phototaxis}, \emph{attraction}, and \emph{repulsion}. Each module is a reactive, memory-less sensorimotor routine that maps observations to motor commands (see Section~\nameref{sec:designmethods} and Fig.~\ref{fig:methods}B). This structural constraint reduces variance, limits overfitting to simulation artifacts, and substantially mitigates the sim-to-real gap.
+
+\paragraph*{The variants.}
+We implemented four \acb variants—\emph{daisy}, \emph{lily}, \emph{tulip}, and \emph{cyclamen}—all sharing the same critic architecture but differing incrementally in their policy design (see Section~\nameref{sec:designmethods} and Fig.~\ref{fig:methods}A).
+%
+\begin{figure}[tp]
+    \centering
+    \includegraphics[width=\textwidth]{figures/Fig-Methods.pdf}
+    \caption{\textbf{\acb variants and their behavior modules.}  
+    \textbf{(A)} Architecture of the actor in dandelion and the four \acb variants: daisy, lily, tulip, and cyclamen. Dandelion: a continuous-action benchmark in which a two-layer MLP (512 units per layer) maps the full 24-dimensional sensor vector (8 proximity, 8 light, 4 range-and-bearing, 1 neighbor count, 3 ground color) directly to continuous wheel velocities. Daisy: identical architecture, but the output layer is a six-way module selector over predefined behavior modules (exploration, stop, phototaxis, anti-phototaxis, attraction, repulsion). Lily: retains daisy's module-selection output but restricts the input to ground color and neighbor count only. Tulip: keeps lily's inputs and module-selection output but reduces the network to a single hidden layer of 128 units. Cyclamen: extends tulip with a long short-term memory (LSTM) layer of 64 units, endowing the policy with short-term temporal memory. 
+    \textbf{(B)} The six behavior modules: exploration produces ballistic motion with obstacle avoidance; stop halts motion; phototaxis and anti-phototaxis move the robot toward or away from the light source; attraction and repulsion drive the robot toward or away from its neighbors.}
+    \label{fig:methods}
+\end{figure}
+%
+We also implemented one continuous-action benchmark, \emph{dandelion}, which represents the state of the art in continuous-action actor–critic methods with counterfactual credit assignment; it is essentially an implementation of POCA~\cite{CohTenBer-etal2021arxiv} in which the critic operates on the joint pose rather than joint observations.
+%
+Dandelion outputs wheel velocities directly, offering maximal flexibility. Daisy arbitrates among six predefined behavior modules, constraining the output space to validated primitives. Lily adds an input constraint, restricting arbitration to a subset of sensors while modules internally retain full sensor access. Tulip keeps lily's input and output constraints but reduces model capacity.  Cyclamen augments tulip with temporal memory via a recurrent layer, enabling the policy to exploit temporal cues unavailable to purely feed-forward designs.
+%
+Together, these variants form a systematic progression isolating the individual contributions of modularity, input selection, model capacity, and temporal memory to sim-to-real transfer and physical-robot performance.  Hereafter, we collectively refer to dandelion and the four \acb variants as the \emph{\casa methods}.
+
+
+\subsection*{Experimental setting and protocol}
+\label{sec:setting-protocol}
+All design and training were conducted in simulation, followed by direct deployment on physical robots for validation. 
+This section outlines the essential elements of the experimental setting; full technical details are reported in Section~\nameref{sec:materialsmethods}.
+
+Experiments were conducted with a swarm of 20 e-puck robots (Fig.~\ref{fig:epuck}A). Control software interacts with hardware through a \emph{reference model}—\refmod~\cite{HasLigFra-etal2018techrep}—which abstracts sensor and actuator interfaces into a standardized programming interface (Fig.~\ref{fig:epuck}B). This abstraction ensures that all methods interact with the robots in identical fashion, providing a fair and consistent basis for comparison (see Section~\nameref{sec:epuck}). Policies operate in a fully decentralized manner: during deployment, each robot acts solely on its own local observations.
+%
+\begin{figure}[tp]
+    \centering
+    \includegraphics[width=\textwidth]{figures/Fig-ref-opt.pdf}
+    \caption{\textbf{The robot and its reference model.} 
+    \textbf{(A)} The e-puck robot as used in this study. 
+    \textbf{(B)} Reference model~\refmod~\cite{HasLigFra-etal2018techrep}, defining the programming interface between control software and robot hardware. The range-and-bearing vector~$V$ represents the estimated collective position of detected peers: its magnitude increases with the number of detected peers and decreases with their distance. Formally, $V = \sum_{m=1}^{n} \left( \frac{1}{1+d_m},\, \angle b_m \right)$, where $d_m$ and $\angle b_m$ are the range and bearing of the $m$-th detected peer. If no peers are detected, $V$ defaults to $(1,\angle 0)$, pointing directly ahead.}
+    \label{fig:epuck}
+\end{figure}
+%
+Training was performed in a custom-built simulator (see Section~\nameref{sec:simulator}), and learned policies were transferred directly to physical robots without further modification.
+
+We evaluated all methods on five collective tasks: \emph{XOR-Aggregation}, \emph{Homing}, \emph{Foraging}, \emph{Sheltering with constrained access}, and \emph{Directional-gate} (see Section~\nameref{sec:missions} and Fig.~\ref{fig:missions}). In each mission, robots operated within the same dodecagonal arena of \qty{4.91}{\meter\squared}. Arena layouts and task-specific features are shown in Fig.~\ref{fig:missions}; the red glow in panels~({E--J}) marks a light source outside the bottom edge of the arena.
+%
+\begin{figure}[tp]
+    \centering
+    \includegraphics[width=\textwidth]{figures/Fig-Arenas.pdf}
+    \caption{\textbf{Experimental setups and scenarios.} 
+    \textbf{(A)}~XOR-Aggregation (XOR) in simulation; \textbf{(B)}~with real robots.
+    \textbf{(C)}~Homing (HOM) in simulation; \textbf{(D)}~with real robots.
+    \textbf{(E)}~Foraging (FOR) in simulation; \textbf{(F)}~with real robots.
+    \textbf{(G)}~Sheltering with constrained access (SHL) in simulation; \textbf{(H)}~with real robots.
+    \textbf{(I)}~Directional-gate (DGT) in simulation; \textbf{(J)}~with real robots.
+    In each scenario, 20 e-puck robots operate within a dodecagonal arena of \qty{4.91}{\meter\squared}. The red glow visible in panels~(\textbf{E--J}) marks a light source outside the bottom edge of the arena. Dimensions (in meters) are shown in panels~(\textbf{A, C, E, G, I}). Further details are provided in Section~\nameref{sec:materialsmethods}. Movies~S1--S5 show video footage of all robot experiments; Movie~S0 shows median performance.}
+    \label{fig:missions}
+\end{figure}
+
+Each \casa method was run independently 10 times per mission, yielding 10 distinct control software instances per method per mission. Each instance was evaluated once in simulation and once on the real e-puck robots, producing 50 real-robot runs per method and 250 runs in total for the five \casa methods. For comparison, we report previously published results on the same robots and missions using \emph{chocolate}~\cite{FraBraBru-etal2015SI}, \emph{evostick}~\cite{FraBraBru-etal2014SI}, and the trivial benchmark \emph{randomwalk}~\cite{HasLigRudBir2021NATUCOM} (described in Section~\nameref{sec:designmethods}).
+
+All methods were trained and evaluated under identical simulated and physical conditions—same sensor and actuator models, arena layouts, and noise profiles—isolating the effect of learning architecture on transfer performance. The one exception is training budget: chocolate and evostick were trained with \num{200000} simulation evaluations in the original study by Hasselmann et al.~\cite{HasLigRudBir2021NATUCOM}, whereas the \casa methods were trained for \num{5000}, as their performance curves plateau within this range (Fig.~\ref{fig:training}). Each method was thus allocated the resources needed to reach convergence within its own learning process; the comparison remains fair because all methods face identical sim-to-real transfer conditions regardless of training budget. The randomwalk method requires no training. Computational details are in Section~\nameref{sec:materialsmethods}.
+
+
+
+\subsection*{Empirical analysis}
+\label{sec:empirical-analysis}
+We first examine training behavior in simulation, then evaluate transfer to physical robots.
+
+\subsubsection*{Training in simulation}
+Figure~\ref{fig:training} reports smoothed cumulative group reward during training (median trajectories with interquartile ranges over ten runs). In XOR-Aggregation (Fig.~\ref{fig:training}A), daisy, lily, and tulip converge to similar high rewards, while dandelion and cyclamen stabilize at lower levels. In Homing (Fig.~\ref{fig:training}B), cyclamen achieves the highest reward, followed by lily; daisy attains intermediate performance and dandelion remains lowest. In Foraging (Fig.~\ref{fig:training}C), dandelion converges faster and reaches a higher plateau than the \acb variants. In Sheltering (Fig.~\ref{fig:training}D), tulip achieves the best final reward, with cyclamen occasionally peaking higher early; both outperform daisy, lily, and dandelion. In Directional-gate (Fig.~\ref{fig:training}E), dandelion reaches the highest plateau while all \acb variants level off substantially lower.
+%
+\begin{figure}[tp]
+    \centering
+    \includegraphics[width=\textwidth]{figures/Fig-train.pdf}
+    \caption{\textbf{Median learning curves per mission–method pair.}
+    Dandelion and the four \acb variants (daisy, lily, tulip, cyclamen) across five missions: \textbf{(A)}~XOR-Aggregation, \textbf{(B)}~Homing, \textbf{(C)}~Foraging, \textbf{(D)}~Sheltering with constrained access, \textbf{(E)}~Directional-gate. Each panel shows cumulative reward versus training epochs; the solid line is the median over 10 independent runs and the shaded band spans the interquartile range (25\textsuperscript{th}--75\textsuperscript{th} percentile). Colors: dandelion (yellow), daisy (orange), lily (purple), tulip (pink), cyclamen (blue).}
+    \label{fig:training}
+\end{figure}
+%
+Across all missions, the \acb variants display narrower variability bands than dandelion, indicating more consistent learning dynamics. This reduced variance is consistent with our hypothesis: structural constraints limit the space of learnable solutions and produce more stable optimization trajectories. Whether these constraints also improve sim-to-real transfer requires evaluation on physical robots.
+
+\subsubsection*{Behavior analysis}
+Figure~\ref{fig:BehaviorStat} presents behavioral statistics across all missions and methods in simulation.
+%
+\begin{figure}[p]    
+    \centering
+    \includegraphics[width=.97\textwidth]{figures/Fig-BehaviorStat.pdf}
+    \caption{\textbf{Behavioral statistics across missions and methods.}
+    Columns: \textbf{(A--E)}~relative frequency of observed behaviors; \textbf{(F--J)}~complementary cumulative distribution function (CCDF) of behavior-sequence length, $P(L \geq x)$, where $L$ is the number of consecutive identical behaviors; \textbf{(K--O)}~CCDF of instantaneous wheel acceleration $a = (v_{t+1}-v_t)/\Delta t$, i.e., $P(a \geq x)$, with left and right wheel data aggregated.
+    Rows correspond to five missions: \textbf{(A, F, K)}~XOR-Aggregation; \textbf{(B, G, L)}~Homing; \textbf{(C, H, M)}~Foraging; \textbf{(D, I, N)}~Sheltering with constrained access; \textbf{(E, J, O)}~Directional-gate. Each panel shows daisy, lily, tulip, and cyclamen; dandelion is included in panels \textbf{(K--O)} for comparison of continuous versus discrete actuation.}
+    \label{fig:BehaviorStat}
+\end{figure}
+%
+The complementary cumulative distribution functions (CCDFs) of behavior-sequence length (panels F--J) reveal that in approximately 50\% of cases, a robot remains in the same behavioral state for at least 10 consecutive timesteps, with some mission-method combinations exhibiting substantially longer typical sequences. The CCDFs of instantaneous wheel acceleration (panels K--O) show that \acb methods produce higher accelerations than dandelion. However, this difference arises not solely from behavior switching but also from the intrinsic dynamics of the individual behavior modules themselves, as evidenced by the acceleration distribution of the exploration behavior used in isolation (shown as a reference). Given the e-puck's lightweight construction (approximately \qty{190}{\gram}, battery included) and stepper-motor actuation, the robot can decelerate to a complete stop within a single control timestep. Consequently, the observed accelerations—including those associated with behavior transitions—pose no operational concerns for this platform. For robots with more complex dynamics, smoother low-level actuator commands and behavior transitions could be implemented, and both quantities could be explicitly penalized during training to encourage policies that minimize switching frequency and acceleration magnitudes.
+
+\subsubsection*{Assessment in simulation and reality}
+After training, control policies were evaluated both in simulation and on physical robots. Movies~1 to~5 show all real-robot trials (one video per method, each covering ten designs across five missions); Movie~0 presents the median-performing design for each method including benchmarks.  Reference benchmarks from Hasselmann et al.~\cite{HasLigRudBir2021NATUCOM}---evostick, chocolate, and randomwalk---are included for context.
+
+For each method, ten independently generated control policies were tested under identical initial conditions in simulation and on physical robots; cumulative group rewards were measured in both cases and used to construct the boxplots.
+
+Figure~\ref{fig:boxplots} presents notched boxplots comparing cumulative rewards in simulation (thin boxes) and on physical robots (wide boxes) across all missions and methods.  Non-overlapping notches indicate strong evidence (95\% confidence) of differing medians. Across all methods, performance was higher in simulation than in reality, confirming the presence of the sim-to-real gap. Critically, the magnitude of this gap varied substantially across methods: dandelion exhibited the largest performance drop, while daisy, lily, and tulip showed progressively closer agreement between simulated and real-robot performance. Cyclamen achieved the strongest overall real-world performance, though with slightly higher sensitivity to the gap due to its added complexity.
+%
+\begin{figure}[tp]
+    \centering
+    \includegraphics[width=\textwidth]{figures/Fig-box.pdf}
+    \caption{\textbf{Performance in simulation and reality across methods and missions.}
+    \textbf{(A)}~XOR-Aggregation, \textbf{(B)}~Homing, \textbf{(C)}~Foraging, \textbf{(D)}~Sheltering with constrained access, \textbf{(E)}~Directional-gate. Notched box-and-whisker plots compare simulation (narrow boxes) and real-robot (wide boxes) performance. Notches indicate 95\% confidence intervals around the median; non-overlapping notches imply a statistically significant difference ($\alpha=0.05$). See Section~\nameref{sec:statisticalanalysis} for full conventions. Evostick, chocolate, and randomwalk results are lightly shaded to draw focus toward dandelion and the four \acb variants (daisy, lily, tulip, and cyclamen).}
+    \label{fig:boxplots}
+\end{figure}
+
+To aggregate results across missions, we applied per-mission min--max normalization based on real-robot scores (Fig.~\ref{fig:NormAndRanks}A) and ranked methods by real-robot performance (Fig.~\ref{fig:NormAndRanks}B), summarizing overall standing via mean ranks and 95\% bootstrap confidence intervals (see Section~\nameref{sec:statisticalanalysis}). While dandelion attained the highest simulated scores, the four \acb variants showed markedly more consistent transfer. Tulip achieved the most balanced trade-off, exhibiting the smallest performance drop from simulation to reality. Cyclamen's LSTM layer slightly increased sensitivity to the gap but provided an advantage on tasks requiring temporal coordination; as a result, cyclamen achieved the highest overall real-robot performance, matching chocolate and surpassing all other methods in mean rank.
+%
+\begin{figure}[p]
+    \centering
+    \includegraphics[width=\textwidth]{figures/Fig-rank.pdf}
+    \caption{\textbf{Aggregated normalized performance and ranks across missions.}
+    \textbf{(A)} Aggregate performance in simulation (narrow boxes) versus reality (wide boxes) across the five missions, as notched box-and-whisker plots. Notches mark 95\% confidence intervals around the median; non-overlapping notches imply a significant difference at the 5\% level. Each mission was normalized so that the minimum and maximum real-robot performances map to 0 and 1; real-robot values therefore lie in $[0,1]$, while simulation scores may exceed~1. Extreme simulation outliers beyond the 1.5 y-axis cap are truncated. Evostick, chocolate, and randomwalk are lightly shaded to draw focus to dandelion and the four \acb variants (daisy, lily, tulip, and cyclamen). \textbf{(B)} Mean ranks on real-robot performance with 95\% bootstrap confidence intervals (missions resampled with replacement; see Section~\nameref{sec:statisticalanalysis}).}
+    \label{fig:NormAndRanks}
+\end{figure}
+
+The sequence from daisy to tulip demonstrates that progressively constraining and simplifying policy architecture systematically improves transfer reliability. Cyclamen builds on this foundation by selectively reintroducing complexity through temporal memory: the modest increase in sensitivity to the gap is offset by the policy's ability to capture short-term dependencies that benefit all missions.
+
+Together, these results support our hypothesis: embedding structural constraints—through modular action spaces, reduced network complexity, and selective temporal memory—into multi-agent reinforcement learning reduces solution variance and enables reliable sim-to-real transfer, yielding swarm control software that is both learned automatically and directly deployable in the physical world.
+
+
+\section*{Discussion}
+This study demonstrates that structural constraints enable reliable simulation-to-reality transfer in multi-agent reinforcement learning for robot swarms. Through 250 real-robot runs across five collective missions, we show that policies constrained to arbitrate among predefined behavior modules transfer substantially more reliably than policies that directly output motor commands.  This supports our hypothesis that superior sim-to-real transfer in modular approaches reflects the bias-variance tradeoff: constraining the policy space reduces solution variance, limiting overfitting to simulation artifacts and improving generalization to physical robots. \acb matches the transfer reliability of established modular methods while substantially outperforming a state-of-the-art continuous-action baseline, demonstrating for the first time that gradient-based learning can produce control software that is both learned automatically and directly deployable on physical robot swarms.
+
+The results reveal how structural constraints fundamentally alter what policies learn. During training, \acb variants exhibited narrower performance variability than dandelion, indicating more stable optimization. Limiting outputs to discrete module selections prevents learning from exploiting fine-grained simulation artifacts at the actuator level. Critically, this does not merely restrict expressiveness—it changes the learning objective. Modular policies must encode coordination strategies through high-level behavioral decisions (when to aggregate, disperse, or follow light), effectively disentangling \emph{what to do} from \emph{how to do it}: low-level sensorimotor routines remain fixed while learning focuses on their temporal sequencing and contextual selection.
+
+The progression from dandelion through daisy, lily, and tulip systematically tests this principle. Dandelion, despite achieving among the highest simulation rewards on several missions, suffered the largest performance drops on physical robots—particularly in Foraging and Directional-gate, where learned strategies proved brittle under real-world conditions. Daisy, constrained to module selection, immediately improved transfer. Lily, restricted to minimal sensory inputs, reduced overfitting to irrelevant sensor readings. Tulip, with reduced model capacity, demonstrated that smaller networks yield more transferable policies when the action space is appropriately constrained. Each progressive constraint trades simulation performance for transfer reliability, validating that reduced variance—not increased capacity—bridges the sim-to-real gap.
+
+Cyclamen introduces controlled relaxation of these constraints through temporal memory, revealing a nuanced trade-off. The LSTM layer captures short-term dependencies beneficial for missions like Foraging, where robots must behave differently depending on whether they have visited a source since last reaching the nest. This expressiveness comes at a cost: cyclamen exhibits slightly larger sim-to-real performance drops than tulip, reflecting increased variance from expanded representational capacity. However, the benefit outweighs the cost—cyclamen achieves the highest overall real-robot performance, matching the benchmark chocolate. This suggests that carefully reintroducing complexity \emph{after} establishing structural constraints can enhance performance without sacrificing transferability, provided the added capacity targets genuine task requirements rather than simulation artifacts.
+
+Several aspects of scope bound these results. The reliability demonstrated here is empirical rather than analytical: neural network policies cannot be characterized through the closed-form proofs available in classical control theory, and our structural constraints reduce overfitting without providing formal stability guarantees under arbitrary perturbations. The discrete nature of behavioral module arbitration does, however, create an intriguing connection to switched dynamical systems, which can be amenable to formal stability analysis—a promising direction bridging learned policies with analytical guarantees. Scalability beyond the fixed 20-robot groups studied here remains an open question, as training complexity, communication constraints, and the collective behavior space all grow with swarm size. The modular approach is also most effective when tasks decompose naturally into sequences of available primitives: missions requiring precise continuous control or behaviors absent from the library will fail unless the library is extended, and systematic identification of task characteristics predicting modular policy success remains future work. The behavioral modules used here were deliberately simple—parameters fixed, the same six modules applied across all missions—to isolate the learning architecture's contribution; expanding module expressiveness without reintroducing overfitting is a key challenge ahead. Finally, the training efficiency advantage of \casa methods requires qualification. Convergence within \num{5000} simulation episodes represents a 40-fold reduction relative to evolutionary baselines, but \casa methods perform gradient updates at every control cycle (\numrange{1200}{1800} per episode) whereas evolutionary methods update only after complete episodes. This per-timestep overhead substantially narrows the practical efficiency gain, and rigorous comparison is further complicated by differences in implementation, hardware, and parallelization. Computational efficiency is therefore important future work, though it is independent of the sim-to-real transfer quality that constitutes our core contribution.
+
+Looking ahead, the approach opens several promising directions. The attention-based critic could be extended to heterogeneous swarms via role embeddings or morphology descriptors. Integration with multi-timescale hierarchical control—where higher-level policies select sequences of modules rather than individual modules at each step—could bridge reactive behaviors and long-horizon planning while preserving transfer benefits. Repertoire-based approaches~\cite{LigHasBir2020ants,HasLigBir2023SWEVO} could generate diverse module libraries through quality-diversity algorithms, providing richer action spaces without manual engineering. Alternatively, module parameters could be optimized jointly with selection policies while constraining their deviation from validated defaults, preserving transferability while enabling adaptation. Domain randomization and differentiable physics simulation could complement structural biases by training over distributions of simulation parameters. Understanding which module library properties—size, diversity, semantic coherence—most strongly predict successful learning and transfer would help extend the approach beyond swarm robotics to other multi-agent systems.
+
+From a methodological perspective, \acb bridges automatic modular design and gradient-based reinforcement learning—two traditions that evolved largely independently. Modular methods like AutoMoDe achieve transfer reliability through discrete search over predefined components but sacrifice sample efficiency; reinforcement learning achieves efficient credit assignment but struggles with sim-to-real transfer when policies operate directly on actuators. \acb inherits both advantages. Unlike hierarchical reinforcement learning, which learns policies at multiple temporal abstractions, \acb fixes low-level primitives and learns only high-level arbitration—deliberately eliminating variance at the actuator level.
+
+Reliable simulation-to-reality transfer in multi-agent reinforcement learning emerges not from scale or complexity, but from structure. By constraining policies to arbitrate among predefined behavioral modules, we embed domain knowledge directly into the learning architecture, reducing solution variance and enabling generalization from simulated training to physical deployment. The result unites the transfer reliability of modular design with the efficiency and automation of gradient-based learning. Reinforcement learning can now serve as a practical tool for the automatic design of robot swarms, producing control software that is learned, deployable, and reliable.
+
+
+
+\FloatBarrier
+%\newpage
+\section*{Materials and Methods}
+\label{sec:materialsmethods}
+
+\subsection*{E-Puck}
+\label{sec:epuck}
+Experiments were conducted on the e-puck robot platform~\cite{MonBonRae-etal2009arsc,GarFraBru-etal2015techrep}, equipped with an Overo Gumstix~\cite{Gct2018wiki} and a range-and-bearing board~\cite{GutAlvCam-etal2009icra}, conforming to reference model \refmod~\cite{HasLigFra-etal2018techrep} (Fig.~\ref{fig:epuck}). The robot carries eight proximity sensors, eight light sensors, and three ground sensors (distinguishing white, black, and gray floor regions). The range-and-bearing board reports the number of peers within approximately \qty{0.20}{\meter} and a vector toward their center of mass. The e-puck is a differential-drive robot with two independently controlled wheels actuated by stepper motors. In the configuration used in this study, including battery and all onboard components, each robot has a mass of approximately \qty{190}{\gram}. All decision-making relied exclusively on onboard sensors and local processing; no external infrastructure was used.
+
+\subsection*{Simulator}
+\label{sec:simulator}
+All training was conducted in a custom-built simulator developed in Unity (version~6000), implementing the same e-puck noise models as ARGoS3~\cite{PinTriOgr-etal2012SI}—the simulator used by Hasselmann et al.~\cite{HasLigRudBir2021NATUCOM}. The simulator integrates the ML-Agents library~\cite{JulBerTen-etal2018arxiv} (Apache Software License), which provides the MA-POCA algorithm~\cite{CohTenBer-etal2021arxiv}, a generalization of COMA~\cite{FoeFarAfo2018aaai}. We developed the \casa framework (Section~\nameref{sec:casa}) by modifying this implementation: whereas ML-Agents computes critic values from aggregated observations, our critic operates on the full aggregated state, following COMA's centralized training, decentralized execution paradigm. These modifications support both the continuous-action benchmark (dandelion) and the four \acb variants (Section~\nameref{sec:designmethods}). Because the e-puck cannot execute neural networks produced by modern libraries directly, we cross-compiled a custom version of its control software~\cite{GarFraBru-etal2015techrep} to deploy networks trained in Unity. The simulation runs at $f = \qty{10}{\per\second}$, matching the e-puck control cycle frequency.
+
+\subsection*{Arena}
+\label{sec:arena}
+The robots operated in a bounded dodecagonal arena of \qty{4.91}{\meter\squared}, enclosed by walls and occasionally populated with obstacles. The floor was predominantly gray, with regions marked in white or black depending on the mission (Section~\nameref{sec:missions}). In some missions, a single external light source near the arena remained active throughout.
+
+\subsection*{\casa Framework}
+\label{sec:casa}
+The \casaLongCaps (\casa) framework provides the common basis for both continuous-action
+(dandelion) and discrete-action (\acb variants: daisy, lily, tulip, cyclamen) methods.
+
+
+\medskip\noindent
+At time $t$, robot $i$ is in state $s^i_t \in \mathcal{S}$ and perceives observation 
+$o^i_t \in \mathcal{O}$.  
+%
+During training—in simulation—the full joint state 
+$\mathbf{s}_t=(s^1_t,\dots,s^N_t)$ is available to the critic; at deployment only $o^i_t$ is available to the policy. 
+%
+Each robot executes action $a^i_t \in \mathcal{A}$; the joint action and observation are 
+$\mathbf{a}_t=(a^1_t,\dots,a^N_t)$ and $\mathbf{o}_t=(o^1_t,\dots,o^N_t)$.
+%
+All environment elements are static, so $\mathbf{s}_t$ contains only robot states. We let $\mathcal{S} \subseteq \mathbb{R}^{d_\mathcal{S}}$ and $\mathcal{O} \subseteq \mathbb{R}^{d_\mathcal{O}}$ (discrete cases are special instances requiring no separate treatment). 
+We first treat $\mathcal{A} \subseteq \mathbb{N}^{d_\mathcal{A}}$ and then extend to the continuous case  
+$\mathcal{A} \subseteq \mathbb{R}^{d_\mathcal{A}}$.
+
+We model the system as a fully cooperative partially observable multi-agent Markov decision process 
+(POMDP) $\langle \mathcal{S}, \mathcal{O}, \mathcal{A}, P, r, \Omega, N, \gamma \rangle$,   
+where $P(\mathbf{s}_{t+1}\mid \mathbf{s}_t,\mathbf{a}_t)$ is the state-transition probability;
+$r(\mathbf{s}_{t+1},\mathbf{s}_t,\mathbf{a}_t) \in \mathbb{R}$ the instantaneous reward;     
+$\Omega(o^i_t\mid \mathbf{s}_t; i)$ the observation model; 
+and $\gamma \in [0,1]$ the discount factor.
+
+Each robot independently samples actions from a shared stochastic policy conditioned on its local observation: $a^i_t \sim \pi(\cdot|o^i_t;\theta)$, where 
+$\pi$ is implemented by a neural network with parameters $\theta$. 
+We assume independent decentralized policies with shared parameters. 
+The joint policy thus factorizes as $\boldsymbol{\pi}(\mathbf{a}_t|\mathbf{o}_t;\theta) = \prod_{i=1}^N \pi(a^i_t| o^i_t;\theta)$. 
+
+\medskip\noindent
+The objective is to maximize the expected discounted return:
+%
+\begin{equation}
+    J(\theta) = \E_{\pi(\cdot|\cdot\,;\,\theta)}\!\left[R_t\right], 
+\quad \text{where}\; R_t = \sum_{l=0}^\infty \gamma^l r_{t+l}.
+\end{equation}
+%
+The value and state-action value functions induced by $\pi$ are:
+%
+\begin{equation}
+V^\pi(\mathbf{s}) = \E_{\pi}\!\left[R_t |\,\mathbf{s}_t=\mathbf{s}\right]
+\quad\text{and}\quad 
+Q^\pi(\mathbf{s},\mathbf{a}) = \E_{\pi}\!\left[R_t |\,\mathbf{s}_t=\mathbf{s}, \mathbf{a}_t=\mathbf{a}\right].
+\end{equation}
+%
+It follows that $V^\pi(\mathbf{s}_t) = \E_{\mathbf{a}'\sim \boldsymbol{\pi}(\cdot|\mathbf{o}_t;\theta)}\left[Q^\pi(\mathbf{s}_t,\mathbf{a}')\right]$.
+%
+Using the log-derivative identity~\cite{Wil1992ML,SutBar2018book} 
+and the factorization of $\boldsymbol{\pi}$, the per-timestep policy gradient is:
+%
+\begin{equation}
+\label{eq:gradient}
+g_t  = \E_{\pi(\cdot|\cdot\,;\,\theta)}\!\Big[ \sum_i \nabla_{\!\theta} \log \pi(a^i_t|\,o^i_t;\theta) A^\pi(\mathbf{s}_t ,\mathbf{a}_t)\big|\,\mathbf{s}_0 \Big],
+\end{equation}
+%
+where the per-timestep advantage can be defined as $A^\pi(\mathbf{s}_t,\mathbf{a}_t) = Q^\pi(\mathbf{s}_t,\mathbf{a}_t)$
+or, if a \emph{baseline} is subtracted to reduce variance~\cite{Wil1992ML,SutBar2018book}, as:
+%
+\begin{equation}
+A^\pi(\mathbf{s}_t,\mathbf{a}_t) = Q^\pi(\mathbf{s}_t,\mathbf{a}_t) - V^\pi(\mathbf{s}_t) = Q^\pi(\mathbf{s}_t,\mathbf{a}_t) - \sum_{\mathbf{a}'\in \mathcal{A}^N} \boldsymbol{\pi}(\mathbf{a}'|\mathbf{o}_t;\theta) \,Q^\pi(\mathbf{s}_t,\mathbf{a}').
+\end{equation}
+%
+For credit assignment, we adopt a per-robot \emph{counterfactual baseline} that marginalizes over robot $i$'s action while keeping others fixed~\cite{FoeFarAfo2018aaai}: 
+%
+\begin{equation}
+A^\pi_i(\mathbf{s}_t,\mathbf{a}_t) 
+= Q^\pi(\mathbf{s}_t,\mathbf{a}_t) - \sum_{a'\in\mathcal{A}} \!\pi(a'|o^i_t;\,\theta)\, Q^\pi\left(\mathbf{s}_t,(\mathbf{a}^{-i}_t,a')\right),
+\end{equation}
+%
+where $(\mathbf{a}^{-i}_t,a') = (a^1_t,\dots,a^{i-1}_t,a',a^{i+1}_t,\dots,a^N_t)$ is the joint action with robot $i$’s action replaced by $a'$. 
+%
+Equation~\ref{eq:gradient} becomes:
+\begin{equation}
+\label{eq:counterfactual_gradient}
+g_t
+= \E_{\pi(\cdot|\cdot\,;\,\theta)}\!\Big[\sum_i \nabla_{\!\theta} \log \pi(a^i_t|\,o^i_t;\theta) 
+\,A^\pi_i(\mathbf{s}_t ,\mathbf{a}_t)\mid \mathbf{s}_0 \Big].
+\end{equation}
+%
+Exact marginalization requires summation over all discrete actions $\mathcal{A}$ and is tractable only for small discrete action spaces.
+%
+Additionally, $Q^\pi$ depends on the ordering of $\mathbf{s}_t$ and $\mathbf{a}_t$, whereas in a homogeneous swarm, robots are interchangeable and the value function should be permutation-invariant.
+
+To extend the formulation to continuous actions and enforce permutation invariance, we implement two transformer-based components~\cite{CohTenBer-etal2021arxiv}: a value network $V^\pi_\phi$ to compute $\lambda$-returns, and a counterfactual critic $Q^\pi_\psi$ to estimate per-agent baselines. We build on this established architecture—rather than introducing critic-level novelties—to isolate the effect of structural policy constraints on sim-to-real transfer.
+
+During training—in simulation—both $V^\pi_\phi$ and $Q^\pi_\psi$ exploit access to the full joint state $\mathbf{s}_t$ and joint action $\mathbf{a}_t$; at deployment, however, they are not required and each agent executes its policy based only on local observations.  
+%
+The per-agent advantage for robot $i$ at time $t$ is:
+%
+\begin{equation}
+\label{eq:counterfactual_network}
+A^\pi_i(\mathbf{s}_t,\mathbf{a}_t) = y_t^{(\lambda)} 
+- Q_\psi\Big(\mathrm{RSA}\big(g(s^i_t),f(s^j_t,a^j_t)_{\substack{1\leq j \leq N\\j\neq i}}\big)\Big),
+\end{equation}
+%
+where $y_t^{(\lambda)}$ is the $\lambda$-return and $\mathrm{RSA}$ is a permutation-invariant \emph{readout self-attention} operator~\cite{BakKanMar-etal2019arxiv,VasShaPar-etal2017nips,CohTenBer-etal2021arxiv}.
+%
+For each agent $i$, the input to the $\mathrm{RSA}$ module consists of a local embedding $g(s^i_t)$ and a collection of embeddings $f(s^j_t,a^j_t)$ for the other agents’ state–action pairs ($j\neq i$).
+%
+Formally, $g: \mathcal{S} \rightarrow E$ and $f: \mathcal{S}\times\mathcal{A} \rightarrow E$ are encoding networks that map their inputs to the embedding space $E$;
+%
+The aggregated embeddings produced by $\mathrm{RSA}$ are fed to $Q^\pi_\psi$, which outputs the counterfactual baseline for agent $i$.
+%
+The $\lambda$-return $y_t^{(\lambda)}$ is computed using truncated rollouts and bootstrapping from $V^\pi_\phi$: 
+\begin{equation}
+y_t^{(\lambda)} = (1-\lambda) \sum_{n=1}^\infty \lambda^{n-1} G_t^{(n)} \quad\text{and}\quad
+G_t^{(n)} = \sum_{l=0}^{n-1} \gamma^l r_{t+l} + \gamma^n V^\pi_\phi\Big(\mathrm{RSA}\big(g_i(s^i_t)_{1\leq i \leq N}\big)\Big),
+\end{equation}
+%
+where $G_t^{(n)}$ is the $n$-step TD-$\lambda$ return~\cite{SutBar2018book}.
+
+\medskip\noindent
+Both $V^\pi_\phi$ and $Q^\pi_\psi$ are trained to regress toward $y_t^{(\lambda)}$, minimizing the loss functions:
+%
+\begin{align}
+    \mathcal{L}_V(\phi) &= \bigg(V^\pi_\phi\Big(\mathrm{RSA}\big(g_i(s^i_t)_{1\leq i \leq N}\big)\Big) - y^{(\lambda)}\bigg)^2,\\
+     \mathcal{L}_Q(\psi) &= \bigg(Q_\psi\Big(\mathrm{RSA}\big(g_i(s^i_t),f(s^j_t,a^j_t)_{\substack{1\leq j \leq N\\j\neq i}}\big)\Big) - y_t^{(\lambda)}\bigg)^2.
+\end{align}
+%
+The policy $\pi$ is trained with proximal policy optimization (PPO)~\cite{SchWolDha-etal2017arxiv}, using the per-robot counterfactual advantage of Eq.~\ref{eq:counterfactual_network}.
+%
+The likelihood ratio between the new and old policies is:
+%
+\begin{equation}
+\rho_t^i(\theta)
+= \frac{\pi(a^i_t|o^i_t;\theta)}{\pi(a^i_t|o^i_t;\theta_\text{old})}.
+\end{equation}
+%
+where $\theta_\text{old}$ are the policy parameters from the previous iteration.  The clipped PPO objective prevents overly large updates by truncating $\rho_t^i(\theta)$:
+%
+\begin{equation}
+J^i_{\pi}(\theta)
+= \E\Big[\min\!\big(\rho_t^i(\theta)\,A^\pi_i,\;\mathrm{clip}(\rho_t^i(\theta),\,1-\epsilon,\,1+\epsilon)\,A^\pi_i\big)
++ \beta\, H\!\big(\pi(\cdot|o^i_t;\theta)\big)\Big],
+\end{equation}
+%
+where $\epsilon$ is the clipping parameter and $H\left(\pi(\cdot|o^i_t;\theta)\right)$  is the Shannon entropy of the action distribution for robot $i$ at time $t$, included to promote early exploration. 
+
+At each iteration, trajectories are collected into a short-horizon rollout buffer and reused for several PPO epochs; past experience is not mixed across iterations. Training uses $K=5$ parallel simulated environments, increasing effective batch size and reducing gradient variance.
+
+
+
+\subsection*{Design Methods}
+\label{sec:designmethods}
+We describe the three reference benchmarks (chocolate, evostick, randomwalk) and the five \casa methods (dandelion and the four \acb variants). All \casa methods share the same critic architecture; they differ only in their policy network.
+
+\paragraph{Chocolate.}
+Chocolate~\cite{FraBraBru-etal2015SI}, a member of the AutoMoDe family~\cite{BirLigFra2021admlsa}, constructs a probabilistic finite-state machine (PFSM) for the e-puck platform under reference model \refmod~\cite{HasLigFra-etal2018techrep}. States are drawn from six behavior modules (exploration, phototaxis, anti-phototaxis, attraction, repulsion, avoidance); transitions from six conditions (black floor, white floor, gray floor, neighbor count, inverted neighbor count, fixed probability).
+%
+\begin{table}[t]
+\caption{\textbf{Behavior and transition modules in chocolate.} 
+Predefined components of chocolate~\cite{FraBraBru-etal2014SI,FraBraBru-etal2015SI}.
+The \emph{chocolate} column gives the parameter domain in the original implementation;
+the \emph{\acb} column gives the fixed values adopted for all four \acb variants.\medskip\label{tab:automode_params}}
+\centering
+\begin{tabular}{|l|c|c|c|}
+\hline
+\textbf{Module} & \textbf{Parameter} & \textbf{chocolate} & \textbf{\acb} \\
+\hline
+\multicolumn{4}{|l|}{\textit{Behavior modules}} \\
+\hline
+exploration & $\tau$ (turn duration) & $\{1,2,\ldots,100\}$ & 5\\
+phototaxis & $k$ (obstacle gain) & 5 & 5 \\
+anti-phototaxis & $k$ (obstacle gain) & 5 & 5 \\
+attraction & $\alpha$ (attraction gain) & $[1,5]$ & 5 \\
+repulsion & $\alpha$ (repulsion gain) & $[1,5]$ & 5 \\
+stop & – & – & – \\
+\hline
+\multicolumn{4}{|l|}{\textit{Transition conditions}} \\
+\hline
+black-floor & $\beta$ (probability) & $[0,1]$ & – \\
+gray-floor & $\beta$ (probability) & $[0,1]$ & – \\
+white-floor & $\beta$ (probability) & $[0,1]$ & – \\
+neighbor-count & $\eta,\xi$ (steepness, threshold) & $[0,20],\{0,\ldots,10\}$ & – \\
+inverted neighbor-count & $\eta,\xi$ (steepness, threshold) & $[0,20],\{0,\ldots,10\}$ & – \\ 
+fixed-probability & $\beta$ (probability) & $[0,1]$ & – \\
+\hline
+\end{tabular}
+\end{table}
+%
+Module parameters are listed in Table~\ref{tab:automode_params}; the number of states, transitions, and all parameters are optimized via Iterated F-Race~\cite{BirYuaBalStu2010emaoa,LopDubPer-etal2016ORP,FraBraBru-etal2015SI}. Behavior modules use proximity, light, and range-and-bearing sensors; transition conditions use only ground-color sensors and neighbor count $N$. Real-robot performance data are taken from Hasselmann et al.~\cite{HasLigRudBir2021NATUCOM}.
+
+\paragraph{Evostick.}
+Evostick~\cite{FraBraBru-etal2014SI} evolves a feed-forward perceptron via elitist mutation and selection, targeting \refmod. All \refmod sensor readings are provided as input; the network outputs continuous wheel speeds. Real-robot performance data are taken from Hasselmann et al.~\cite{HasLigRudBir2021NATUCOM}.
+
+\paragraph{Randomwalk.}
+Randomwalk is the exploration behavior module of chocolate used in isolation: the robot moves forward until detecting an obstacle, then randomly reorients. No learning or tuning is involved; the single parameter is fixed to~10. Real-robot performance data are taken from Hasselmann et al.~\cite{HasLigRudBir2021NATUCOM}.
+
+\paragraph{Dandelion.}
+Dandelion is a continuous-action realization of the \casa framework (Section~\nameref{sec:casa}) and serves as the state-of-the-art MARL baseline; it implements POCA~\cite{CohTenBer-etal2021arxiv} with the critic operating on the joint pose rather than joint observations. Each robot's policy is a two-hidden-layer MLP (512 units each) that takes the full 24-dimensional \refmod observation vector (proximity, light, ground color, range-and-bearing, neighbor count) and outputs continuous wheel velocities in $[-0.12,0.12]\,\unit{\meter\per\second}$.
+
+Both $V^\pi_\phi$ and $Q^\pi_\psi$ use the same critic architecture: an entity encoder mapping inputs to a 128-dimensional embedding, followed by a single residual self-attention block (four heads) and two fully connected layers of 128 units with ReLU activations.
+
+Each robot's state is encoded as $s=\big(\rho,\cos(\alpha),\sin(\alpha),\cos(\beta),\sin(\beta)\big)$ (Fig.~\ref{fig:state}), removing angular discontinuities while preserving all information in $(\rho,\alpha,\beta)$.
+%
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=.5\textwidth]{figures/Fig-state.pdf}
+    \caption{\textbf{The state of a robot.}
+    The state is uniquely described by three quantities: $\rho$, the distance from the arena center to the robot; $\alpha$, the angle from the arena-center-to-light-source axis to the arena-center-to-robot segment; and $\beta$, the robot's orientation relative to the arena-center-to-robot axis. For neural processing the state is encoded as $s = \big(\rho,\cos(\alpha),\sin(\alpha),\cos(\beta),\sin(\beta)\big)$, removing angular discontinuities while preserving all information in $(\rho,\alpha,\beta)$.}
+    \label{fig:state}
+\end{figure}
+
+
+\paragraph{Daisy.}
+Daisy uses the same 512$\times$512 MLP as dandelion but replaces the continuous output with a six-way softmax over the predefined behavior modules (Table~\ref{tab:automode_params}); module parameters are fixed as shown. At each timestep the selected module drives the wheels. The critic is identical to dandelion's.
+
+
+
+\paragraph{Lily.}
+Lily restricts the policy input to the four sensors used by chocolate's transition conditions (three ground-color sensors and neighbor count), while retaining daisy's six-way module-selection output. Behavior modules internally retain full sensor access. The critic is identical to dandelion's.
+
+\paragraph{Tulip.}
+Tulip retains lily's inputs and outputs but replaces the two hidden layers with a single hidden layer of 128 units, reducing model capacity. The critic is identical to dandelion's.
+
+\paragraph{Cyclamen.}
+Cyclamen retains tulip's inputs and outputs but adds a 64-unit LSTM layer on top of the 128-unit feedforward layer. The LSTM integrates the 128 most recent inputs (\qty{12.8}{\second} at $f=\qty{10}{\per\second}$), enabling exploitation of short-term temporal dependencies. The critic is identical to dandelion's.
+
+\bigskip\noindent
+The five \casa methods form a controlled progression: dandelion provides a strong continuous-action MARL baseline; daisy introduces module arbitration; lily adds input restriction; tulip reduces model capacity; cyclamen selectively restores temporal memory. This sequence isolates the contribution of each structural constraint to sim-to-real transfer.
+
+The behavior modules were hand-written in a mission-agnostic way and kept fixed across all missions and \acb variants to isolate the contribution of the learning architecture. Automatic generation of such modules—via neuroevolution~\cite{LigHasBir2020ants}, evolutionary optimization~\cite{CamFer2022gecco}, or novelty search~\cite{HasLigBir2023SWEVO}—has been demonstrated without compromising modular transfer reliability, and represents a natural extension of the present work.
+
+
+\subsection*{Missions}
+\label{sec:missions}
+We evaluated each design method on the five missions of Hasselmann et al.~\cite{HasLigRudBir2021NATUCOM}, adopted without alteration to enable direct comparison with previously published results for evostick, chocolate, and randomwalk. All missions use the same dodecagonal arena of \qty{4.91}{\meter\squared}, a swarm of $N=20$ e-pucks, and a sampling frequency of $f=\qty{10}{\per\second}$. Performance metrics are identical to those of Hasselmann et al.\ and were not defined \emph{ad hoc} for this work; the mathematical expression constitutes the operative specification used during both training and evaluation. $\mathbf{1}[\cdot]$ denotes the indicator function.
+
+\paragraph{XOR‑Aggregation (XOR).}
+Two identical black circular areas lie on opposite sides of the arena. Robots must aggregate into one area; success is rewarded when robots converge in the \emph{same} area:
+$
+F_{\text{XOR}} = \sum_{t=1}^{Tf}\sum_{i=1}^{N}
+\mathbf{1}\bigl[\rho_i(t)\in A^+(t)\bigr],
+$
+where $T=\qty{180}{\second}$, $\rho_i(t)$ is the position of robot $i$ at step $t$, and $A^+(t)$ is the area hosting the largest number of robots at step $t$.
+
+\paragraph{Homing (HOM).}
+Starting in the northern half, the swarm must reach a single black goal area at the south. Performance depends only on the final configuration:
+$
+F_{\text{HOM}} = \sum_{i=1}^{N}\mathbf{1}\bigl[\rho_i(T)\in A_{\text{hom}}\bigr],
+$
+where $T=\qty{120}{\second}$ and $A_{\text{hom}}$ is the goal area.
+
+\paragraph{Foraging (FOR).}
+Two black food sources and one white nest are present; a red light near the nest provides a global cue. Each robot trip from a food source to the nest increments a counter $K$:
+$
+F_{\text{FOR}} = K,
+$
+where $T=\qty{180}{\second}$.
+
+\paragraph{Sheltering with constrained access (SHL).}
+A three-walled white shelter at the center is flanked by two black areas; its open side faces a red light. Performance is cumulative occupancy:
+$
+F_{\text{SHL}} = \sum_{t=1}^{Tf}\sum_{i=1}^{N}
+\mathbf{1}\bigl[\rho_i(t)\in A_{\text{shl}}\bigr],
+$
+where $T=\qty{180}{\second}$.
+
+\paragraph{Directional‑gate (DGT).}
+A white gate mid-arena must be crossed only from north to south; a black corridor may guide robots to it. Let $K^{+}$ and $K^{-}$ be correct and incorrect crossings:
+$
+F_{\text{DGT}} = K^{+}-K^{-},
+$
+where $T=\qty{120}{\second}$.
+
+
+\subsection*{Reward Structure}
+\label{sec:rewardstructure}
+For each \casa method, the instantaneous reward at each step is the term of the corresponding mission's performance metric (Section~\nameref{sec:missions}); no reward shaping or manual engineering is introduced.
+
+\paragraph{XOR‑Aggregation.} $r_{\text{XOR}}(t) = \sum_{i=1}^{N} \mathbf{1}\bigl[\rho_i(t)\in A^+(t)\bigr].$
+
+\paragraph{Homing.} $r_{\text{HOM}}(t) = \sum_{i=1}^{N}\mathbf{1}\bigl[\rho_i(t)\in A_{\text{hom}}\bigr]$ for $t=Tf$; $r_{\text{HOM}}(t)=0$ for $t<Tf$. This is a sparse reward: no feedback is provided until the final step, requiring robots to discover effective strategies through exploration alone.
+
+\paragraph{Foraging.} $r_{\text{FOR}}(t) = K(t)$, where $K(t)$ counts robots that just reached the nest having previously visited a food source since the episode start or their last nest visit.
+
+\paragraph{Sheltering with constrained access.} $r_{\text{SHL}}(t) = \sum_{i=1}^{N} \mathbf{1}\bigl[\rho_i(t)\in A_{\text{shl}}\bigr].$
+
+\paragraph{Directional‑gate.} $r_{\text{DGT}}(t) = K^{+}(t) - K^{-}(t).$
+
+\bigskip\noindent
+For chocolate and evostick, the performance metric is computed at episode end and used as a scalar reward signal. Randomwalk requires no reward structure.
+
+
+\subsection*{Experimental Setting}
+\label{sec:experimentalsetting}
+Each \casa method was independently executed 10 times per mission (\num{5000} simulation episodes per run), yielding 10 distinct control software instances. To mitigate the sim-to-real gap, we applied domain randomization over initial robot conditions and injected sensor and actuator noise~\cite{ZhaQueWes2020ssci}.
+
+Benchmark results for chocolate, evostick, and randomwalk are taken from Hasselmann et al.~\cite{HasLigRudBir2021NATUCOM}; chocolate and evostick were each trained with \num{200000} simulation evaluations.
+
+Each of the 10 instances per method per mission was evaluated once in simulation and once on physical robots. Executing each instance once rather than repeating fewer instances minimizes variance of the estimated expected performance under a fixed budget~\cite{LigCotGarBir2022IEEETEVC}. The sequence of robot experiments was randomized and no runs were discarded. Swarm performance was recorded by an overhead camera tracking robot positions via unique fiducial markers~\cite{LegGarKuc-etal2022techrep} at $f=\qty{10}{\per\second}$. The external light source was filtered through a red gel to prevent camera saturation while remaining detectable by the robots' infrared-sensitive sensors. Robots relied exclusively on local sensor information.
+
+
+
+\subsection*{Computational Environment}
+\label{sec:computationalenvironment}
+\acb variants were trained on a GPU-equipped SLURM cluster; each job ran on a node with an AMD EPYC Genoa processor (32~cores, 129\,GiB RAM) and one NVIDIA RTX~6000 Ada GPU (Linux~5.14, Python~3.10, CUDA~12.6), using the Unity ML-Agents toolkit. Each training session ran ten independent policy designs in parallel, each interacting with five concurrent simulated environments.
+
+Chocolate and evostick were trained on a CPU-only SLURM cluster with dual AMD EPYC~7452 processors (64~cores, 503\,GiB RAM; Linux~4.18, GCC~9.4.0, Python~3.6.8), using Iterated F-Race~\cite{LopDubPer-etal2016ORP} and a neuroevolutionary algorithm respectively, parallelized across candidate evaluations.
+
+\subsection*{Statistical Analysis and Data Presentation}
+\label{sec:statisticalanalysis}
+Training dynamics are shown as median learning curves over 10 runs (solid line) with interquartile range (25\textsuperscript{th}--75\textsuperscript{th} percentile, shaded).
+
+Final performance is visualized as notched box-whisker plots: the median (thick line), IQR (box), and whiskers extending to the most extreme points within $1.5\,\mathrm{IQR}$; points beyond this range are individual outliers. Notches are approximate 95\% confidence intervals for the median ($\pm1.58\,\mathrm{IQR}/\sqrt{n}$); non-overlapping notches indicate significantly different medians at the 95\% level (overlap does not imply the converse).
+
+Per-mission min--max normalization uses the minimum and maximum \emph{real-robot} performance across all methods, so normalized real-robot scores lie in $[0,1]$ and simulation scores may exceed~1.
+
+Mean ranks across missions are computed per mission by ordering methods on real-robot performance, then averaged. Bootstrap 95\% confidence intervals are obtained by resampling missions with replacement, recomputing mean ranks, and taking the 2.5\textsuperscript{th} and 97.5\textsuperscript{th} percentiles; non-overlapping intervals are interpreted as strong evidence of a rank difference.
+
+All figures use the IBM Design Library color-blind-safe palette, with each \casa method assigned a consistent color. Video recordings of all real-robot runs are provided as Movies~S0 to~S5.
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+%\newpage
+\bibliographystyle{IEEEtran}
+\bibliography{demiurge-bib/definitions,demiurge-bib/author,demiurge-bib/address,demiurge-bib/proceedings-short,demiurge-bib/journal-short,demiurge-bib/publisher,demiurge-bib/series-short,demiurge-bib/institution,demiurge-bib/bibliography}
+
+%\subsection*{Data and materials availability}
+%\subsection*{Code availability}
+
+\subsection*{Acknowledgments}
+The authors thank Mary Katherine Heinrich for reading a preliminary version of the manuscript and for her helpful suggestions.
+
+\subsection*{Funding}
+This research was partially supported by the Wallonia–Brussels Federation of Belgium through the ARC Advanced Project \emph{GbO -- Guaranteed by Optimization}. 
+It was also partially supported by the Belgian \emph{Fonds de la Recherche Scientifique--FNRS} through the PDR project \emph{Reinforcement Learning for Robot Swarms}, the CDR funding \emph{SwarmUP}, and the CDE funding \emph{SwarmSim}. 
+JS and MB further acknowledge support from the Belgian \emph{Fonds de la Recherche Scientifique--FNRS}, of which they are a FRIA Fellow and a Research Director, respectively.
+
+\subsection*{Author contributions}
+The original concept was proposed by IG and MB and further developed with the contribution of GLH and JS.
+The software was implemented by IG with assistance from KH and MK.
+The experimental design was conceived by IG and MB; experiments were carried out by IG with help from MK.
+IG and MB drafted the manuscript; GLH, JS, and MK contributed to the literature review.
+All authors discussed the results and contributed to the final revision of the manuscript.
+The research was directed by MB.
+
+\subsection*{Competing interests}
+The authors declare that they have no competing interests.
+
+%\subsection*{Supplementary materials}
+
+
+\end{document}
+% End of science_template.tex
