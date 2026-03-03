@@ -107,21 +107,15 @@ def main():
     obs_dict, _ = env.reset()
     obs_dim = obs_dict[agents[0]].shape[-1]
     act_dim = ckpt.get("act_dim", 2)
-    state_dim = ckpt.get("state_dim", 5)
-
-    # Actor receives sensor obs + 5D state (matching ML-Agents training).
-    # At inference, the 5D state is zeroed (trainingOnly=true in Unity).
-    actor_obs_dim = ckpt.get("actor_obs_dim", obs_dim + state_dim)
 
     print(f"[Play] variant={variant}  discrete={discrete}  "
           f"hidden={hidden_dim}  layers={num_layers}  "
-          f"obs={obs_dim}  state={state_dim}  actor_obs={actor_obs_dim}  "
-          f"act={'discrete(' + str(num_actions) + ')' if discrete else str(act_dim)}")
+          f"obs={obs_dim}  act={'discrete(' + str(num_actions) + ')' if discrete else str(act_dim)}")
 
     if discrete:
-        actor = DiscreteActor(actor_obs_dim, num_actions, hidden_dim, num_layers).to(device)
+        actor = DiscreteActor(obs_dim, num_actions, hidden_dim, num_layers).to(device)
     else:
-        actor = Actor(actor_obs_dim, act_dim, hidden_dim, num_layers).to(device)
+        actor = Actor(obs_dim, act_dim, hidden_dim, num_layers).to(device)
 
     actor.load_state_dict(ckpt["actor"])
     actor.eval()
@@ -142,10 +136,7 @@ def main():
             action_dict = {}
             for i, agent in enumerate(agents):
                 obs = obs_dict[agent]  # (E, obs_dim)
-                # Append zeroed 5D state (trainingOnly=true: zeros at inference)
-                state_zeros = torch.zeros(obs.shape[0], state_dim, device=device)
-                actor_input = torch.cat([obs, state_zeros], dim=-1)  # (E, actor_obs_dim)
-                dist = actor.get_dist(actor_input)
+                dist = actor.get_dist(obs)
                 if args.deterministic:
                     if discrete:
                         act = dist.probs.argmax(dim=-1)  # (E,)

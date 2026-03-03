@@ -11,7 +11,7 @@ Architecture (matching ML-Agents exactly):
   and `tanh_squash=False` (raw linear mean, no squashing).
   mu_head initialized with KaimingHeNormal, gain=0.2.
   Log-prob returned **per action dimension** (not summed) for per-dim PPO clipping.
-  Entropy: mean across action dims.
+  Entropy: sum across action dims (matches ML-Agents action_model.py).
 
 • **Critic** — POCAValueNetwork wrapping MultiAgentNetworkBody:
   - Uses 5D polar state (ρ, cos α, sin α, cos β, sin β) instead of agent obs.
@@ -194,16 +194,18 @@ class Actor(nn.Module):
         return Normal(mu, std)
 
     def evaluate(self, obs: torch.Tensor, actions: torch.Tensor):
-        """Return per-dim log_prob and mean entropy.
+        """Return per-dim log_prob and summed entropy.
 
         Returns:
             log_prob_per_dim: (B, act_dim) — NOT summed across dims.
                 ML-Agents computes PPO ratio per action dimension.
-            entropy: (B,) — mean entropy across action dims.
+            entropy: (B,) — SUM of entropy across action dims.
+                ML-Agents action_model.py: "Use the sum of entropy
+                across actions, not the mean" (torch.sum(entropies, dim=1)).
         """
         dist = self.get_dist(obs)
         log_prob_per_dim = dist.log_prob(actions)      # (B, act_dim)
-        entropy = dist.entropy().mean(dim=-1)           # (B,)
+        entropy = dist.entropy().sum(dim=-1)            # (B,)
         return log_prob_per_dim, entropy
 
 

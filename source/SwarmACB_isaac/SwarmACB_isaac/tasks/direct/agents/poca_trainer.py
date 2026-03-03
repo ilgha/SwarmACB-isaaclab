@@ -59,7 +59,7 @@ class POCAConfig:
 
     # Optimiser
     lr: float = 3e-4
-    adam_eps: float = 1e-7
+    adam_eps: float = 1e-8           # ML-Agents uses PyTorch default (1e-8)
 
     # Schedules: "linear" or "constant"
     lr_schedule: str = "constant"
@@ -220,31 +220,19 @@ class POCATrainer:
         # state and not the observation of the agents."
         self.state_dim = 5
 
-        # ── Actor observation dimension ─────────────────────────
-        # In ML-Agents, PerAgentState5DSensor (trainingOnly=true) is
-        # included in the actor's observation during training.  The actor
-        # receives ALL observations concatenated:
-        #   actor_obs = [sensor_obs (24-dim), state (5-dim)] = 29-dim
-        # The critic receives ONLY state (5-dim) via _state_only_obs().
-        # At inference the 5D state is zeroed (trainingOnly), but during
-        # training the actor uses it for faster learning (it provides
-        # direct position/heading info relative to the gate).
-        self.actor_obs_dim = self.obs_dim + self.state_dim
-
         print(f"[POCA] envs={self.num_envs}  agents={self.num_agents}  "
               f"obs={self.obs_dim}  state={self.state_dim}  "
-              f"actor_obs={self.actor_obs_dim}  "
               f"act={'discrete(' + str(self.num_actions) + ')' if self.discrete else str(self.act_dim)}  "
               f"decision_period={self.decision_period}")
-        print("[POCA] Actor sees obs+state (29-dim), Critic sees state only (5-dim)")
+        print("[POCA] Actor uses local obs only; Critic uses 5D polar state")
 
         if self.discrete:
             self.actor = DiscreteActor(
-                self.actor_obs_dim, self.num_actions, c.hidden_dim, c.num_layers,
+                self.obs_dim, self.num_actions, c.hidden_dim, c.num_layers,
             ).to(self.device)
         else:
             self.actor = Actor(
-                self.actor_obs_dim, self.act_dim, c.hidden_dim, c.num_layers,
+                self.obs_dim, self.act_dim, c.hidden_dim, c.num_layers,
             ).to(self.device)
 
         self.critic = POCACritic(
@@ -312,10 +300,17 @@ class POCATrainer:
         self._rollout_reward_history: list[float] = []
         self._max_history = 100  # keep last N rollout rewards
 
-        # Print param count
+        # Print param count & batch info
         actor_params = sum(p.numel() for p in self.actor.parameters())
         critic_params = sum(p.numel() for p in self.critic.parameters())
+        group_mb = max(1, c.mini_batch_size // self.num_agents)
+        T_E = c.horizon * self.num_envs
+        n_batches = (T_E + group_mb - 1) // group_mb
         print(f"[POCA] Actor params: {actor_params:,}  Critic params: {critic_params:,}")
+        print(f"[POCA] Mini-batch: {c.mini_batch_size} agent-transitions "
+              f"→ {group_mb} group entries  "
+              f"({n_batches} batches/epoch × {c.num_epochs} epochs "
+              f"= {n_batches * c.num_epochs} gradient updates/rollout)")
         print(f"[POCA] TensorBoard → {c.log_dir}")
 
     # ──────────────────────────────────────────────────────────────
@@ -386,16 +381,9 @@ class POCATrainer:
                 # (E, N, C, H, W) -> (E, N, C*H*W)
                 obs_stacked = obs_stacked.view(obs_stacked.shape[0], obs_stacked.shape[1], -1)
 
-            # ── get 5D state for critic AND actor ─────────────────
-            # ML-Agents: PerAgentState5DSensor provides 5D state to the
-            # actor as part of its observation (trainingOnly=true).
-            # The actor sees [sensor_obs, state] = 29-dim.
-            critic_state = self.unwrapped.get_critic_state()           # (E, N, 5)
-
             # ── sample actions from shared actor (batched over all agents) ──
-            # Actor obs = sensor obs (24) + state (5) = 29-dim
-            actor_obs = torch.cat([obs_stacked, critic_state], dim=-1) # (E, N, 29)
-            flat_obs = actor_obs.reshape(-1, actor_obs.shape[-1])      # (E*N, 29)
+            # Actor uses LOCAL observations only (swarm robotics: no global knowledge)
+            flat_obs = obs_stacked.reshape(-1, obs_stacked.shape[-1])  # (E*N, obs)
             dist = self.actor.get_dist(flat_obs)
 
             if self.discrete:
@@ -410,6 +398,7 @@ class POCATrainer:
                 all_log_probs = flat_logp.view(self.num_envs, self.num_agents, self.act_dim)
 
             # ── critic: team value V(s) — uses 5D polar STATE ─────
+            critic_state = self.unwrapped.get_critic_state()           # (E, N, 5)
             team_val = self.critic.critic_pass(critic_state).squeeze(-1)  # (E,)
 
             # ── baselines: counterfactual b_i — also uses STATE ───
@@ -504,7 +493,13 @@ class POCATrainer:
         n_updates = 0
 
         for _epoch in range(cfg.num_epochs):
-            for batch in self.buffer.get_batches(cfg.mini_batch_size):
+            # ML-Agents batch_size is in *individual agent transitions*.
+            # Our get_batches iterates over (T, E) group entries where each
+            # entry contains N agents.  Convert: group_mb = batch_size // N
+            # so each mini-batch has ~batch_size individual transitions.
+            # This gives the same gradient-step-to-data ratio as ML-Agents.
+            group_mb = max(1, cfg.mini_batch_size // self.num_agents)
+            for batch in self.buffer.get_batches(group_mb):
                 obs = batch["obs"]                  # (MB, N, obs)
                 critic_states = batch["critic_states"]  # (MB, N, 5)
                 actions = batch["actions"]          # (MB, N, act)
@@ -517,9 +512,8 @@ class POCATrainer:
                 MB, N = obs.shape[:2]
 
                 # ── policy loss (batched over all agents, shared actor) ─
-                # Actor obs = sensor obs (24) + state (5) = 29-dim
-                actor_obs = torch.cat([obs, critic_states], dim=-1)    # (MB, N, 29)
-                flat_obs = actor_obs.reshape(-1, actor_obs.shape[-1])  # (MB*N, 29)
+                # Actor uses LOCAL obs only (no global state)
+                flat_obs = obs.reshape(-1, obs.shape[-1])              # (MB*N, obs)
                 flat_act = actions.reshape(-1, actions.shape[-1])      # (MB*N, act_dim)
                 flat_logp, flat_ent = self.actor.evaluate(flat_obs, flat_act)
                 # flat_logp: (MB*N, act_dim), flat_ent: (MB*N,)
@@ -781,7 +775,6 @@ class POCATrainer:
             "act_dim": self.act_dim,
             "state_dim": self.state_dim,
             "obs_dim": self.obs_dim,
-            "actor_obs_dim": self.actor_obs_dim,
         }, path)
         print(f"[POCA] Saved → {path}")
 
