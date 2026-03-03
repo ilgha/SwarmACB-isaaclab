@@ -264,22 +264,14 @@ class DirectionalGateEnv(DirectMARLEnv):
     def _update_visual_markers(self):
         """Update robot and heading marker positions from kinematic state.
 
-        Skipped when running headless (no viewport) to avoid costly GPU→CPU
-        transfers every step.  Also throttled to every 5th step when visible.
+        Skipped entirely when running headless (no viewport) to avoid
+        costly GPU→CPU transfers every step.
         """
         # Skip entirely in headless mode (no viewer)
-        if not hasattr(self, '_render_mode') or self._render_mode is None:
-            # Check if sim has a running viewer
-            try:
-                if not self.sim.has_gui():
-                    return
-            except (AttributeError, RuntimeError):
-                pass
-
-        # Throttle to every 5th step to reduce CPU overhead
-        step = getattr(self, '_marker_counter', 0)
-        self._marker_counter = step + 1
-        if step % 5 != 0:
+        try:
+            if not self.sim.has_gui():
+                return
+        except (AttributeError, RuntimeError):
             return
 
         N = self.cfg.num_agents
@@ -530,12 +522,17 @@ class DirectionalGateEnv(DirectMARLEnv):
         else:
             # ── Dandelion continuous ──────────────────────────────
             # Stack (E, N, 2): [left_vel, right_vel]
+            # Actions are in NORMALIZED [-1, 1] space (matching ML-Agents).
+            # Unity's ContinuousActionOutputApplier clips to [-1, 1]
+            # before the C# env scales by MaxVelocity.
             actions_stacked = torch.stack(
                 [self._raw_actions[a] for a in cfg.possible_agents],
                 dim=1,
             )  # (E, N, 2)
-            left_vel = actions_stacked[:, :, 0].clamp(-cfg.max_wheel_speed, cfg.max_wheel_speed)
-            right_vel = actions_stacked[:, :, 1].clamp(-cfg.max_wheel_speed, cfg.max_wheel_speed)
+            # Clamp to [-1, 1] then scale to wheel velocity
+            actions_clamped = actions_stacked.clamp(-1.0, 1.0)
+            left_vel = actions_clamped[:, :, 0] * cfg.max_wheel_speed
+            right_vel = actions_clamped[:, :, 1] * cfg.max_wheel_speed
 
         # ── Differential-drive kinematic integration ──────────────
         dt = cfg.sim.dt
@@ -771,7 +768,10 @@ class DirectionalGateEnv(DirectMARLEnv):
             env_ids = list(range(self.num_envs))
         super()._reset_idx(env_ids)
 
-        idx = torch.tensor(env_ids, device=self.device, dtype=torch.long)
+        if isinstance(env_ids, torch.Tensor):
+            idx = env_ids.to(device=self.device, dtype=torch.long)
+        else:
+            idx = torch.tensor(env_ids, device=self.device, dtype=torch.long)
         N = self.cfg.num_agents
         R = self.cfg.arena_circumradius
 

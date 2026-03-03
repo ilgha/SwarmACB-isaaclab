@@ -38,6 +38,7 @@ class POCARolloutBuffer:
         num_agents: int,
         obs_dim: int,
         act_dim: int,
+        state_dim: int = 5,
         gamma: float = 0.99,
         lam: float = 0.95,
         device: torch.device | str = "cuda",
@@ -47,6 +48,7 @@ class POCARolloutBuffer:
         self.num_agents = num_agents
         self.obs_dim = obs_dim
         self.act_dim = act_dim
+        self.state_dim = state_dim
         self.gamma = gamma
         self.lam = lam
         self.device = device
@@ -55,6 +57,9 @@ class POCARolloutBuffer:
 
         # ── Per-step storage ──────────────────────────────────────
         self.obs = torch.zeros(T, E, N, obs_dim, device=device)
+        # Critic state: 5D polar (ρ, cos α, sin α, cos β, sin β) — separate from obs
+        # The critic uses this instead of agent observations (SwarmACB modification).
+        self.critic_states = torch.zeros(T, E, N, state_dim, device=device)
         self.actions = torch.zeros(T, E, N, act_dim, device=device)
         # Per-dim log_probs (NOT summed!) — needed for ML-Agents per-dim PPO clipping
         self.log_probs = torch.zeros(T, E, N, act_dim, device=device)
@@ -79,6 +84,7 @@ class POCARolloutBuffer:
     def add(
         self,
         obs: torch.Tensor,            # (E, N, obs_dim)
+        critic_states: torch.Tensor,   # (E, N, state_dim)  — 5D polar state for critic
         actions: torch.Tensor,         # (E, N, act_dim)
         log_probs: torch.Tensor,       # (E, N, act_dim)  — per-dim!
         reward: torch.Tensor,          # (E,)
@@ -88,6 +94,7 @@ class POCARolloutBuffer:
     ):
         t = self.ptr
         self.obs[t] = obs
+        self.critic_states[t] = critic_states
         self.actions[t] = actions
         self.log_probs[t] = log_probs
         self.rewards[t] = reward
@@ -141,6 +148,7 @@ class POCARolloutBuffer:
         total = T * E
 
         flat_obs = self.obs.view(total, N, self.obs_dim)
+        flat_cs = self.critic_states.view(total, N, self.state_dim)
         flat_act = self.actions.view(total, N, self.act_dim)
         flat_logp = self.log_probs.view(total, N, self.act_dim)    # per-dim!
         flat_adv = self.advantages.view(total, N)
@@ -155,6 +163,7 @@ class POCARolloutBuffer:
             idx = indices[start:end]
             yield {
                 "obs": flat_obs[idx],                # (MB, N, obs_dim)
+                "critic_states": flat_cs[idx],       # (MB, N, state_dim)
                 "actions": flat_act[idx],            # (MB, N, act_dim)
                 "old_log_probs": flat_logp[idx],     # (MB, N, act_dim) — per-dim!
                 "advantages": flat_adv[idx],         # (MB, N)

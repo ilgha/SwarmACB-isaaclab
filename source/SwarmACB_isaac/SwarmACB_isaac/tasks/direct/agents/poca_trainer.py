@@ -207,9 +207,16 @@ class POCATrainer:
         c = self.cfg
         self.decision_period = c.decision_period
 
+        # Critic state dimension: 5D polar (ρ, cos α, sin α, cos β, sin β)
+        # Matches SwarmACB Unity modification: "the value function takes the
+        # state and not the observation of the agents."
+        self.state_dim = 5
+
         print(f"[POCA] envs={self.num_envs}  agents={self.num_agents}  "
-              f"obs={self.obs_dim}  act={'discrete(' + str(self.num_actions) + ')' if self.discrete else str(self.act_dim)}  "
+              f"obs={self.obs_dim}  state={self.state_dim}  "
+              f"act={'discrete(' + str(self.num_actions) + ')' if self.discrete else str(self.act_dim)}  "
               f"decision_period={self.decision_period}")
+        print("[POCA] Critic uses 5D polar STATE (not obs)")
 
         if self.discrete:
             self.actor = DiscreteActor(
@@ -221,7 +228,7 @@ class POCATrainer:
             ).to(self.device)
 
         self.critic = POCACritic(
-            self.obs_dim, self.act_dim_critic, self.num_agents,
+            self.state_dim, self.act_dim_critic, self.num_agents,
             c.hidden_dim, c.critic_num_heads, c.num_layers,
         ).to(self.device)
 
@@ -258,6 +265,7 @@ class POCATrainer:
             num_agents=self.num_agents,
             obs_dim=self.obs_dim,
             act_dim=self.act_dim,
+            state_dim=self.state_dim,
             gamma=c.gamma,
             lam=c.lam,
             device=self.device,
@@ -370,12 +378,13 @@ class POCATrainer:
                 all_actions = flat_act.view(self.num_envs, self.num_agents, self.act_dim)
                 all_log_probs = flat_logp.view(self.num_envs, self.num_agents, self.act_dim)
 
-            # ── critic: team value V(s) — obs only ────────────────
-            team_val = self.critic.critic_pass(obs_stacked).squeeze(-1)  # (E,)
+            # ── critic: team value V(s) — uses 5D polar STATE ─────
+            critic_state = self.unwrapped.get_critic_state()           # (E, N, 5)
+            team_val = self.critic.critic_pass(critic_state).squeeze(-1)  # (E,)
 
-            # ── baselines: counterfactual b_i ─────────────────────
+            # ── baselines: counterfactual b_i — also uses STATE ───
             critic_actions = self._encode_actions_for_critic(all_actions)
-            baselines = self.critic.all_baselines(obs_stacked, critic_actions)  # (E, N)
+            baselines = self.critic.all_baselines(critic_state, critic_actions)  # (E, N)
 
             # ── step environment decision_period times ────────────
             # Same action for all sub-steps; env applies velocity
@@ -395,6 +404,7 @@ class POCATrainer:
             # ── store ONE transition per decision ─────────────────
             self.buffer.add(
                 obs=obs_stacked,
+                critic_states=critic_state,
                 actions=all_actions,
                 log_probs=all_log_probs,  # per-dim!
                 reward=accumulated_reward * self.reward_strength,
@@ -425,11 +435,9 @@ class POCATrainer:
             # Count agent-decisions (matching ML-Agents max_steps)
             self.global_step += self.num_envs * self.num_agents
 
-        # ── bootstrap V for lambda-return ─────────────────────────
-        obs_stacked = torch.stack([obs_dict[a] for a in agents], dim=1)
-        if obs_stacked.ndim == 5:
-            obs_stacked = obs_stacked.view(obs_stacked.shape[0], obs_stacked.shape[1], -1)
-        last_tv = self.critic.critic_pass(obs_stacked).squeeze(-1)
+        # ── bootstrap V for lambda-return (uses 5D STATE) ─────────
+        last_state = self.unwrapped.get_critic_state()                # (E, N, 5)
+        last_tv = self.critic.critic_pass(last_state).squeeze(-1)
         self.buffer.compute_returns_and_advantages(last_tv)
 
         return obs_dict
@@ -456,6 +464,7 @@ class POCATrainer:
         for _epoch in range(cfg.num_epochs):
             for batch in self.buffer.get_batches(cfg.mini_batch_size):
                 obs = batch["obs"]                  # (MB, N, obs)
+                critic_states = batch["critic_states"]  # (MB, N, 5)
                 actions = batch["actions"]          # (MB, N, act)
                 old_logp = batch["old_log_probs"]   # (MB, N, act_dim) per-dim!
                 advantages = batch["advantages"]    # (MB, N)
@@ -489,10 +498,10 @@ class POCATrainer:
                 )
                 mean_entropy = ent_all.mean()
 
-                # ── critic: recompute V and baselines ─────────────
-                new_tv = self.critic.critic_pass(obs).squeeze(-1)       # (MB,)
+                # ── critic: recompute V and baselines (use 5D STATE) ─
+                new_tv = self.critic.critic_pass(critic_states).squeeze(-1)  # (MB,)
                 critic_act = self._encode_actions_for_critic(actions)
-                new_bl = self.critic.all_baselines(obs, critic_act)     # (MB, N)
+                new_bl = self.critic.all_baselines(critic_states, critic_act)  # (MB, N)
 
                 # ── value loss (trust-region clipped) ─────────────
                 value_loss = trust_region_value_loss(
@@ -599,84 +608,88 @@ class POCATrainer:
                 self._next_summary_step += self.cfg.summary_freq
                 s = self.global_step
 
-                # ── Losses & schedule params ──────────────────────
-                self.writer.add_scalar(
-                    "losses/policy", metrics["policy_loss"], s)
-                self.writer.add_scalar(
-                    "losses/value", metrics["value_loss"], s)
-                self.writer.add_scalar(
-                    "losses/baseline",
-                    metrics["baseline_loss"], s)
-                self.writer.add_scalar(
-                    "losses/entropy", metrics["entropy"], s)
-                self.writer.add_scalar(
-                    "charts/learning_rate", metrics["lr"], s)
-                self.writer.add_scalar(
-                    "charts/epsilon", metrics["eps"], s)
-                self.writer.add_scalar(
-                    "charts/beta", metrics["beta"], s)
-                self.writer.add_scalar("charts/SPS", sps, s)
+                # ══════════════════════════════════════════════════
+                #  ML-Agents exact tags (same names as Unity TB)
+                # ══════════════════════════════════════════════════
 
-                # ── Reward: rollout-level ─────────────────────────
+                # ── Losses (ML-Agents: Losses/*) ──────────────────
                 self.writer.add_scalar(
-                    "reward/mean_rollout",
+                    "Losses/Policy Loss",
+                    metrics["policy_loss"], s)
+                self.writer.add_scalar(
+                    "Losses/Value Loss",
+                    metrics["value_loss"], s)
+                self.writer.add_scalar(
+                    "Losses/POCA/Baseline Loss",
+                    metrics["baseline_loss"], s)
+
+                # ── Policy (ML-Agents: Policy/*) ──────────────────
+                self.writer.add_scalar(
+                    "Policy/Entropy", metrics["entropy"], s)
+                self.writer.add_scalar(
+                    "Policy/Learning Rate", metrics["lr"], s)
+                self.writer.add_scalar(
+                    "Policy/Epsilon", metrics["eps"], s)
+                self.writer.add_scalar(
+                    "Policy/Beta", metrics["beta"], s)
+
+                # Extrinsic Reward = mean per-step reward over the
+                # rollout (ML-Agents logs this as the mean reward
+                # received per agent-decision across the buffer)
+                mean_step_reward = (
+                    self.buffer.rewards.mean().item()
+                )
+                self.writer.add_scalar(
+                    "Policy/Extrinsic Reward",
+                    mean_step_reward, s)
+
+                # Extrinsic Value Estimate = mean V(s) prediction
+                self.writer.add_scalar(
+                    "Policy/Extrinsic Value Estimate",
+                    self.buffer.team_values.mean().item(), s)
+
+                # ── Environment (ML-Agents: Environment/*) ────────
+                if self._completed_episode_returns:
+                    ep = self._completed_episode_returns
+                    self.writer.add_scalar(
+                        "Environment/Cumulative Reward",
+                        sum(ep) / len(ep), s)
+                    self._completed_episode_returns.clear()
+
+                if self._completed_episode_lengths:
+                    el = self._completed_episode_lengths
+                    self.writer.add_scalar(
+                        "Environment/Episode Length",
+                        sum(el) / len(el), s)
+                    self._completed_episode_lengths.clear()
+
+                # ══════════════════════════════════════════════════
+                #  Extra diagnostics (beyond ML-Agents)
+                # ══════════════════════════════════════════════════
+
+                self.writer.add_scalar(
+                    "Extra/SPS", sps, s)
+                self.writer.add_scalar(
+                    "Extra/Mean Rollout Reward",
                     mean_rollout_reward, s)
                 rolling_avg = (
                     sum(self._rollout_reward_history)
                     / len(self._rollout_reward_history)
                 )
                 self.writer.add_scalar(
-                    "reward/rolling_avg_rollout", rolling_avg, s)
-
-                # ── Reward: in-progress episodes ──────────────────
+                    "Extra/Rolling Avg Rollout Reward",
+                    rolling_avg, s)
                 self.writer.add_scalar(
-                    "reward/mean_in_progress",
-                    self._episode_reward_acc.mean().item(), s)
-                self.writer.add_scalar(
-                    "reward/max_in_progress",
-                    self._episode_reward_acc.max().item(), s)
+                    "Extra/Mean Abs Advantage",
+                    self.buffer.advantages.abs().mean().item(), s)
 
-                # ── Reward: completed episodes ────────────────────
-                if self._completed_episode_returns:
-                    ep = self._completed_episode_returns
-                    self.writer.add_scalar(
-                        "reward/mean_episode",
-                        sum(ep) / len(ep), s)
-                    self.writer.add_scalar(
-                        "reward/max_episode", max(ep), s)
-                    self.writer.add_scalar(
-                        "reward/min_episode", min(ep), s)
-                    self.writer.add_scalar(
-                        "reward/num_episodes", len(ep), s)
-                    self._completed_episode_returns.clear()
-
-                # ── Group reward (gate crossings) ─────────────────
+                # Group reward (gate crossings — mission-specific)
                 if self._completed_group_rewards:
                     gr = self._completed_group_rewards
                     self.writer.add_scalar(
-                        "group_reward/mean_episode",
+                        "Extra/Group Reward Mean",
                         sum(gr) / len(gr), s)
-                    self.writer.add_scalar(
-                        "group_reward/max_episode", max(gr), s)
-                    self.writer.add_scalar(
-                        "group_reward/min_episode", min(gr), s)
                     self._completed_group_rewards.clear()
-
-                # ── Episode length ────────────────────────────────
-                if self._completed_episode_lengths:
-                    el = self._completed_episode_lengths
-                    self.writer.add_scalar(
-                        "episode/mean_length",
-                        sum(el) / len(el), s)
-                    self._completed_episode_lengths.clear()
-
-                # ── Critic / advantage diagnostics ────────────────
-                self.writer.add_scalar(
-                    "charts/mean_value",
-                    self.buffer.team_values.mean().item(), s)
-                self.writer.add_scalar(
-                    "charts/mean_abs_advantage",
-                    self.buffer.advantages.abs().mean().item(), s)
 
             # 5. checkpoint (step-based, matching ML-Agents)
             if self.global_step >= self._next_checkpoint_step:
@@ -712,6 +725,7 @@ class POCATrainer:
             "discrete": self.discrete,
             "num_actions": self.num_actions if self.discrete else 0,
             "act_dim": self.act_dim,
+            "state_dim": self.state_dim,
         }, path)
         print(f"[POCA] Saved → {path}")
 

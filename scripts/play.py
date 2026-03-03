@@ -125,7 +125,8 @@ def main():
     episode_count = 0
 
     obs_dict, _ = env.reset()
-    ep_reward = torch.zeros(args.num_envs, device=device)
+    num_envs = unwrapped.num_envs
+    ep_reward = torch.zeros(num_envs, device=device)
 
     print(f"[Play] Evaluating {args.num_episodes} episodes "
           f"({'deterministic' if args.deterministic else 'stochastic'})...")
@@ -154,7 +155,7 @@ def main():
         ep_reward += reward_dict[agents[0]]
 
         # Check for done envs
-        for ei in range(args.num_envs):
+        for ei in range(num_envs):
             done = (terminated_dict[agents[0]][ei] | truncated_dict[agents[0]][ei]).item()
             if done:
                 episode_rewards.append(ep_reward[ei].item())

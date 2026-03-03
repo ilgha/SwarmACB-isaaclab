@@ -14,15 +14,20 @@ Architecture (matching ML-Agents exactly):
   Entropy: mean across action dims.
 
 • **Critic** — POCAValueNetwork wrapping MultiAgentNetworkBody:
-  - Raw observations go directly into EntityEmbedding (no separate obs MLP).
+  - Uses 5D polar state (ρ, cos α, sin α, cos β, sin β) instead of agent obs.
+    This matches the SwarmACB modification in Unity (PerAgentState5DSensor.cs +
+    optimizer_torch.py _state_only_obs routing).
+  - State goes directly into EntityEmbedding (no separate obs MLP).
   - EntityEmbedding = LinearEncoder(1 layer, Swish, T-Fixup init).
-  - Two entity encoders: obs_entity_enc (obs only) and obs_act_entity_enc (obs+action).
+  - Two entity encoders: obs_entity_enc (state only) and obs_act_entity_enc (state+action).
   - ResidualSelfAttention with masked average pooling.
   - Post-attention LinearEncoder (num_layers, Swish, T-Fixup init).
   - Append normalized agent count → value head.
 
-• **Weight init**: T-Fixup scheme — Normal(std = (0.125 / embed_dim)^0.5)
-  used for entity embeddings, attention projections, and post-attention encoder.
+• **Actor** — SimpleActor sees sensor obs concatenated with 5D state.
+  In Unity, PerAgentState5DSensor provides a second observation buffer.
+  ML-Agents VectorInput is pass-through, so concatenation is equivalent.
+  actor_obs_dim = sensor_obs_dim + 5.
 
 Reference: Unity ML-Agents POCA
   ml-agents/mlagents/trainers/poca/optimizer_torch.py
@@ -359,18 +364,23 @@ class POCACritic(nn.Module):
 
     Two evaluation modes (matching ML-Agents POCAValueNetwork):
     ────────────────────
-    **critic_pass(all_obs)**
-        All agents → obs-only entity embedding → self-attention → V(s).
+    **critic_pass(all_states)**
+        All agents → state-only entity embedding → self-attention → V(s).
 
-    **baseline(agent_i_obs, other_obs, other_actions)**
-        Agent i → obs-only embedding.
-        Others  → obs+action embedding.
+    **baseline(agent_i_state, other_states, other_actions)**
+        Agent i → state-only embedding.
+        Others  → state+action embedding.
         Together through self-attention → counterfactual b_i.
+
+    IMPORTANT: The critic receives the 5D polar state (ρ, cos α, sin α, cos β, sin β),
+    NOT the full agent observations. This matches the user's modification to Unity ML-Agents:
+    "Adapt the original poca algorithm to take state instead of observation at the critic level"
+    See: PerAgentState5DSensor.cs + optimizer_torch.py (_state_only_obs routing)
     """
 
     def __init__(
         self,
-        obs_dim: int,
+        state_dim: int,
         act_dim: int,
         num_agents: int,
         h_size: int = 256,
@@ -378,15 +388,15 @@ class POCACritic(nn.Module):
         num_layers: int = 2,
     ):
         super().__init__()
-        self.obs_dim = obs_dim
+        self.state_dim = state_dim
         self.act_dim = act_dim
         self.num_agents = num_agents
         self.h_size = h_size
 
-        # Entity embeddings (raw obs → h_size embedding)
+        # Entity embeddings (5D state → h_size embedding)
         # ML-Agents: EntityEmbedding = LinearEncoder(1 layer, Swish, T-Fixup init)
-        self.obs_entity_enc = EntityEmbedding(obs_dim, h_size)
-        self.obs_act_entity_enc = EntityEmbedding(obs_dim + act_dim, h_size)
+        self.obs_entity_enc = EntityEmbedding(state_dim, h_size)
+        self.obs_act_entity_enc = EntityEmbedding(state_dim + act_dim, h_size)
 
         # Self-attention over entity embeddings
         self.self_attn = ResidualSelfAttention(h_size, num_heads)
@@ -428,71 +438,71 @@ class POCACritic(nn.Module):
 
     # ── public API ────────────────────────────────────────────────
 
-    def critic_pass(self, all_agent_obs: torch.Tensor) -> torch.Tensor:
-        """Team value V(s).  All agents go through obs-only entity encoding.
+    def critic_pass(self, all_agent_states: torch.Tensor) -> torch.Tensor:
+        """Team value V(s).  All agents go through state-only entity encoding.
 
-        Args:   all_agent_obs — (B, N, obs_dim)
+        Args:   all_agent_states — (B, N, state_dim)  [5D polar state]
         Returns: (B, 1)
         """
-        B, N, _ = all_agent_obs.shape
-        entities = self.obs_entity_enc(all_agent_obs)      # (B, N, h)
+        B, N, _ = all_agent_states.shape
+        entities = self.obs_entity_enc(all_agent_states)   # (B, N, h)
         return self._encode_and_value(entities, N)
 
     def baseline(
         self,
-        agent_i_obs: torch.Tensor,     # (B, obs_dim)
-        other_obs: torch.Tensor,       # (B, M, obs_dim)
-        other_actions: torch.Tensor,   # (B, M, act_dim)
+        agent_i_state: torch.Tensor,    # (B, state_dim)
+        other_states: torch.Tensor,      # (B, M, state_dim)
+        other_actions: torch.Tensor,     # (B, M, act_dim)
     ) -> torch.Tensor:
         """Counterfactual baseline b_i.
 
-        Agent i → obs-only entity embedding (no action).
-        Others  → obs+action entity embedding.
+        Agent i → state-only entity embedding (no action).
+        Others  → state+action entity embedding.
 
         Returns: (B, 1)
         """
-        M = other_obs.shape[1]
+        M = other_states.shape[1]
 
-        # Agent i: obs-only entity
-        ent_i = self.obs_entity_enc(agent_i_obs.unsqueeze(1))     # (B, 1, h)
+        # Agent i: state-only entity
+        ent_i = self.obs_entity_enc(agent_i_state.unsqueeze(1))   # (B, 1, h)
 
-        # Others: obs+action entities
-        obs_act = torch.cat([other_obs, other_actions], dim=-1)   # (B, M, obs+act)
-        ent_o = self.obs_act_entity_enc(obs_act)                  # (B, M, h)
+        # Others: state+action entities
+        state_act = torch.cat([other_states, other_actions], dim=-1)  # (B, M, state+act)
+        ent_o = self.obs_act_entity_enc(state_act)                    # (B, M, h)
 
-        entities = torch.cat([ent_i, ent_o], dim=1)               # (B, 1+M, h)
+        entities = torch.cat([ent_i, ent_o], dim=1)                   # (B, 1+M, h)
         return self._encode_and_value(entities, 1 + M)
 
     def all_baselines(
         self,
-        all_obs: torch.Tensor,       # (B, N, obs_dim)
-        all_actions: torch.Tensor,   # (B, N, act_dim)
+        all_states: torch.Tensor,     # (B, N, state_dim)
+        all_actions: torch.Tensor,    # (B, N, act_dim)
     ) -> torch.Tensor:
         """Compute baselines for every agent (batched — single forward pass).
 
         Instead of N separate forward passes, we construct all N counterfactual
         entity sets at once by stacking along the batch dimension:
           (B*N, N, h_size) where for each "virtual batch" entry b*N+i,
-          entity 0 = obs-only embedding of agent i,
-          entities 1..N-1 = obs+act embedding of all others.
+          entity 0 = state-only embedding of agent i,
+          entities 1..N-1 = state+act embedding of all others.
 
         Returns: (B, N)
         """
-        B, N, _ = all_obs.shape
+        B, N, _ = all_states.shape
 
-        # Embed all obs-only: (B, N, h)
-        obs_emb = self.obs_entity_enc(all_obs)                     # (B, N, h)
+        # Embed all state-only: (B, N, h)
+        obs_emb = self.obs_entity_enc(all_states)                      # (B, N, h)
 
-        # Embed all obs+act: (B, N, h)
-        obs_act = torch.cat([all_obs, all_actions], dim=-1)        # (B, N, obs+act)
-        obs_act_emb = self.obs_act_entity_enc(obs_act)             # (B, N, h)
+        # Embed all state+act: (B, N, h)
+        state_act = torch.cat([all_states, all_actions], dim=-1)       # (B, N, state+act)
+        obs_act_emb = self.obs_act_entity_enc(state_act)               # (B, N, h)
 
         # For agent i's baseline:
         #   entity 0 = obs_emb[:, i]  (obs-only)
         #   entities 1..N-1 = obs_act_emb[:, other_indices]
         # We build this for ALL i simultaneously by repeating and masking.
 
-        # Expand obs_emb for the "self" slot: (B, N, 1, h) — agent i's obs embedding
+        # Expand obs_emb for the "self" slot: (B, N, 1, h) — agent i's state embedding
         self_ent = obs_emb.unsqueeze(2)                            # (B, N, 1, h)
 
         # Build "others" obs_act_emb for each agent i:
@@ -501,7 +511,7 @@ class POCACritic(nn.Module):
         # Efficient: tile obs_act_emb to (B, N, N, h), then remove diagonal
         tiled = obs_act_emb.unsqueeze(1).expand(B, N, N, self.h_size)  # (B, N, N, h)
         # Mask to remove self (diagonal)
-        mask = ~torch.eye(N, dtype=torch.bool, device=all_obs.device)  # (N, N)
+        mask = ~torch.eye(N, dtype=torch.bool, device=all_states.device)  # (N, N)
         # Gather others: (B, N, N-1, h)
         others_ent = tiled[:, :, :, :].reshape(B * N, N, self.h_size)
         mask_flat = mask.unsqueeze(0).expand(B, -1, -1).reshape(B * N, N)
