@@ -106,19 +106,27 @@ class POCAConfig:
 #  Schedule helpers  (kept for optional use with other configs)
 # ──────────────────────────────────────────────────────────────────────
 
-class LinearDecay:
-    """Linearly decay a value from *initial* to 0 over *total_steps*.
+class PolynomialDecay:
+    """Polynomial (default=linear) decay matching ML-Agents ModelUtils.polynomial_decay.
 
-    NOTE: PushBlockCollab.yaml uses constant schedules, so this is unused
-    unless explicitly configured.
+    Decays from *initial_value* to *min_value* over *max_step*.
+    ML-Agents uses non-zero min values:
+        lr      → 1e-10
+        epsilon → 0.1
+        beta    → 1e-5
     """
 
-    def __init__(self, initial: float, total_steps: int):
+    def __init__(self, initial: float, min_value: float, max_step: int, power: float = 1.0):
         self.initial = initial
-        self.total_steps = max(total_steps, 1)
+        self.min_value = min_value
+        self.max_step = max(max_step, 1)
+        self.power = power
 
     def get(self, step: int) -> float:
-        return self.initial * max(1.0 - step / self.total_steps, 0.0)
+        step = min(step, self.max_step)
+        return (self.initial - self.min_value) * (
+            1.0 - step / self.max_step
+        ) ** self.power + self.min_value
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -212,19 +220,31 @@ class POCATrainer:
         # state and not the observation of the agents."
         self.state_dim = 5
 
+        # ── Actor observation dimension ─────────────────────────
+        # In ML-Agents, PerAgentState5DSensor (trainingOnly=true) is
+        # included in the actor's observation during training.  The actor
+        # receives ALL observations concatenated:
+        #   actor_obs = [sensor_obs (24-dim), state (5-dim)] = 29-dim
+        # The critic receives ONLY state (5-dim) via _state_only_obs().
+        # At inference the 5D state is zeroed (trainingOnly), but during
+        # training the actor uses it for faster learning (it provides
+        # direct position/heading info relative to the gate).
+        self.actor_obs_dim = self.obs_dim + self.state_dim
+
         print(f"[POCA] envs={self.num_envs}  agents={self.num_agents}  "
               f"obs={self.obs_dim}  state={self.state_dim}  "
+              f"actor_obs={self.actor_obs_dim}  "
               f"act={'discrete(' + str(self.num_actions) + ')' if self.discrete else str(self.act_dim)}  "
               f"decision_period={self.decision_period}")
-        print("[POCA] Critic uses 5D polar STATE (not obs)")
+        print("[POCA] Actor sees obs+state (29-dim), Critic sees state only (5-dim)")
 
         if self.discrete:
             self.actor = DiscreteActor(
-                self.obs_dim, self.num_actions, c.hidden_dim, c.num_layers,
+                self.actor_obs_dim, self.num_actions, c.hidden_dim, c.num_layers,
             ).to(self.device)
         else:
             self.actor = Actor(
-                self.obs_dim, self.act_dim, c.hidden_dim, c.num_layers,
+                self.actor_obs_dim, self.act_dim, c.hidden_dim, c.num_layers,
             ).to(self.device)
 
         self.critic = POCACritic(
@@ -243,9 +263,13 @@ class POCATrainer:
         self._init_eps = c.clip_eps
         self._init_beta = c.beta
 
-        self.lr_schedule = LinearDecay(c.lr, c.total_timesteps) if c.lr_schedule == "linear" else None
-        self.eps_schedule = LinearDecay(c.clip_eps, c.total_timesteps) if c.eps_schedule == "linear" else None
-        self.beta_schedule = LinearDecay(c.beta, c.total_timesteps) if c.beta_schedule == "linear" else None
+        # ML-Agents polynomial_decay min values:
+        #   lr   → 1e-10  (essentially 0)
+        #   eps  → 0.1    (trust region never collapses fully)
+        #   beta → 1e-5   (tiny entropy bonus remains)
+        self.lr_schedule = PolynomialDecay(c.lr, 1e-10, c.total_timesteps) if c.lr_schedule == "linear" else None
+        self.eps_schedule = PolynomialDecay(c.clip_eps, 0.1, c.total_timesteps) if c.eps_schedule == "linear" else None
+        self.beta_schedule = PolynomialDecay(c.beta, 1e-5, c.total_timesteps) if c.beta_schedule == "linear" else None
 
         self.current_lr = c.lr
         self.current_eps = c.clip_eps
@@ -362,9 +386,16 @@ class POCATrainer:
                 # (E, N, C, H, W) -> (E, N, C*H*W)
                 obs_stacked = obs_stacked.view(obs_stacked.shape[0], obs_stacked.shape[1], -1)
 
+            # ── get 5D state for critic AND actor ─────────────────
+            # ML-Agents: PerAgentState5DSensor provides 5D state to the
+            # actor as part of its observation (trainingOnly=true).
+            # The actor sees [sensor_obs, state] = 29-dim.
+            critic_state = self.unwrapped.get_critic_state()           # (E, N, 5)
+
             # ── sample actions from shared actor (batched over all agents) ──
-            # Reshape (E, N, obs) → (E*N, obs) for a SINGLE forward pass
-            flat_obs = obs_stacked.reshape(-1, obs_stacked.shape[-1])  # (E*N, obs)
+            # Actor obs = sensor obs (24) + state (5) = 29-dim
+            actor_obs = torch.cat([obs_stacked, critic_state], dim=-1) # (E, N, 29)
+            flat_obs = actor_obs.reshape(-1, actor_obs.shape[-1])      # (E*N, 29)
             dist = self.actor.get_dist(flat_obs)
 
             if self.discrete:
@@ -379,7 +410,6 @@ class POCATrainer:
                 all_log_probs = flat_logp.view(self.num_envs, self.num_agents, self.act_dim)
 
             # ── critic: team value V(s) — uses 5D polar STATE ─────
-            critic_state = self.unwrapped.get_critic_state()           # (E, N, 5)
             team_val = self.critic.critic_pass(critic_state).squeeze(-1)  # (E,)
 
             # ── baselines: counterfactual b_i — also uses STATE ───
@@ -487,8 +517,9 @@ class POCATrainer:
                 MB, N = obs.shape[:2]
 
                 # ── policy loss (batched over all agents, shared actor) ─
-                # Reshape (MB, N, obs) → (MB*N, obs) for single forward pass
-                flat_obs = obs.reshape(-1, obs.shape[-1])              # (MB*N, obs)
+                # Actor obs = sensor obs (24) + state (5) = 29-dim
+                actor_obs = torch.cat([obs, critic_states], dim=-1)    # (MB, N, 29)
+                flat_obs = actor_obs.reshape(-1, actor_obs.shape[-1])  # (MB*N, 29)
                 flat_act = actions.reshape(-1, actions.shape[-1])      # (MB*N, act_dim)
                 flat_logp, flat_ent = self.actor.evaluate(flat_obs, flat_act)
                 # flat_logp: (MB*N, act_dim), flat_ent: (MB*N,)
@@ -645,6 +676,17 @@ class POCATrainer:
                 self.writer.add_scalar(
                     "Policy/Beta", metrics["beta"], s)
 
+                # Actor log_std diagnostic (per-dim)
+                if not self.discrete and hasattr(self.actor, "log_std"):
+                    log_std = self.actor.log_std.detach()
+                    for d in range(log_std.shape[-1]):
+                        self.writer.add_scalar(
+                            f"Policy/Std dim{d}",
+                            log_std[0, d].exp().item(), s)
+                    self.writer.add_scalar(
+                        "Policy/Log Std Mean",
+                        log_std.mean().item(), s)
+
                 # Extrinsic Reward = mean per-step reward over the
                 # rollout (ML-Agents logs this as the mean reward
                 # received per agent-decision across the buffer)
@@ -738,6 +780,8 @@ class POCATrainer:
             "num_actions": self.num_actions if self.discrete else 0,
             "act_dim": self.act_dim,
             "state_dim": self.state_dim,
+            "obs_dim": self.obs_dim,
+            "actor_obs_dim": self.actor_obs_dim,
         }, path)
         print(f"[POCA] Saved → {path}")
 
