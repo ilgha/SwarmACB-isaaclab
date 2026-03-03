@@ -148,7 +148,8 @@ def main():
                 if discrete:
                     action_dict[agent] = act.unsqueeze(-1)  # (E, 1)
                 else:
-                    action_dict[agent] = act
+                    # ML-Agents preprocessing: clamp(-3,3)/3 before env
+                    action_dict[agent] = act.clamp(-3, 3) / 3
 
         obs_dict, reward_dict, terminated_dict, truncated_dict, info = env.step(action_dict)
 

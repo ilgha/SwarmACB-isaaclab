@@ -386,10 +386,22 @@ class POCATrainer:
             critic_actions = self._encode_actions_for_critic(all_actions)
             baselines = self.critic.all_baselines(critic_state, critic_actions)  # (E, N)
 
+            # ── ML-Agents action preprocessing ──────────────────
+            # ML-Agents clips continuous actions to [-3, 3] then divides by 3
+            # before sending to the env (AgentAction.to_action_tuple with
+            # clip=True).  This keeps ~99.7 % of initial samples (std=1)
+            # inside the active range, avoiding gradient-killing saturation
+            # at the ±1 boundary.  Buffer stores RAW actions for correct
+            # log-prob / ratio computation.
+            if not self.discrete:
+                env_actions = all_actions.clamp(-3, 3) / 3
+            else:
+                env_actions = all_actions
+
             # ── step environment decision_period times ────────────
             # Same action for all sub-steps; env applies velocity
             # only on the first sub-step (decision step), then coasts.
-            action_dict = {a: all_actions[:, i] for i, a in enumerate(agents)}
+            action_dict = {a: env_actions[:, i] for i, a in enumerate(agents)}
             accumulated_reward = torch.zeros(self.num_envs, device=self.device)
             last_done = torch.zeros(self.num_envs, device=self.device)
 
