@@ -303,14 +303,19 @@ class POCATrainer:
         # Print param count & batch info
         actor_params = sum(p.numel() for p in self.actor.parameters())
         critic_params = sum(p.numel() for p in self.critic.parameters())
-        group_mb = max(1, c.mini_batch_size // self.num_agents)
         T_E = c.horizon * self.num_envs
+        if c.buffer_size_hint > 0 and c.mini_batch_size > 0:
+            bpe = max(1, c.buffer_size_hint // c.mini_batch_size)
+            group_mb = max(1, T_E // bpe)
+        else:
+            group_mb = c.mini_batch_size
         n_batches = (T_E + group_mb - 1) // group_mb
-        print(f"[POCA] Actor params: {actor_params:,}  Critic params: {critic_params:,}")
-        print(f"[POCA] Mini-batch: {c.mini_batch_size} agent-transitions "
-              f"→ {group_mb} group entries  "
-              f"({n_batches} batches/epoch × {c.num_epochs} epochs "
-              f"= {n_batches * c.num_epochs} gradient updates/rollout)")
+        print(f"[POCA] Actor params: {actor_params:,}  "
+              f"Critic params: {critic_params:,}")
+        print(f"[POCA] Mini-batch: {group_mb} group entries "
+              f"({group_mb * self.num_agents} agent-transitions)  "
+              f"[{n_batches} batches/epoch × {c.num_epochs} epochs "
+              f"= {n_batches * c.num_epochs} updates/rollout]")
         print(f"[POCA] TensorBoard → {c.log_dir}")
 
     # ──────────────────────────────────────────────────────────────
@@ -492,13 +497,20 @@ class POCATrainer:
         total_ent = 0.0
         n_updates = 0
 
+        # Compute group mini-batch size to match ML-Agents' batches-per-epoch.
+        # ML-Agents: batches_per_epoch = buffer_size / batch_size = 20480/2048 = 10.
+        # Our buffer has T*E group entries (each containing N agents).
+        # We derive group_mb so get_batches yields the same number of
+        # batches per epoch as ML-Agents, giving identical gradient-update count.
+        T_E = self.buffer.horizon * self.buffer.num_envs
+        if cfg.buffer_size_hint > 0 and cfg.mini_batch_size > 0:
+            bpe = max(1, cfg.buffer_size_hint // cfg.mini_batch_size)
+            group_mb = max(1, T_E // bpe)
+        else:
+            # Fallback: treat mini_batch_size as group entries directly
+            group_mb = cfg.mini_batch_size
+
         for _epoch in range(cfg.num_epochs):
-            # ML-Agents batch_size is in *individual agent transitions*.
-            # Our get_batches iterates over (T, E) group entries where each
-            # entry contains N agents.  Convert: group_mb = batch_size // N
-            # so each mini-batch has ~batch_size individual transitions.
-            # This gives the same gradient-step-to-data ratio as ML-Agents.
-            group_mb = max(1, cfg.mini_batch_size // self.num_agents)
             for batch in self.buffer.get_batches(group_mb):
                 obs = batch["obs"]                  # (MB, N, obs)
                 critic_states = batch["critic_states"]  # (MB, N, 5)

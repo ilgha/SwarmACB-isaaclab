@@ -15,5 +15,5 @@ from .poca_networks import (
     EntityEmbedding,
 )
 from .poca_buffer import POCARolloutBuffer
-from .poca_trainer import POCATrainer, POCAConfig, LinearDecay
+from .poca_trainer import POCATrainer, POCAConfig, PolynomialDecay
 from .config_loader import load_config, print_config
