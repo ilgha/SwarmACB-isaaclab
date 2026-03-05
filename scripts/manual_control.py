@@ -111,8 +111,9 @@ class StandaloneDGTEnv:
         self.yaw = torch.zeros(self.E, self.N, device=self.device)
         self.prev_y = torch.zeros(self.E, self.N, device=self.device)
 
-        # Gate trigger line (middle of white gate)
-        self.gate_trigger_y = self.gate_south + self.gate_length / 2.0
+        # Color-transition reward tracking (matches Unity DirGateEnvController.cs)
+        # Unity detects ground COLOR TRANSITIONS, not Y-position crossings.
+        self.prev_ground_color = torch.full((self.E, self.N), 0.5, device=self.device)  # grey default
 
         # ── Sensors ───────────────────────────────────────────────
         self.sensors = EpuckSensors(
@@ -121,7 +122,7 @@ class StandaloneDGTEnv:
         self.behavior_modules = BehaviorModules(
             max_speed=self.max_speed, device=device,
         )
-        self.behavior_modules.init_exploration_state(self.E, self.N)
+        self.behavior_modules.init_state(self.E, self.N)
 
         # ── Wall segments ─────────────────────────────────────────
         self.arena_wall_segments = self._build_walls()
@@ -171,6 +172,7 @@ class StandaloneDGTEnv:
         self.pos[0, :, 1] = r * torch.sin(th)
         self.yaw[0] = torch.rand(self.N) * 2 * math.pi - math.pi
         self.prev_y[0] = self.pos[0, :, 1]
+        self.prev_ground_color = torch.full((self.E, self.N), 0.5, device=self.device)
         self.step_reward = 0.0
         self.episode_reward = 0.0
         self.step_count = 0
@@ -221,18 +223,22 @@ class StandaloneDGTEnv:
         self._resolve_gate_walls()
         self._resolve_robots()
 
-        # Reward: gate crossing at trigger line
-        curr_y = self.pos[0, :, 1]   # (N,)
-        curr_x = self.pos[0, :, 0]   # (N,)
-        prev_y = self.prev_y[0]      # (N,)
-        trig = self.gate_trigger_y
-        hw = self.gate_hw
-        in_gate = curr_x.abs() < hw
-        n2s = (prev_y > trig) & (curr_y <= trig) & in_gate
-        s2n = (prev_y <= trig) & (curr_y > trig) & in_gate
-        k_plus = n2s.float().sum().item()
-        k_minus = s2n.float().sum().item()
-        self.prev_y[0] = curr_y.clone()
+        # Reward: colour transitions (matching Unity DirGateEnvController.cs)
+        # BLACK → WHITE = +1 (K⁺), WHITE → BLACK = -1 (K⁻)
+        curr_color = self._ground_scalar(self.pos[0])  # (N,)
+        prev_color = self.prev_ground_color[0]          # (N,)
+
+        prev_is_black = (prev_color < 0.25)
+        prev_is_white = (prev_color > 0.75)
+        curr_is_black = (curr_color < 0.25)
+        curr_is_white = (curr_color > 0.75)
+
+        black_to_white = prev_is_black & curr_is_white
+        white_to_black = prev_is_white & curr_is_black
+
+        k_plus = black_to_white.float().sum().item()
+        k_minus = white_to_black.float().sum().item()
+        self.prev_ground_color[0] = curr_color.clone()
 
         self.step_reward = k_plus - k_minus
         self.episode_reward += self.step_reward
@@ -252,7 +258,7 @@ class StandaloneDGTEnv:
             self.pos, self.yaw, self.light_pos,
         )
         ground = self._ground_3ch(self.pos)  # (1, N, 3)
-        ztilde, rab_proj = self.sensors.compute_rab(
+        ztilde, rab_proj, _, _ = self.sensors.compute_rab(
             self.pos, self.yaw,
         )
         obs24 = self.sensors.collect_obs_dandelion(
@@ -493,16 +499,12 @@ def main():
                 env.sensors.compute_light(
                     env.pos, env.yaw, env.light_pos,
                 ))
-            zt, rp = env.sensors.compute_rab(
+            zt, rp, rab_ax, rab_ay = env.sensors.compute_rab(
                 env.pos, env.yaw,
-            )
-            rab_ang = torch.atan2(
-                rp[:, :, 1] + rp[:, :, 3],
-                rp[:, :, 0] + rp[:, :, 2],
             )
             el, er = env.behavior_modules.dispatch(
                 module_ids, prox_val, prox_ang,
-                light_val, light_ang, zt, rab_ang,
+                light_val, light_ang, rab_ax, rab_ay,
             )
             left[0, 1:] = el[0, 1:]
             right[0, 1:] = er[0, 1:]

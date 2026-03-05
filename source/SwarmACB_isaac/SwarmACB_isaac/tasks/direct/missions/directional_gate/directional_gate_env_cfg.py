@@ -153,9 +153,8 @@ class DirectionalGateEnvCfg(DirectMARLEnvCfg):
     #  No reward shaping.
 
     # ── Behaviour module parameters (ACB variants) ────────────────
-    explore_tau: int = 5            # exploration turn duration (ticks)
-    obstacle_gain: float = 5.0     # k for phototaxis / anti-phototaxis
-    social_gain: float = 5.0       # α for attraction / repulsion
+    alpha_parameter: float = 5.0   # alphaParameter used in GetAttractionVectorToNeighbors
+                                   # and repulsion (matches Unity Epuck.cs)
 
     # ──────────────────────────────────────────────────────────────
 

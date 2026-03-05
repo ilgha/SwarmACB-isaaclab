@@ -510,6 +510,15 @@ class POCATrainer:
             # Fallback: treat mini_batch_size as group entries directly
             group_mb = cfg.mini_batch_size
 
+        # ── Normalize advantages (matching ML-Agents on_policy_trainer._update_policy) ──
+        # ML-Agents normalizes advantages to mean=0, std=1 BEFORE the epoch loop.
+        # Without this, raw advantage magnitudes vary wildly, destabilizing
+        # the policy gradient and causing premature convergence.
+        all_adv = self.buffer.advantages
+        adv_mean = all_adv.mean()
+        adv_std = all_adv.std()
+        self.buffer.advantages = (all_adv - adv_mean) / (adv_std + 1e-10)
+
         for _epoch in range(cfg.num_epochs):
             for batch in self.buffer.get_batches(group_mb):
                 obs = batch["obs"]                  # (MB, N, obs)

@@ -55,12 +55,11 @@ class DirectionalGateEnv(DirectMARLEnv):
         self.agent_yaw = torch.zeros(E, N, device=dev)      # heading (rad)
 
         # ── Gate-crossing detection ──────────────────────────────
-        # Trigger line: middle of the white gate
-        self._gate_trigger_y = (self._gate_south_y()
-                                + cfg.gate_length / 2.0)
-        self._gate_x_halfwidth = cfg.gate_width / 2.0
-        # Track previous y-position to detect crossings
-        self.prev_y = torch.zeros(E, N, device=dev)
+        # Unity detects ground COLOR TRANSITIONS (not Y-position crossings):
+        #   BLACK → WHITE  →  +1  (correct traversal: corridor → gate going south)
+        #   WHITE → BLACK  →  −1  (reverse traversal: gate → corridor going north)
+        # Track previous ground color per robot (0=black, 0.5=grey, 1=white)
+        self.prev_ground_color = torch.full((E, N), 0.5, device=dev)  # grey default
 
         # ── Episode reward accumulator (for trainer compatibility) ─
         self.completed_group_reward = torch.zeros(E, device=dev)
@@ -91,12 +90,10 @@ class DirectionalGateEnv(DirectMARLEnv):
         # ── Behaviour modules (for ACB discrete variants) ─────────
         self.behavior_modules = BehaviorModules(
             max_speed=cfg.max_wheel_speed,
-            obstacle_gain=cfg.obstacle_gain,
-            social_gain=cfg.social_gain,
-            explore_tau=cfg.explore_tau,
+            alpha_parameter=cfg.alpha_parameter,
             device=dev,
         )
-        self.behavior_modules.init_exploration_state(E, N)
+        self.behavior_modules.init_state(E, N)
 
         # ── Arena center / light direction for critic state ───────
         self.arena_center = torch.zeros(2, device=dev)
@@ -490,7 +487,7 @@ class DirectionalGateEnv(DirectMARLEnv):
             light_vals, light_value, light_angle = self.sensors.compute_light(
                 self.agent_pos, self.agent_yaw, self.light_pos,
             )
-            ztilde, rab_proj = self.sensors.compute_rab(
+            ztilde, rab_proj, rab_attr_x, rab_attr_y = self.sensors.compute_rab(
                 self.agent_pos, self.agent_yaw,
             )
 
@@ -506,18 +503,11 @@ class DirectionalGateEnv(DirectMARLEnv):
                 "rab_proj": rab_proj,
             }
 
-            # RAB aggregate angle in body frame for attraction / repulsion
-            rab_sum_angle = torch.atan2(
-                rab_proj[:, :, 1] + rab_proj[:, :, 3],  # sin components
-                rab_proj[:, :, 0] + rab_proj[:, :, 2],  # cos components
-            )
-            rab_magnitude = ztilde  # use neighbour presence as magnitude
-
             left_vel, right_vel = self.behavior_modules.dispatch(
                 module_ids,
                 prox_value, prox_angle,
                 light_value, light_angle,
-                rab_magnitude, rab_sum_angle,
+                rab_attr_x, rab_attr_y,
             )
         else:
             # ── Dandelion continuous ──────────────────────────────
@@ -680,7 +670,7 @@ class DirectionalGateEnv(DirectMARLEnv):
             light_vals, _, _ = self.sensors.compute_light(
                 self.agent_pos, self.agent_yaw, self.light_pos,
             )
-            ztilde, rab_proj = self.sensors.compute_rab(
+            ztilde, rab_proj, _, _ = self.sensors.compute_rab(
                 self.agent_pos, self.agent_yaw,
             )
 
@@ -706,39 +696,39 @@ class DirectionalGateEnv(DirectMARLEnv):
     # ──────────────────────────────────────────────────────────────
 
     def _get_rewards(self) -> dict[str, torch.Tensor]:
-        """Compute team reward: K⁺ − K⁻ gate crossings.
+        """Compute team reward via ground COLOR TRANSITIONS (matching Unity exactly).
 
-        The trigger line is at the middle of the white gate
-        (y = gate_south + gate_length / 2).  A crossing is
-        counted when a robot's y-position crosses this line
-        while its x-position is within ±gate_width/2.
+        Unity DirGateEnvController.cs detects:
+          BLACK → WHITE  →  +1  (correct traversal: robot exits corridor into gate)
+          WHITE → BLACK  →  −1  (reverse traversal: robot enters corridor from gate)
 
-          K⁺: north → south  (prev_y > trigger, curr_y ≤ trigger)
-          K⁻: south → north  (prev_y ≤ trigger, curr_y > trigger)
+        All other transitions (grey↔white, grey↔black, same→same) give 0 reward.
         """
         cfg = self.cfg
-        curr_y = self.agent_pos[:, :, 1]          # (E, N)
-        curr_x = self.agent_pos[:, :, 0]          # (E, N)
-        prev_y = self.prev_y                      # (E, N)
-        trig = self._gate_trigger_y
-        hw = self._gate_x_halfwidth
 
-        # Robot must be within the gate opening (x-axis)
-        in_gate = curr_x.abs() < hw              # (E, N)
+        # Current ground color scalar per agent: 0=black, 0.5=grey, 1=white
+        curr_color = self._ground_color(self.agent_pos)[:, :, 0]  # (E, N)
+        prev_color = self.prev_ground_color                       # (E, N)
 
-        # North-to-south crossing → K⁺
-        n2s = (prev_y > trig) & (curr_y <= trig) & in_gate
-        k_plus = n2s.float().sum(dim=1)           # (E,)
+        # Discretize: black < 0.25, grey ∈ [0.25, 0.75], white > 0.75
+        prev_is_black = (prev_color < 0.25)
+        prev_is_white = (prev_color > 0.75)
+        curr_is_black = (curr_color < 0.25)
+        curr_is_white = (curr_color > 0.75)
 
-        # South-to-north crossing → K⁻
-        s2n = (prev_y <= trig) & (curr_y > trig) & in_gate
-        k_minus = s2n.float().sum(dim=1)          # (E,)
+        # K⁺: BLACK → WHITE (correct traversal, going south through gate)
+        black_to_white = prev_is_black & curr_is_white
+        k_plus = black_to_white.float().sum(dim=1)                # (E,)
 
-        # Update y tracking
-        self.prev_y = curr_y.clone()
+        # K⁻: WHITE → BLACK (reverse traversal, going north into corridor)
+        white_to_black = prev_is_white & curr_is_black
+        k_minus = white_to_black.float().sum(dim=1)               # (E,)
+
+        # Update color tracking
+        self.prev_ground_color = curr_color.clone()
 
         # Team reward
-        reward = k_plus - k_minus                 # (E,)
+        reward = k_plus - k_minus                                 # (E,)
         self._episode_group_reward += reward
 
         # Return same reward for all agents (team reward)
@@ -792,8 +782,9 @@ class DirectionalGateEnv(DirectMARLEnv):
         self.agent_pos[idx, :, 1] = r_rand * torch.sin(theta)
         self.agent_yaw[idx] = torch.rand(n_reset, N, device=self.device) * 2 * math.pi - math.pi
 
-        # Reset y-tracking for crossing detection
-        self.prev_y[idx] = self.agent_pos[idx, :, 1]
+        # Reset ground-color tracking for crossing detection
+        reset_color = self._ground_color(self.agent_pos[idx])[:, :, 0]  # (len(idx), N)
+        self.prev_ground_color[idx] = reset_color
 
         # Reset exploration state for these envs
         mask = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)

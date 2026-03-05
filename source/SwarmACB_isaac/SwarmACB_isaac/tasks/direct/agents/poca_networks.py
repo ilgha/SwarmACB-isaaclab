@@ -284,7 +284,7 @@ class ResidualSelfAttention(nn.Module):
     """
 
     NEG_INF = -1e6
-    EPSILON = 1e-6
+    EPSILON = 1e-7  # Matches ML-Agents attention.py EPSILON
 
     def __init__(self, embed_dim: int, num_heads: int = 4):
         super().__init__()

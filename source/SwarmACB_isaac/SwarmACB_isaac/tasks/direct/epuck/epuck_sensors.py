@@ -375,12 +375,14 @@ class EpuckSensors:
         self,
         agent_pos: torch.Tensor,     # (E, N, 2)
         agent_yaw: torch.Tensor,     # (E, N)
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute range-and-bearing observations.
 
         Returns:
             ztilde:     (E, N)    — normalized neighbor count: 1 - 2/(1+exp(n))
             rab_proj:   (E, N, 4) — 4 directional projections of RAB sum vector
+            rab_attr_x: (E, N)    — x component of alpha-weighted attraction vector (body frame)
+            rab_attr_y: (E, N)    — y component of alpha-weighted attraction vector (body frame)
         """
         E, N = agent_pos.shape[:2]
         device = agent_pos.device
@@ -415,9 +417,13 @@ class EpuckSensors:
 
         bearing = torch.atan2(body_y, body_x)  # (E, N, N) — bearing in body frame
 
-        # Weighted sum: w = 1/dist * (cos(bearing), sin(bearing))
-        w_x = (inv_dist * torch.cos(bearing) * in_range.float()).sum(dim=-1)  # (E, N)
-        w_y = (inv_dist * torch.sin(bearing) * in_range.float()).sum(dim=-1)
+        cos_bearing = torch.cos(bearing)
+        sin_bearing = torch.sin(bearing)
+        in_range_f = in_range.float()
+
+        # Weighted sum (1/dist): for observation projections
+        w_x = (inv_dist * cos_bearing * in_range_f).sum(dim=-1)  # (E, N)
+        w_y = (inv_dist * sin_bearing * in_range_f).sum(dim=-1)
 
         # Project onto 4 directions: 45°, 135°, 225°, 315°
         rab_proj = (
@@ -425,7 +431,13 @@ class EpuckSensors:
             + w_y.unsqueeze(-1) * self._rab_sin.view(1, 1, 4)
         )  # (E, N, 4)
 
-        return ztilde, rab_proj
+        # Alpha-weighted attraction vector: alpha/(1+dist) weighting
+        # Matches Unity GetAttractionVectorToNeighbors(alphaParameter)
+        alpha_weight = self.alpha_rab / (1.0 + dist)  # (E, N, N)
+        rab_attr_x = (alpha_weight * cos_bearing * in_range_f).sum(dim=-1)  # (E, N)
+        rab_attr_y = (alpha_weight * sin_bearing * in_range_f).sum(dim=-1)  # (E, N)
+
+        return ztilde, rab_proj, rab_attr_x, rab_attr_y
 
     # ──────────────────────────────────────────────────────────────
     #  Full observation assembly
