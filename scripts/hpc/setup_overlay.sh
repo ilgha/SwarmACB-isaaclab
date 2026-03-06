@@ -33,12 +33,15 @@ apptainer exec \
     --nv \
     --overlay "$OVERLAY" \
     --bind "$PROJECT_DIR:$PROJECT_DIR" \
-    --env PYTHONPATH="$PROJECT_DIR/source" \
     "$CONTAINER" \
-    python3.11 -c "
+    bash -c "
+        source /root/isaac_env/bin/activate && \
+        export PYTHONPATH=$PROJECT_DIR/source:\$PYTHONPATH && \
+        python -c '
 import SwarmACB_isaac
-print('SwarmACB_isaac imported OK from:', SwarmACB_isaac.__file__)
-"
+print(\"SwarmACB_isaac imported OK from:\", SwarmACB_isaac.__file__)
+'
+    "
 
 echo ""
 echo "=== Quick headless test ==="
@@ -46,15 +49,23 @@ apptainer exec \
     --nv \
     --overlay "$OVERLAY" \
     --bind "$PROJECT_DIR:$PROJECT_DIR" \
-    --env PYTHONPATH="$PROJECT_DIR/source" \
     "$CONTAINER" \
-    python3.11 -c "
+    bash -c "
+        source /root/isaac_env/bin/activate && \
+        export PYTHONPATH=$PROJECT_DIR/source:\$PYTHONPATH && \
+        python -c '
 import torch
-print(f'PyTorch {torch.__version__}, CUDA available: {torch.cuda.is_available()}')
+print(f\"PyTorch {torch.__version__}, CUDA available: {torch.cuda.is_available()}\")
 if torch.cuda.is_available():
-    print(f'GPU: {torch.cuda.get_device_name(0)}')
-print('All good!')
-"
+    print(f\"GPU: {torch.cuda.get_device_name(0)}\")
+import importlib.util
+mods = [\"isaacsim\", \"isaaclab\", \"omni\", \"gymnasium\", \"tensorboard\", \"SwarmACB_isaac\"]
+for m in mods:
+    spec = importlib.util.find_spec(m)
+    print(f\"{m}: {\"OK\" if spec else \"MISSING\"}\")
+print(\"All good!\")
+'
+    "
 
 echo ""
 echo "=== Setup complete ==="

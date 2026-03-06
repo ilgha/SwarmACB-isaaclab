@@ -64,11 +64,12 @@ apptainer exec \
     --overlay "$OVERLAY" \
     --bind "$PROJECT_DIR:$PROJECT_DIR" \
     --env ACCEPT_EULA=Y \
-    --env PYTHONPATH="$PROJECT_DIR/source" \
     "$CONTAINER" \
     bash -c "
+        source /root/isaac_env/bin/activate && \
+        export PYTHONPATH=$PROJECT_DIR/source:\$PYTHONPATH && \
         cd $PROJECT_DIR && \
-        python3.11 scripts/train.py \
+        python scripts/train.py \
             --config configs/DirGate_tulip.yaml \
             --headless \
             --log_dir runs/DirGate_tulip_hpc \
