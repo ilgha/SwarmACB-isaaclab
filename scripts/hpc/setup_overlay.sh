@@ -28,26 +28,54 @@ else
 fi
 
 echo ""
-echo "=== Installing missing system libraries into overlay ==="
+echo "=== Installing missing system libraries (no root needed) ==="
 # Isaac Sim plugins require libX11, libgomp, libGLU, libXt even in headless mode.
-# These are missing from the base container — install them into the writable overlay.
+# These are missing from the base container. Since we can't apt-get install
+# (requires root), we download the .deb packages and extract them manually.
+LIBDIR="$PROJECT_DIR/.syslibs"
+
 apptainer exec \
     --nv \
     --overlay "$OVERLAY" \
+    --bind "$PROJECT_DIR:$PROJECT_DIR" \
     "$CONTAINER" \
-    bash -c '
-        # Check if libgomp is already installed
-        if ! ldconfig -p 2>/dev/null | grep -q libgomp; then
-            echo "Installing missing system libraries..."
-            apt-get update -qq && \
-            apt-get install -y --no-install-recommends \
-                libx11-6 libgomp1 libglu1-mesa libxt6 libxrender1 libxext6 && \
-            ldconfig && \
-            echo "System libraries installed successfully."
-        else
-            echo "System libraries already installed (found libgomp)."
+    bash -c "
+        LIBDIR=$LIBDIR
+        LIBPATH=\$LIBDIR/usr/lib/x86_64-linux-gnu
+
+        # Skip if already extracted
+        if [ -f \"\$LIBPATH/libX11.so.6\" ] && [ -f \"\$LIBPATH/libgomp.so.1\" ]; then
+            echo 'System libraries already extracted — skipping.'
+            exit 0
         fi
-    '
+
+        echo 'Downloading and extracting .deb packages...'
+        mkdir -p \$LIBDIR /tmp/_debs
+        cd /tmp/_debs
+
+        # Download all needed debs (and their dependencies) — no root required
+        apt-get download \
+            libx11-6 libgomp1 libglu1-mesa libxt6 libxrender1 libxext6 \
+            libxau6 libxcb1 libxdmcp6 libbsd0 libmd0 \
+            libglvnd0 libopengl0 libice6 libsm6 2>/dev/null
+
+        # Extract each into our custom syslibs prefix — no root required
+        for deb in *.deb; do
+            dpkg-deb -x \"\$deb\" \$LIBDIR
+        done
+
+        rm -rf /tmp/_debs
+
+        # Verify key libraries are present
+        for lib in libX11.so.6 libgomp.so.1 libGLU.so.1 libXt.so.6 libXrender.so.1; do
+            if [ -f \"\$LIBPATH/\$lib\" ]; then
+                echo \"  OK: \$lib\"
+            else
+                echo \"  MISSING: \$lib\"
+            fi
+        done
+        echo 'Library extraction complete.'
+    "
 
 echo ""
 echo "=== Verifying SwarmACB_isaac import (via PYTHONPATH) ==="
@@ -58,6 +86,7 @@ apptainer exec \
     "$CONTAINER" \
     bash -c "
         source /root/isaac_env/bin/activate && \
+        export LD_LIBRARY_PATH=$PROJECT_DIR/.syslibs/usr/lib/x86_64-linux-gnu:\$LD_LIBRARY_PATH && \
         export PYTHONPATH=$PROJECT_DIR/source:\$PYTHONPATH && \
         python -c '
 import SwarmACB_isaac
@@ -74,6 +103,7 @@ apptainer exec \
     "$CONTAINER" \
     bash -c "
         source /root/isaac_env/bin/activate && \
+        export LD_LIBRARY_PATH=$PROJECT_DIR/.syslibs/usr/lib/x86_64-linux-gnu:\$LD_LIBRARY_PATH && \
         export PYTHONPATH=$PROJECT_DIR/source:\$PYTHONPATH && \
         python $PROJECT_DIR/scripts/hpc/check_env.py
     "

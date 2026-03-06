@@ -27,6 +27,9 @@
 docker/cluster/exports/
 docker/.container.cfg
 
+# Extracted system libraries (HPC)
+.syslibs/
+
 # IDE
 **/.idea/
 **/.vscode/
