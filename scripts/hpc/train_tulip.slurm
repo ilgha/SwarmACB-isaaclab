@@ -68,7 +68,7 @@ apptainer exec \
     bash -c "
         source /root/isaac_env/bin/activate && \
         export LD_LIBRARY_PATH=$PROJECT_DIR/.syslibs/usr/lib/x86_64-linux-gnu:\$LD_LIBRARY_PATH && \
-        export PYTHONPATH=$PROJECT_DIR/source:\$PYTHONPATH && \
+        export PYTHONPATH=$PROJECT_DIR/source/SwarmACB_isaac:\$PYTHONPATH && \
         cd $PROJECT_DIR && \
         python scripts/train.py \
             --config configs/DirGate_tulip.yaml \

@@ -87,7 +87,7 @@ apptainer exec \
     bash -c "
         source /root/isaac_env/bin/activate && \
         export LD_LIBRARY_PATH=$PROJECT_DIR/.syslibs/usr/lib/x86_64-linux-gnu:\$LD_LIBRARY_PATH && \
-        export PYTHONPATH=$PROJECT_DIR/source:\$PYTHONPATH && \
+        export PYTHONPATH=$PROJECT_DIR/source/SwarmACB_isaac:\$PYTHONPATH && \
         python -c '
 import SwarmACB_isaac
 print(\"SwarmACB_isaac imported OK from:\", SwarmACB_isaac.__file__)
@@ -104,7 +104,7 @@ apptainer exec \
     bash -c "
         source /root/isaac_env/bin/activate && \
         export LD_LIBRARY_PATH=$PROJECT_DIR/.syslibs/usr/lib/x86_64-linux-gnu:\$LD_LIBRARY_PATH && \
-        export PYTHONPATH=$PROJECT_DIR/source:\$PYTHONPATH && \
+        export PYTHONPATH=$PROJECT_DIR/source/SwarmACB_isaac:\$PYTHONPATH && \
         python $PROJECT_DIR/scripts/hpc/check_env.py
     "
 
