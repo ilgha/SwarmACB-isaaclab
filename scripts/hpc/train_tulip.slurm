@@ -67,6 +67,7 @@ apptainer exec \
     "$CONTAINER" \
     bash -c "
         source /root/isaac_env/bin/activate && \
+        ldconfig 2>/dev/null || true && \
         export PYTHONPATH=$PROJECT_DIR/source:\$PYTHONPATH && \
         cd $PROJECT_DIR && \
         python scripts/train.py \

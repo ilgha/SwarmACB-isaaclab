@@ -28,6 +28,28 @@ else
 fi
 
 echo ""
+echo "=== Installing missing system libraries into overlay ==="
+# Isaac Sim plugins require libX11, libgomp, libGLU, libXt even in headless mode.
+# These are missing from the base container — install them into the writable overlay.
+apptainer exec \
+    --nv \
+    --overlay "$OVERLAY" \
+    "$CONTAINER" \
+    bash -c '
+        # Check if libgomp is already installed
+        if ! ldconfig -p 2>/dev/null | grep -q libgomp; then
+            echo "Installing missing system libraries..."
+            apt-get update -qq && \
+            apt-get install -y --no-install-recommends \
+                libx11-6 libgomp1 libglu1-mesa libxt6 libxrender1 libxext6 && \
+            ldconfig && \
+            echo "System libraries installed successfully."
+        else
+            echo "System libraries already installed (found libgomp)."
+        fi
+    '
+
+echo ""
 echo "=== Verifying SwarmACB_isaac import (via PYTHONPATH) ==="
 apptainer exec \
     --nv \
