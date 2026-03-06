@@ -1,13 +1,15 @@
 #!/bin/bash
 #SBATCH --job-name=swarm_tulip
-#SBATCH --output=logs/tulip_%j.out
-#SBATCH --error=logs/tulip_%j.err
-#SBATCH --time=48:00:00
+#SBATCH --array=0-1
+#SBATCH --time=3-00:00:00
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
+#SBATCH --cpus-per-task=10
 #SBATCH --gres=gpu:1
-#SBATCH --partition=gpu          # ← adjust to your cluster's GPU partition name
+#SBATCH --mem-per-cpu=1000
+#SBATCH --partition=batch
+#SBATCH --output=logs/%x_%A_%a_master.out
+#SBATCH --error=logs/%x_%A_%a_master.err
+
 
 # ═══════════════════════════════════════════════════════════════════════
 #  SwarmACB — Train tulip variant on HPC via Apptainer + Isaac Lab
