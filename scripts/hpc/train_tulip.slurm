@@ -64,6 +64,7 @@ apptainer exec \
     --overlay "$OVERLAY" \
     --bind "$PROJECT_DIR:$PROJECT_DIR" \
     --env ACCEPT_EULA=Y \
+    --env PYTHONPATH="$PROJECT_DIR/source" \
     "$CONTAINER" \
     bash -c "
         cd $PROJECT_DIR && \

@@ -28,19 +28,17 @@ else
 fi
 
 echo ""
-echo "=== Installing SwarmACB_isaac package into overlay ==="
+echo "=== Verifying SwarmACB_isaac import (via PYTHONPATH) ==="
 apptainer exec \
     --nv \
     --overlay "$OVERLAY" \
     --bind "$PROJECT_DIR:$PROJECT_DIR" \
+    --env PYTHONPATH="$PROJECT_DIR/source" \
     "$CONTAINER" \
-    bash -c "
-        cd $PROJECT_DIR/source/SwarmACB_isaac && \
-        python3.11 -m pip install --no-deps -e . && \
-        echo '' && \
-        echo '=== Verifying installation ===' && \
-        python3.11 -c 'import SwarmACB_isaac; print(\"SwarmACB_isaac imported OK from:\", SwarmACB_isaac.__file__)'
-    "
+    python3.11 -c "
+import SwarmACB_isaac
+print('SwarmACB_isaac imported OK from:', SwarmACB_isaac.__file__)
+"
 
 echo ""
 echo "=== Quick headless test ==="
@@ -48,6 +46,7 @@ apptainer exec \
     --nv \
     --overlay "$OVERLAY" \
     --bind "$PROJECT_DIR:$PROJECT_DIR" \
+    --env PYTHONPATH="$PROJECT_DIR/source" \
     "$CONTAINER" \
     python3.11 -c "
 import torch
