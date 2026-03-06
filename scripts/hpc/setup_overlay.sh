@@ -53,18 +53,7 @@ apptainer exec \
     bash -c "
         source /root/isaac_env/bin/activate && \
         export PYTHONPATH=$PROJECT_DIR/source:\$PYTHONPATH && \
-        python -c '
-import torch
-print(f\"PyTorch {torch.__version__}, CUDA available: {torch.cuda.is_available()}\")
-if torch.cuda.is_available():
-    print(f\"GPU: {torch.cuda.get_device_name(0)}\")
-import importlib.util
-mods = [\"isaacsim\", \"isaaclab\", \"omni\", \"gymnasium\", \"tensorboard\", \"SwarmACB_isaac\"]
-for m in mods:
-    spec = importlib.util.find_spec(m)
-    print(f\"{m}: {\"OK\" if spec else \"MISSING\"}\")
-print(\"All good!\")
-'
+        python $PROJECT_DIR/scripts/hpc/check_env.py
     "
 
 echo ""
