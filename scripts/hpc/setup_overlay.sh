@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-PROJECT_DIR="/home/ulb/iridia_robo/igharbi/SwarmACB_isaac"
+PROJECT_DIR="/home/ulb/iridia_robo/igharbi/SwarmACB-isaaclab"
 CONTAINER="/srv/apps/shared/containers/isaacsim.sif"
 OVERLAY="$GLOBALSCRATCH/isaacsim_overlay.img"
 
