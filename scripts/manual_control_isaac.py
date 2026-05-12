@@ -35,17 +35,33 @@ import argparse
 
 # ── Isaac Lab bootstrap (MUST happen before other Isaac Lab imports) ──
 from isaaclab.app import AppLauncher
+from _isaac_launch import apply_windows_kit_defaults
 
 parser = argparse.ArgumentParser(description="SwarmACB — Manual control (Isaac Sim)")
 parser.add_argument("--num-agents", type=int, default=20)
 parser.add_argument("--speed", type=float, default=0.08, help="Keyboard control speed (m/s)")
 parser.add_argument("--others-explore", action="store_true",
                     help="Start other robots in exploration mode instead of stop")
+parser.add_argument("--no-keyboard", action="store_true",
+                    help="Do not subscribe to keyboard events; useful for startup smoke tests")
+parser.add_argument("--smoke-frames", type=int, default=0,
+                    help="Run this many rendered frames, then exit; 0 means run until closed")
+parser.add_argument("--sim-hz", type=float, default=60.0,
+                    help="Kinematic integration and viewport update rate")
+parser.add_argument("--control-hz", type=float, default=10.0,
+                    help="Behaviour-module decision rate; 10 Hz matches the original 0.1 s step")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
+apply_windows_kit_defaults(args, "ManualIsaac")
 
+if getattr(args, "headless", False) and not args.no_keyboard:
+    print("[ManualIsaac] Headless mode has no app window; enabling --no-keyboard.", flush=True)
+    args.no_keyboard = True
+
+print("[ManualIsaac] Launching Isaac Sim app...", flush=True)
 app_launcher = AppLauncher(args)
 simulation_app = app_launcher.app
+print("[ManualIsaac] Isaac Sim app launched.", flush=True)
 
 # ── Now safe to import Isaac Lab & Omni packages ─────────────────────
 
@@ -83,7 +99,7 @@ from behavior_modules import BehaviorModules
 class StandaloneDGTEnv:
     """Lightweight DGT env (pure-PyTorch kinematic sim, no USD physics)."""
 
-    def __init__(self, num_agents: int = 20, device: str = "cpu"):
+    def __init__(self, num_agents: int = 20, device: str = "cpu", dt: float = 0.1):
         self.device = torch.device(device)
         self.E = 1
         self.N = num_agents
@@ -98,7 +114,7 @@ class StandaloneDGTEnv:
         self.robot_radius = 0.035
         self.max_speed = 0.12
         self.wheelbase = 0.053
-        self.dt = 0.1
+        self.dt = dt
 
         # ── Ground zones ────────────────────────────────────────
         self.corridor_width = 0.50
@@ -508,6 +524,8 @@ class KeyboardController:
 
     def __init__(self):
         self._appwindow = omni.appwindow.get_default_app_window()
+        if self._appwindow is None:
+            raise RuntimeError("No Isaac Sim app window is available for keyboard input.")
         self._input = carb.input.acquire_input_interface()
         self._keyboard = self._appwindow.get_keyboard()
 
@@ -539,7 +557,9 @@ class KeyboardController:
         return evts
 
     def destroy(self):
-        self._input.unsubscribe_to_keyboard_events(self._keyboard, self._sub)
+        if self._sub is not None:
+            self._input.unsubscribe_to_keyboard_events(self._keyboard, self._sub)
+            self._sub = None
 
 
 # =====================================================================
@@ -549,9 +569,22 @@ class KeyboardController:
 def main():
     N = args.num_agents
     speed = args.speed
+    sim_hz = max(args.sim_hz, 1.0)
+    control_hz = max(args.control_hz, 1.0)
+    sim_dt = 1.0 / sim_hz
+    control_dt = 1.0 / control_hz
+    control_interval = max(1, round(control_dt / sim_dt))
+    status_interval = max(1, round(1.0 / sim_dt))
+    print(
+        f"[ManualIsaac] sim_hz={sim_hz:.1f}, control_hz={control_hz:.1f}, "
+        f"control interval={control_interval} frames",
+        flush=True,
+    )
 
     # ── Simulation context ────────────────────────────────────────
-    sim = SimulationContext(physics_dt=0.1, rendering_dt=0.1)
+    print("[ManualIsaac] Creating SimulationContext...", flush=True)
+    sim = SimulationContext(physics_dt=sim_dt, rendering_dt=sim_dt)
+    print("[ManualIsaac] SimulationContext ready.", flush=True)
 
     # ── Lighting ──────────────────────────────────────────────────
     light_cfg = sim_utils.DomeLightCfg(intensity=3000.0, color=(0.80, 0.80, 0.80))
@@ -561,19 +594,23 @@ def main():
     spawn_ground_plane("/World/GroundPlane", GroundPlaneCfg())
 
     # ── Kinematic env ─────────────────────────────────────────────
-    env = StandaloneDGTEnv(num_agents=N, device="cpu")
+    env = StandaloneDGTEnv(num_agents=N, device="cpu", dt=sim_dt)
 
     # ── Visual scene ──────────────────────────────────────────────
+    print("[ManualIsaac] Building arena visuals...", flush=True)
     _build_arena_visuals(env)
     robot_markers = _create_robot_markers(env)
     heading_markers = _create_heading_markers(env)
+    print("[ManualIsaac] Visual scene ready.", flush=True)
 
     # ── Keyboard ──────────────────────────────────────────────────
-    kb = KeyboardController()
+    kb = None if args.no_keyboard else KeyboardController()
     others_module = 0 if args.others_explore else 1  # 0=explore, 1=stop
 
     # ── Let the sim initialise ────────────────────────────────────
+    print("[ManualIsaac] Resetting simulation...", flush=True)
     sim.reset()
+    print("[ManualIsaac] Entering main loop.", flush=True)
 
     # Marker index arrays (robot 0 = prototype 0, rest = prototype 1)
     robot_proto = np.array([0] + [1] * (N - 1), dtype=np.int32)
@@ -588,49 +625,62 @@ def main():
     print("=" * 60 + "\n")
 
     step_counter = 0
+    other_left_cmd = torch.zeros(1, N)
+    other_right_cmd = torch.zeros(1, N)
+    force_control_update = True
 
     while simulation_app.is_running():
         # ── Handle keyboard events ────────────────────────────────
-        for evt in kb.pop_events():
+        for evt in ([] if kb is None else kb.pop_events()):
             if evt == "ESCAPE":
+                print("[ManualIsaac] Escape pressed; exiting.", flush=True)
+                if kb is not None:
+                    kb.destroy()
                 simulation_app.close()
                 return
             elif evt == "R":
                 env.reset()
                 step_counter = 0
+                force_control_update = True
                 print("[RESET] Episode reset")
             elif evt == "NUMPAD_0":
                 others_module = 0
+                force_control_update = True
                 print(f"[MODULE] Others → {MODULE_NAMES[0]}")
             elif evt == "NUMPAD_1":
                 others_module = 1
+                force_control_update = True
                 print(f"[MODULE] Others → {MODULE_NAMES[1]}")
             elif evt == "NUMPAD_2":
                 others_module = 2
+                force_control_update = True
                 print(f"[MODULE] Others → {MODULE_NAMES[2]}")
             elif evt == "NUMPAD_3":
                 others_module = 3
+                force_control_update = True
                 print(f"[MODULE] Others → {MODULE_NAMES[3]}")
             elif evt == "NUMPAD_4":
                 others_module = 4
+                force_control_update = True
                 print(f"[MODULE] Others → {MODULE_NAMES[4]}")
             elif evt == "NUMPAD_5":
                 others_module = 5
+                force_control_update = True
                 print(f"[MODULE] Others → {MODULE_NAMES[5]}")
 
         # ── Keyboard → wheel velocities for robot 0 ──────────────
         lv0, rv0 = 0.0, 0.0
-        if kb.is_held("Z", "UP"):
+        if kb is not None and kb.is_held("Z", "UP"):
             lv0, rv0 = speed, speed
-        if kb.is_held("S", "DOWN"):
+        if kb is not None and kb.is_held("S", "DOWN"):
             lv0, rv0 = -speed, -speed
-        if kb.is_held("Q", "LEFT"):
+        if kb is not None and kb.is_held("Q", "LEFT"):
             lv0 -= speed * 0.5
             rv0 += speed * 0.5
-        if kb.is_held("D", "RIGHT"):
+        if kb is not None and kb.is_held("D", "RIGHT"):
             lv0 += speed * 0.5
             rv0 -= speed * 0.5
-        if kb.is_held("A"):
+        if kb is not None and kb.is_held("A"):
             lv0, rv0 = 0.0, 0.0
 
         # Build velocity tensors
@@ -640,7 +690,7 @@ def main():
         right[0, 0] = rv0
 
         # ── Others: run selected behaviour module ─────────────────
-        if N > 1:
+        if N > 1 and (force_control_update or step_counter % control_interval == 0):
             prox_v, prox_val, prox_ang = env.sensors.compute_proximity(
                 env.pos, env.yaw, env.wall_segments, env.pos, env.robot_radius,
             )
@@ -653,8 +703,13 @@ def main():
             el, er = env.behavior_modules.dispatch(
                 module_ids, prox_val, prox_ang, light_val, light_ang, rab_ax, rab_ay,
             )
-            left[0, 1:] = el[0, 1:]
-            right[0, 1:] = er[0, 1:]
+            other_left_cmd = el
+            other_right_cmd = er
+            force_control_update = False
+
+        if N > 1:
+            left[0, 1:] = other_left_cmd[0, 1:]
+            right[0, 1:] = other_right_cmd[0, 1:]
 
         # ── Step kinematic env ────────────────────────────────────
         env.step(left, right)
@@ -695,13 +750,13 @@ def main():
         )
 
         # ── Periodic console readout ──────────────────────────────
-        if step_counter % 10 == 0:
+        if step_counter % status_interval == 0:
             info = env.compute_obs_robot0()
             gv = info["ground_3"]
             g_label = "BLACK" if gv[0] < 0.1 else ("WHITE" if gv[0] > 0.9 else "GREY")
             pos0 = pos_2d[0]
             print(
-                f"[Step {env.step_count:4d}/1200] "
+                f"[t={env.step_count * env.dt:6.1f}s step={env.step_count:5d}] "
                 f"pos=({pos0[0]:+.3f},{pos0[1]:+.3f}) "
                 f"yaw={math.degrees(yaws[0]):+6.1f}° "
                 f"ground={g_label} "
@@ -717,8 +772,13 @@ def main():
         # ── Sim step (renders the viewport) ───────────────────────
         sim.step()
 
+        if args.smoke_frames > 0 and step_counter >= args.smoke_frames:
+            print(f"[ManualIsaac] Smoke test completed after {step_counter} frames.", flush=True)
+            break
+
     # ── Cleanup ───────────────────────────────────────────────────
-    kb.destroy()
+    if kb is not None:
+        kb.destroy()
     simulation_app.close()
 
 

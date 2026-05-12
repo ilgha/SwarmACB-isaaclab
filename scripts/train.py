@@ -25,6 +25,7 @@ import argparse
 
 # Isaac Lab bootstrap — must happen before other Isaac Lab imports
 from isaaclab.app import AppLauncher
+from _isaac_launch import apply_windows_kit_defaults
 
 parser = argparse.ArgumentParser(description="SwarmACB POCA Training")
 
@@ -58,6 +59,7 @@ parser.add_argument("--checkpoint_dir", type=str, default=None,
 # AppLauncher adds its own args (--headless, --device, etc.)
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
+apply_windows_kit_defaults(args, "Train")
 
 # Launch Omniverse
 app_launcher = AppLauncher(args)

@@ -30,6 +30,9 @@ set -euo pipefail
 PROJECT_DIR="/home/ulb/iridia_robo/igharbi/SwarmACB-isaaclab"
 CONTAINER="/srv/apps/shared/containers/isaacsim.sif"
 OVERLAY="$GLOBALSCRATCH/isaacsim_overlay.img"
+RUN_SUFFIX="${SLURM_ARRAY_TASK_ID:-0}"
+RUN_DIR="runs/DirGate_tulip_hpc_${RUN_SUFFIX}"
+CHECKPOINT_DIR="checkpoints/DirGate_tulip_hpc_${RUN_SUFFIX}"
 
 # ── Create log directory ──────────────────────────────────────────────
 mkdir -p "$PROJECT_DIR/logs"
@@ -39,9 +42,12 @@ echo "=========================================="
 echo "  Job ID:       $SLURM_JOB_ID"
 echo "  Node:         $(hostname)"
 echo "  GPUs:         $CUDA_VISIBLE_DEVICES"
+echo "  Array task:   $RUN_SUFFIX"
 echo "  Date:         $(date)"
 echo "  Project:      $PROJECT_DIR"
 echo "  Container:    $CONTAINER"
+echo "  Run dir:      $RUN_DIR"
+echo "  Checkpoints:  $CHECKPOINT_DIR"
 echo "=========================================="
 
 nvidia-smi || true
@@ -73,8 +79,8 @@ apptainer exec \
         python scripts/train.py \
             --config configs/DirGate_tulip.yaml \
             --headless \
-            --log_dir runs/DirGate_tulip_hpc \
-            --checkpoint_dir checkpoints/DirGate_tulip_hpc
+            --log_dir $RUN_DIR \
+            --checkpoint_dir $CHECKPOINT_DIR
     "
 
 echo "Training finished at $(date)"

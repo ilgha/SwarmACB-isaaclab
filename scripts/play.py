@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 
 from isaaclab.app import AppLauncher
+from _isaac_launch import apply_windows_kit_defaults
 
 parser = argparse.ArgumentParser(description="SwarmACB POCA Evaluation")
 
@@ -40,6 +41,7 @@ parser.add_argument("--deterministic", action="store_true",
 
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
+apply_windows_kit_defaults(args, "Play")
 
 app_launcher = AppLauncher(args)
 simulation_app = app_launcher.app
@@ -74,21 +76,32 @@ def _resolve_env_cfg(task_id: str):
 def main():
     # ── Resolve variant from config / CLI / checkpoint ────────────
     variant = args.variant  # may be None
+    env_overrides = {}
 
     if args.config:
         from SwarmACB_isaac.tasks.direct.agents.config_loader import load_config, print_config
         run_name, cfg_variant, cfg, env_overrides = load_config(args.config)
         if variant is None:
             variant = cfg_variant
-        print_config(run_name, variant, cfg, env_overrides)
+
+    # Evaluation defaults to one environment unless explicitly overridden.
+    if args.num_envs is not None:
+        env_overrides["num_envs"] = args.num_envs
 
     if variant is None:
         variant = "dandelion"  # fallback
+
+    if args.config:
+        print_config(run_name, variant, cfg, env_overrides)
 
     # ── Build env config and apply variant BEFORE gym.make ────────
     env_cfg = _resolve_env_cfg(args.task)
     if hasattr(env_cfg, "update_variant"):
         env_cfg.update_variant(variant)
+    if "num_envs" in env_overrides:
+        env_cfg.scene.num_envs = env_overrides["num_envs"]
+    if "episode_length_s" in env_overrides:
+        env_cfg.episode_length_s = env_overrides["episode_length_s"]
 
     # ── Create environment ────────────────────────────────────────
     env = gym.make(args.task, cfg=env_cfg)

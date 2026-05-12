@@ -390,9 +390,11 @@ class EpuckSensors:
         cos_y = torch.cos(agent_yaw)  # (E, N)
         sin_y = torch.sin(agent_yaw)
 
-        # Pairwise distances (E, N, N)
-        dx = agent_pos[:, :, 0].unsqueeze(2) - agent_pos[:, :, 0].unsqueeze(1)
-        dy = agent_pos[:, :, 1].unsqueeze(2) - agent_pos[:, :, 1].unsqueeze(1)
+        # Pairwise vectors: diff[i,j] = robot_j - robot_i.
+        # This is the direction from the current robot to each neighbor,
+        # matching the proximity detector and behavior-module expectations.
+        dx = agent_pos[:, :, 0].unsqueeze(1) - agent_pos[:, :, 0].unsqueeze(2)
+        dy = agent_pos[:, :, 1].unsqueeze(1) - agent_pos[:, :, 1].unsqueeze(2)
         dist = torch.sqrt(dx ** 2 + dy ** 2 + 1e-8)  # (E, N, N)
 
         # Mask: in range and not self (explicit diagonal exclusion)
