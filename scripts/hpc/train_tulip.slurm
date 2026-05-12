@@ -57,7 +57,8 @@ nvidia-smi || true
 # ── Run training inside Apptainer ─────────────────────────────────────
 # Key flags:
 #   --nv           : expose NVIDIA GPU drivers into the container
-#   --overlay      : writable filesystem layer (Isaac Sim needs to create files)
+#   --overlay :ro  : shared prepared overlay, mounted read-only for array jobs
+#   --writable-tmpfs: per-job temporary writes inside the container
 #   --bind         : mount the project directory so the code is visible inside
 #   --env          : pass environment variables into the container
 #   --headless     : Isaac Lab flag — no GUI, no rendering (essential for HPC)
@@ -69,7 +70,8 @@ nvidia-smi || true
 
 apptainer exec \
     --nv \
-    --overlay "$OVERLAY" \
+    --overlay "${OVERLAY}:ro" \
+    --writable-tmpfs \
     --bind "$PROJECT_DIR:$PROJECT_DIR" \
     --env ACCEPT_EULA=Y \
     "$CONTAINER" \

@@ -43,7 +43,8 @@ nvidia-smi || true
 
 apptainer exec \
     --nv \
-    --overlay "$OVERLAY" \
+    --overlay "${OVERLAY}:ro" \
+    --writable-tmpfs \
     --bind "$PROJECT_DIR:$PROJECT_DIR" \
     --env ACCEPT_EULA=Y \
     "$CONTAINER" \
