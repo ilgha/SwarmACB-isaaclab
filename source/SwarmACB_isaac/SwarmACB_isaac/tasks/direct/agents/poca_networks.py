@@ -273,6 +273,111 @@ class DiscreteActor(nn.Module):
 #  Residual Self-Attention  (ML-Agents attention.py)
 # ──────────────────────────────────────────────────────────────────────
 
+class RecurrentDiscreteActor(nn.Module):
+    """Categorical actor with an LSTM memory for cyclamen."""
+
+    def __init__(
+        self,
+        obs_dim: int,
+        num_actions: int,
+        hidden: int = 128,
+        num_layers: int = 1,
+        memory_size: int = 128,
+    ):
+        super().__init__()
+        self.obs_dim = obs_dim
+        self.num_actions = num_actions
+        self.memory_size = memory_size
+
+        self.net = LinearEncoder(
+            obs_dim,
+            num_layers,
+            hidden,
+            kernel_init="kaiming_normal",
+        )
+        self.lstm = nn.LSTM(hidden, memory_size, batch_first=True)
+        self.logits_head = _linear_layer(
+            memory_size,
+            num_actions,
+            kernel_init="kaiming_normal",
+            kernel_gain=0.2,
+        )
+
+        for name, param in self.lstm.named_parameters():
+            if "weight_ih" in name:
+                nn.init.xavier_uniform_(param)
+            elif "weight_hh" in name:
+                nn.init.orthogonal_(param)
+            elif "bias" in name:
+                nn.init.zeros_(param)
+
+    def initial_state(
+        self,
+        batch_size: int,
+        device: torch.device | str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        h = torch.zeros(1, batch_size, self.memory_size, device=device)
+        c = torch.zeros(1, batch_size, self.memory_size, device=device)
+        return h, c
+
+    def forward_sequence(
+        self,
+        obs_seq: torch.Tensor,
+        state: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """Return logits for ``obs_seq`` shaped ``(B, T, obs_dim)``."""
+        B, T = obs_seq.shape[:2]
+        enc = self.net(obs_seq.reshape(B * T, self.obs_dim)).view(B, T, -1)
+        if state is None:
+            state = self.initial_state(B, obs_seq.device)
+        out, next_state = self.lstm(enc, state)
+        return self.logits_head(out), next_state
+
+    def step(
+        self,
+        obs: torch.Tensor,
+        state: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        logits, next_state = self.forward_sequence(obs.unsqueeze(1), state)
+        return logits[:, 0], next_state
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        logits, _ = self.step(obs)
+        return logits
+
+    def get_dist(
+        self,
+        obs: torch.Tensor,
+        state: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.distributions.Categorical:
+        logits, _ = self.step(obs, state)
+        return torch.distributions.Categorical(logits=logits)
+
+    def evaluate_sequence(
+        self,
+        obs_seq: torch.Tensor,
+        actions_seq: torch.Tensor,
+        state: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return log_prob ``(B, T, 1)`` and entropy ``(B, T)``."""
+        B, T = obs_seq.shape[:2]
+        logits, _ = self.forward_sequence(obs_seq, state)
+        dist = torch.distributions.Categorical(
+            logits=logits.reshape(B * T, self.num_actions)
+        )
+        act = actions_seq.reshape(B * T, -1).squeeze(-1).long()
+        log_prob = dist.log_prob(act).view(B, T, 1)
+        entropy = dist.entropy().view(B, T)
+        return log_prob, entropy
+
+    def evaluate(self, obs: torch.Tensor, actions: torch.Tensor):
+        log_prob, entropy = self.evaluate_sequence(
+            obs.unsqueeze(1),
+            actions.unsqueeze(1),
+        )
+        return log_prob[:, 0], entropy[:, 0]
+
+
 class ResidualSelfAttention(nn.Module):
     """Pre-norm residual multi-head self-attention with masked average pooling.
 

@@ -113,6 +113,7 @@ def main():
             hidden_dim=args.hidden_dim or hd,
             num_layers=args.num_layers or nl,
             decision_period=args.decision_period or 1,
+            recurrent=(variant == "cyclamen"),
         )
         cfg.log_dir = f"runs/{run_name}"
         cfg.checkpoint_dir = f"checkpoints/poca_{variant}"
@@ -121,6 +122,7 @@ def main():
     # ── CLI overrides always win ──────────────────────────────────
     if args.variant is not None:
         variant = args.variant
+        cfg.recurrent = (variant == "cyclamen")
     if args.total_timesteps is not None:
         cfg.total_timesteps = args.total_timesteps
     if args.hidden_dim is not None:

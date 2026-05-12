@@ -1,14 +1,9 @@
-# ═══════════════════════════════════════════════════════════════════════
-#  SwarmACB — Directional Gate × Cyclamen (discrete, 4-dim obs, LSTM)
-# ═══════════════════════════════════════════════════════════════════════
+# SwarmACB - Directional Gate x Cyclamen (discrete, 4-dim obs, LSTM)
 #
-#  Cyclamen uses the same 4-dim observations as Lily/Tulip but wraps
-#  the policy in an LSTM to test whether memory helps the task.
-#  (LSTM support is not yet implemented in the networks — this config
-#   is a placeholder ready for when it is.)
+# Cyclamen uses the same 4-dim observations as Lily/Tulip but wraps
+# the policy in an LSTM to test whether memory helps the task.
 #
-#  python scripts/train.py --config configs/DirGate_cyclamen.yaml
-# ═══════════════════════════════════════════════════════════════════════
+#   python scripts/train.py --config configs/DirGate_cyclamen.yaml
 
 behaviors:
   DirGate_cyclamen:
@@ -30,9 +25,9 @@ behaviors:
     network_settings:
       hidden_units: 128           # small net + LSTM
       num_layers: 1
-      # memory:
-      #   memory_size: 128        # LSTM hidden size (future)
-      #   sequence_length: 64     # BPTT window (future)
+      memory:
+        memory_size: 128          # LSTM hidden size
+        sequence_length: 64       # BPTT window
 
     reward_signals:
       extrinsic:

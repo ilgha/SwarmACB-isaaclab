@@ -9,6 +9,7 @@ Used by all CASA methods (dandelion through cyclamen) across all missions.
 from .poca_networks import (
     Actor,
     DiscreteActor,
+    RecurrentDiscreteActor,
     POCACritic,
     ResidualSelfAttention,
     LinearEncoder,

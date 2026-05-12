@@ -39,6 +39,7 @@ class POCARolloutBuffer:
         obs_dim: int,
         act_dim: int,
         state_dim: int = 5,
+        memory_size: int = 0,
         gamma: float = 0.99,
         lam: float = 0.95,
         device: torch.device | str = "cuda",
@@ -49,6 +50,7 @@ class POCARolloutBuffer:
         self.obs_dim = obs_dim
         self.act_dim = act_dim
         self.state_dim = state_dim
+        self.memory_size = int(memory_size or 0)
         self.gamma = gamma
         self.lam = lam
         self.device = device
@@ -69,6 +71,12 @@ class POCARolloutBuffer:
 
         self.team_values = torch.zeros(T, E, device=device)      # V(s_t)
         self.baselines = torch.zeros(T, E, N, device=device)     # b_i(s_t, a_{-i,t})
+        if self.memory_size > 0:
+            self.memory_h = torch.zeros(T, E, N, self.memory_size, device=device)
+            self.memory_c = torch.zeros(T, E, N, self.memory_size, device=device)
+        else:
+            self.memory_h = None
+            self.memory_c = None
 
         # ── Computed after rollout ────────────────────────────────
         self.returns = torch.zeros(T, E, device=device)          # λ-return (same for all agents)
@@ -91,6 +99,8 @@ class POCARolloutBuffer:
         done: torch.Tensor,            # (E,)
         team_value: torch.Tensor,      # (E,)
         baselines: torch.Tensor,       # (E, N)
+        memory_h: torch.Tensor | None = None,  # (E, N, memory_size)
+        memory_c: torch.Tensor | None = None,  # (E, N, memory_size)
     ):
         t = self.ptr
         self.obs[t] = obs
@@ -101,6 +111,11 @@ class POCARolloutBuffer:
         self.dones[t] = done
         self.team_values[t] = team_value
         self.baselines[t] = baselines
+        if self.memory_size > 0:
+            if memory_h is None or memory_c is None:
+                raise ValueError("Recurrent rollout buffer requires memory_h and memory_c")
+            self.memory_h[t] = memory_h
+            self.memory_c[t] = memory_c
         self.ptr += 1
 
     # ──────────────────────────────────────────────────────────────
@@ -171,3 +186,61 @@ class POCARolloutBuffer:
                 "old_team_values": flat_tv[idx],     # (MB,)
                 "old_baselines": flat_bl[idx],       # (MB, N)
             }
+
+    def get_sequence_batches(self, sequence_length: int, mini_batch_size: int):
+        """Yield shuffled BPTT windows for recurrent actor updates."""
+        if self.memory_size <= 0 or self.memory_h is None or self.memory_c is None:
+            raise RuntimeError("get_sequence_batches requires recurrent memory storage")
+
+        T, E = self.horizon, self.num_envs
+        seq_len = max(1, min(int(sequence_length), T))
+        grouped: dict[int, list[tuple[int, int, int]]] = {}
+        for env_id in range(E):
+            for start_t in range(0, T, seq_len):
+                end_t = min(start_t + seq_len, T)
+                grouped.setdefault(end_t - start_t, []).append((env_id, start_t, end_t))
+
+        lengths = list(grouped.keys())
+        for length_idx in torch.randperm(len(lengths), device=self.device).tolist():
+            L = lengths[length_idx]
+            chunks = grouped[L]
+            order = torch.randperm(len(chunks), device=self.device).tolist()
+            seq_batch_size = max(1, int(mini_batch_size) // max(L, 1))
+
+            for start in range(0, len(order), seq_batch_size):
+                selected = [chunks[i] for i in order[start:start + seq_batch_size]]
+                yield {
+                    "obs": torch.stack(
+                        [self.obs[s:e, env_id] for env_id, s, e in selected], dim=0
+                    ),
+                    "critic_states": torch.stack(
+                        [self.critic_states[s:e, env_id] for env_id, s, e in selected], dim=0
+                    ),
+                    "actions": torch.stack(
+                        [self.actions[s:e, env_id] for env_id, s, e in selected], dim=0
+                    ),
+                    "old_log_probs": torch.stack(
+                        [self.log_probs[s:e, env_id] for env_id, s, e in selected], dim=0
+                    ),
+                    "advantages": torch.stack(
+                        [self.advantages[s:e, env_id] for env_id, s, e in selected], dim=0
+                    ),
+                    "dones": torch.stack(
+                        [self.dones[s:e, env_id] for env_id, s, e in selected], dim=0
+                    ),
+                    "returns": torch.stack(
+                        [self.returns[s:e, env_id] for env_id, s, e in selected], dim=0
+                    ),
+                    "old_team_values": torch.stack(
+                        [self.team_values[s:e, env_id] for env_id, s, e in selected], dim=0
+                    ),
+                    "old_baselines": torch.stack(
+                        [self.baselines[s:e, env_id] for env_id, s, e in selected], dim=0
+                    ),
+                    "memory_h": torch.stack(
+                        [self.memory_h[s, env_id] for env_id, s, _e in selected], dim=0
+                    ),
+                    "memory_c": torch.stack(
+                        [self.memory_c[s, env_id] for env_id, s, _e in selected], dim=0
+                    ),
+                }

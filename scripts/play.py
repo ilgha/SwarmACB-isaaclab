@@ -56,7 +56,7 @@ import torch
 import SwarmACB_isaac.tasks  # noqa: F401
 
 from SwarmACB_isaac.tasks.direct.agents.poca_networks import (
-    Actor, DiscreteActor,
+    Actor, DiscreteActor, RecurrentDiscreteActor,
 )
 
 
@@ -116,17 +116,27 @@ def main():
     hidden_dim = ckpt.get("hidden_dim", 256)
     num_layers = ckpt.get("num_layers", 2)
     num_actions = ckpt.get("num_actions", 6)
+    recurrent = bool(ckpt.get("recurrent", False))
+    memory_size = ckpt.get("memory_size", 128)
+    if recurrent and not discrete:
+        raise ValueError("Recurrent playback is only implemented for discrete actors")
 
     obs_dict, _ = env.reset()
     obs_dim = obs_dict[agents[0]].shape[-1]
     act_dim = ckpt.get("act_dim", 2)
 
     print(f"[Play] variant={variant}  discrete={discrete}  "
+          f"recurrent={recurrent}  "
           f"hidden={hidden_dim}  layers={num_layers}  "
           f"obs={obs_dim}  act={'discrete(' + str(num_actions) + ')' if discrete else str(act_dim)}")
 
     if discrete:
-        actor = DiscreteActor(obs_dim, num_actions, hidden_dim, num_layers).to(device)
+        if recurrent:
+            actor = RecurrentDiscreteActor(
+                obs_dim, num_actions, hidden_dim, num_layers, memory_size,
+            ).to(device)
+        else:
+            actor = DiscreteActor(obs_dim, num_actions, hidden_dim, num_layers).to(device)
     else:
         actor = Actor(obs_dim, act_dim, hidden_dim, num_layers).to(device)
 
@@ -140,6 +150,11 @@ def main():
     obs_dict, _ = env.reset()
     num_envs = unwrapped.num_envs
     ep_reward = torch.zeros(num_envs, device=device)
+    if recurrent:
+        memory_h, memory_c = actor.initial_state(num_envs * len(agents), device)
+    else:
+        memory_h = None
+        memory_c = None
 
     print(f"[Play] Evaluating {args.num_episodes} episodes "
           f"({'deterministic' if args.deterministic else 'stochastic'})...")
@@ -147,22 +162,35 @@ def main():
     while episode_count < args.num_episodes:
         with torch.no_grad():
             action_dict = {}
-            for i, agent in enumerate(agents):
-                obs = obs_dict[agent]  # (E, obs_dim)
-                dist = actor.get_dist(obs)
+            if recurrent:
+                obs_stacked = torch.stack([obs_dict[a] for a in agents], dim=1)
+                flat_obs = obs_stacked.reshape(-1, obs_stacked.shape[-1])
+                logits, next_memory = actor.step(flat_obs, (memory_h, memory_c))
+                memory_h, memory_c = next_memory[0].detach(), next_memory[1].detach()
+                dist = torch.distributions.Categorical(logits=logits)
                 if args.deterministic:
-                    if discrete:
-                        act = dist.probs.argmax(dim=-1)  # (E,)
+                    flat_act = dist.probs.argmax(dim=-1)
+                else:
+                    flat_act = dist.sample()
+                all_actions = flat_act.view(num_envs, len(agents), 1)
+                action_dict = {a: all_actions[:, i] for i, a in enumerate(agents)}
+            else:
+                for i, agent in enumerate(agents):
+                    obs = obs_dict[agent]  # (E, obs_dim)
+                    dist = actor.get_dist(obs)
+                    if args.deterministic:
+                        if discrete:
+                            act = dist.probs.argmax(dim=-1)  # (E,)
+                        else:
+                            act = dist.mean  # (E, act_dim)
                     else:
-                        act = dist.mean  # (E, act_dim)
-                else:
-                    act = dist.sample()
+                        act = dist.sample()
 
-                if discrete:
-                    action_dict[agent] = act.unsqueeze(-1)  # (E, 1)
-                else:
-                    # ML-Agents preprocessing: clamp(-3,3)/3 before env
-                    action_dict[agent] = act.clamp(-3, 3) / 3
+                    if discrete:
+                        action_dict[agent] = act.unsqueeze(-1)  # (E, 1)
+                    else:
+                        # ML-Agents preprocessing: clamp(-3,3)/3 before env
+                        action_dict[agent] = act.clamp(-3, 3) / 3
 
         obs_dict, reward_dict, terminated_dict, truncated_dict, info = env.step(action_dict)
 
@@ -174,6 +202,11 @@ def main():
             if done:
                 episode_rewards.append(ep_reward[ei].item())
                 ep_reward[ei] = 0.0
+                if recurrent:
+                    start = ei * len(agents)
+                    end = start + len(agents)
+                    memory_h[:, start:end, :] = 0.0
+                    memory_c[:, start:end, :] = 0.0
                 episode_count += 1
                 if episode_count >= args.num_episodes:
                     break

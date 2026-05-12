@@ -32,7 +32,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 
-from .poca_networks import Actor, DiscreteActor, POCACritic
+from .poca_networks import Actor, DiscreteActor, RecurrentDiscreteActor, POCACritic
 from .poca_buffer import POCARolloutBuffer
 
 
@@ -83,6 +83,9 @@ class POCAConfig:
     hidden_dim: int = 512
     num_layers: int = 2
     critic_num_heads: int = 4
+    recurrent: bool = False
+    memory_size: int = 128
+    sequence_length: int = 64
 
     # TensorBoard
     log_dir: str = "runs/poca"
@@ -214,6 +217,9 @@ class POCATrainer:
         # ── networks ──────────────────────────────────────────────
         c = self.cfg
         self.decision_period = c.decision_period
+        self.recurrent = bool(getattr(c, "recurrent", False))
+        if self.recurrent and not self.discrete:
+            raise ValueError("Recurrent POCA actor is only implemented for discrete actions")
 
         # Critic state dimension: 5D polar (ρ, cos α, sin α, cos β, sin β)
         # Matches SwarmACB Unity modification: "the value function takes the
@@ -225,15 +231,36 @@ class POCATrainer:
               f"act={'discrete(' + str(self.num_actions) + ')' if self.discrete else str(self.act_dim)}  "
               f"decision_period={self.decision_period}")
         print("[POCA] Actor uses local obs only; Critic uses 5D polar state")
+        if self.recurrent:
+            print(f"[POCA] Recurrent actor: LSTM memory={c.memory_size}  "
+                  f"sequence_length={c.sequence_length}")
 
         if self.discrete:
-            self.actor = DiscreteActor(
-                self.obs_dim, self.num_actions, c.hidden_dim, c.num_layers,
-            ).to(self.device)
+            if self.recurrent:
+                self.actor = RecurrentDiscreteActor(
+                    self.obs_dim,
+                    self.num_actions,
+                    c.hidden_dim,
+                    c.num_layers,
+                    c.memory_size,
+                ).to(self.device)
+            else:
+                self.actor = DiscreteActor(
+                    self.obs_dim, self.num_actions, c.hidden_dim, c.num_layers,
+                ).to(self.device)
         else:
             self.actor = Actor(
                 self.obs_dim, self.act_dim, c.hidden_dim, c.num_layers,
             ).to(self.device)
+
+        if self.recurrent:
+            memory_batch = self.num_envs * self.num_agents
+            self.actor_memory_h, self.actor_memory_c = self.actor.initial_state(
+                memory_batch, self.device,
+            )
+        else:
+            self.actor_memory_h = None
+            self.actor_memory_c = None
 
         self.critic = POCACritic(
             self.state_dim, self.act_dim_critic, self.num_agents,
@@ -278,6 +305,7 @@ class POCATrainer:
             obs_dim=self.obs_dim,
             act_dim=self.act_dim,
             state_dim=self.state_dim,
+            memory_size=c.memory_size if self.recurrent else 0,
             gamma=c.gamma,
             lam=c.lam,
             device=self.device,
@@ -389,7 +417,23 @@ class POCATrainer:
             # ── sample actions from shared actor (batched over all agents) ──
             # Actor uses LOCAL observations only (swarm robotics: no global knowledge)
             flat_obs = obs_stacked.reshape(-1, obs_stacked.shape[-1])  # (E*N, obs)
-            dist = self.actor.get_dist(flat_obs)
+            memory_h = None
+            memory_c = None
+            if self.recurrent:
+                memory_h = self.actor_memory_h.squeeze(0).view(
+                    self.num_envs, self.num_agents, -1,
+                ).clone()
+                memory_c = self.actor_memory_c.squeeze(0).view(
+                    self.num_envs, self.num_agents, -1,
+                ).clone()
+                logits, next_memory = self.actor.step(
+                    flat_obs, (self.actor_memory_h, self.actor_memory_c),
+                )
+                self.actor_memory_h = next_memory[0].detach()
+                self.actor_memory_c = next_memory[1].detach()
+                dist = torch.distributions.Categorical(logits=logits)
+            else:
+                dist = self.actor.get_dist(flat_obs)
 
             if self.discrete:
                 flat_act = dist.sample()                       # (E*N,)
@@ -447,6 +491,8 @@ class POCATrainer:
                 done=last_done,
                 team_value=team_val,
                 baselines=baselines,
+                memory_h=memory_h,
+                memory_c=memory_c,
             )
 
             # ── episode reward tracking ───────────────────────────
@@ -468,6 +514,13 @@ class POCATrainer:
                 self._episode_reward_acc[done_mask] = 0.0
                 self._episode_step_count[done_mask] = 0.0
 
+            if self.recurrent and done_mask.any():
+                done_agents = done_mask[:, None].expand(
+                    self.num_envs, self.num_agents,
+                ).reshape(-1)
+                self.actor_memory_h[:, done_agents, :] = 0.0
+                self.actor_memory_c[:, done_agents, :] = 0.0
+
             # Count agent-decisions (matching ML-Agents max_steps)
             self.global_step += self.num_envs * self.num_agents
 
@@ -477,6 +530,116 @@ class POCATrainer:
         self.buffer.compute_returns_and_advantages(last_tv)
 
         return obs_dict
+
+    def _compute_feedforward_losses(
+        self,
+        batch: dict,
+        current_eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        obs = batch["obs"]
+        critic_states = batch["critic_states"]
+        actions = batch["actions"]
+        old_logp = batch["old_log_probs"]
+        advantages = batch["advantages"]
+        returns = batch["returns"]
+        old_tv = batch["old_team_values"]
+        old_bl = batch["old_baselines"]
+
+        MB, N = obs.shape[:2]
+        flat_obs = obs.reshape(-1, obs.shape[-1])
+        flat_act = actions.reshape(-1, actions.shape[-1])
+        flat_logp, flat_ent = self.actor.evaluate(flat_obs, flat_act)
+
+        new_logp_all = flat_logp.view(MB, N, -1)
+        ent_all = flat_ent.view(MB, N)
+        policy_loss = trust_region_policy_loss(
+            advantages.unsqueeze(-1).reshape(-1, 1),
+            new_logp_all.reshape(-1, new_logp_all.shape[-1]),
+            old_logp.reshape(-1, old_logp.shape[-1]),
+            current_eps,
+        )
+        mean_entropy = ent_all.mean()
+
+        new_tv = self.critic.critic_pass(critic_states).squeeze(-1)
+        critic_act = self._encode_actions_for_critic(actions)
+        new_bl = self.critic.all_baselines(critic_states, critic_act)
+
+        value_loss = trust_region_value_loss(new_tv, old_tv, returns, current_eps)
+        ret_expanded = returns.unsqueeze(-1).expand_as(new_bl)
+        baseline_loss = trust_region_value_loss(
+            new_bl.reshape(-1),
+            old_bl.reshape(-1),
+            ret_expanded.reshape(-1),
+            current_eps,
+        )
+        return policy_loss, value_loss, baseline_loss, mean_entropy
+
+    def _compute_recurrent_losses(
+        self,
+        batch: dict,
+        current_eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        obs = batch["obs"]
+        critic_states = batch["critic_states"]
+        actions = batch["actions"]
+        old_logp = batch["old_log_probs"]
+        advantages = batch["advantages"]
+        returns = batch["returns"]
+        old_tv = batch["old_team_values"]
+        old_bl = batch["old_baselines"]
+
+        B, L, N = obs.shape[:3]
+        obs_seq = obs.permute(0, 2, 1, 3).reshape(B * N, L, obs.shape[-1])
+        act_seq = actions.permute(0, 2, 1, 3).reshape(B * N, L, actions.shape[-1])
+        h0 = batch["memory_h"].reshape(B * N, -1).unsqueeze(0).detach()
+        c0 = batch["memory_c"].reshape(B * N, -1).unsqueeze(0).detach()
+        state = (h0, c0)
+        logps = []
+        ents = []
+        for t in range(L):
+            logits, state = self.actor.step(obs_seq[:, t], state)
+            dist = torch.distributions.Categorical(logits=logits)
+            act_t = act_seq[:, t].squeeze(-1).long()
+            logps.append(dist.log_prob(act_t).unsqueeze(-1))
+            ents.append(dist.entropy())
+            if t < L - 1:
+                keep = (1.0 - batch["dones"][:, t]).repeat_interleave(N)
+                keep = keep.view(1, B * N, 1)
+                state = (state[0] * keep, state[1] * keep)
+        logp_seq = torch.stack(logps, dim=1)
+        ent_seq = torch.stack(ents, dim=1)
+
+        new_logp_all = logp_seq.view(B, N, L, -1).permute(0, 2, 1, 3)
+        ent_all = ent_seq.view(B, N, L).permute(0, 2, 1)
+        policy_loss = trust_region_policy_loss(
+            advantages.unsqueeze(-1).reshape(-1, 1),
+            new_logp_all.reshape(-1, new_logp_all.shape[-1]),
+            old_logp.reshape(-1, old_logp.shape[-1]),
+            current_eps,
+        )
+        mean_entropy = ent_all.mean()
+
+        flat_states = critic_states.reshape(B * L, N, critic_states.shape[-1])
+        flat_actions = actions.reshape(B * L, N, actions.shape[-1])
+        flat_returns = returns.reshape(B * L)
+        flat_old_tv = old_tv.reshape(B * L)
+        flat_old_bl = old_bl.reshape(B * L, N)
+
+        new_tv = self.critic.critic_pass(flat_states).squeeze(-1)
+        critic_act = self._encode_actions_for_critic(flat_actions)
+        new_bl = self.critic.all_baselines(flat_states, critic_act)
+
+        value_loss = trust_region_value_loss(
+            new_tv, flat_old_tv, flat_returns, current_eps,
+        )
+        ret_expanded = flat_returns.unsqueeze(-1).expand_as(new_bl)
+        baseline_loss = trust_region_value_loss(
+            new_bl.reshape(-1),
+            flat_old_bl.reshape(-1),
+            ret_expanded.reshape(-1),
+            current_eps,
+        )
+        return policy_loss, value_loss, baseline_loss, mean_entropy
 
     # ──────────────────────────────────────────────────────────────
     #  PPO / POCA update
@@ -520,7 +683,41 @@ class POCATrainer:
         self.buffer.advantages = (all_adv - adv_mean) / (adv_std + 1e-10)
 
         for _epoch in range(cfg.num_epochs):
-            for batch in self.buffer.get_batches(group_mb):
+            if self.recurrent:
+                batch_iter = self.buffer.get_sequence_batches(
+                    cfg.sequence_length, group_mb,
+                )
+            else:
+                batch_iter = self.buffer.get_batches(group_mb)
+
+            for batch in batch_iter:
+                if self.recurrent:
+                    policy_loss, value_loss, baseline_loss, mean_entropy = (
+                        self._compute_recurrent_losses(batch, current_eps)
+                    )
+                else:
+                    policy_loss, value_loss, baseline_loss, mean_entropy = (
+                        self._compute_feedforward_losses(batch, current_eps)
+                    )
+
+                loss = (
+                    policy_loss
+                    + 0.5 * (value_loss + 0.5 * baseline_loss)
+                    - current_beta * mean_entropy
+                )
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                # NOTE: ML-Agents does NOT clip gradients for POCA
+                self.optimizer.step()
+
+                total_pol += policy_loss.item()
+                total_val += value_loss.item()
+                total_bl += baseline_loss.item()
+                total_ent += mean_entropy.item()
+                n_updates += 1
+                continue
+
                 obs = batch["obs"]                  # (MB, N, obs)
                 critic_states = batch["critic_states"]  # (MB, N, 5)
                 actions = batch["actions"]          # (MB, N, act)
@@ -791,6 +988,9 @@ class POCATrainer:
             # Save architecture for correct restoration in play
             "hidden_dim": getattr(self.cfg, "hidden_dim", 256),
             "num_layers": getattr(self.cfg, "num_layers", 2),
+            "recurrent": self.recurrent,
+            "memory_size": getattr(self.cfg, "memory_size", 0),
+            "sequence_length": getattr(self.cfg, "sequence_length", 0),
             "discrete": self.discrete,
             "num_actions": self.num_actions if self.discrete else 0,
             "act_dim": self.act_dim,

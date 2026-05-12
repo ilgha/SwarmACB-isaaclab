@@ -80,6 +80,11 @@ def load_config(path: str | Path) -> tuple[str, str, POCAConfig, dict[str, Any]]
     # Network
     cfg.hidden_dim = network.get("hidden_units", cfg.hidden_dim)
     cfg.num_layers = network.get("num_layers", cfg.num_layers)
+    memory = network.get("memory", {})
+    cfg.recurrent = bool(memory) or variant == "cyclamen"
+    if cfg.recurrent:
+        cfg.memory_size = memory.get("memory_size", cfg.memory_size)
+        cfg.sequence_length = memory.get("sequence_length", cfg.sequence_length)
 
     # Reward signals
     extrinsic = reward.get("extrinsic", {})
@@ -138,6 +143,9 @@ def print_config(run_name: str, variant: str, cfg: POCAConfig, env_ov: dict):
     print(f"  Network")
     print(f"    hidden_units        : {cfg.hidden_dim}")
     print(f"    num_layers          : {cfg.num_layers}")
+    if cfg.recurrent:
+        print(f"    memory_size         : {cfg.memory_size}")
+        print(f"    sequence_length     : {cfg.sequence_length}")
     print(f"  Training")
     print(f"    max_steps           : {cfg.total_timesteps:,}")
     print(f"    time_horizon        : {cfg.horizon}")
