@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=swarm_tulip
-#SBATCH --array=0-1
+#SBATCH --array=0-9
 #SBATCH --time=3-00:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=10
@@ -21,6 +21,8 @@
 #  Submit:
 #    cd /home/ulb/iridia_robo/igharbi/SwarmACB_isaac
 #    sbatch scripts/hpc/train_tulip.slurm
+#
+#  This submits 10 independent runs via SLURM array tasks 0..9.
 #
 # ═══════════════════════════════════════════════════════════════════════
 
