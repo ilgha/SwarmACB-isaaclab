@@ -81,6 +81,10 @@ def _mission_from_task(task: str) -> str:
     return "dgt"
 
 
+def _mission_length_s(mission: str) -> float:
+    return 120.0 if mission in ("dgt", "homing") else 180.0
+
+
 # =======================================================================
 #  Standalone minimalist env (no Isaac Sim dependency)
 # =======================================================================
@@ -115,6 +119,8 @@ class StandaloneDGTEnv:
         self.max_speed = 0.12
         self.wheelbase = 0.053
         self.dt = 0.1
+        self.episode_length_s = _mission_length_s(self.mission)
+        self.episode_steps = int(round(self.episode_length_s / self.dt))
 
         # ── Ground zones (from paper figure) ───────────────────
         self.corridor_width = 0.50   # m
@@ -365,7 +371,7 @@ class StandaloneDGTEnv:
             self.step_count += 1
             return
         if self.mission == "homing":
-            final_step = self.step_count + 1 >= 1200
+            final_step = self.step_count + 1 >= self.episode_steps
             self.step_reward = self._goal_membership(self.pos[0]).float().sum().item() if final_step else 0.0
             self.episode_reward += self.step_reward
             self.step_count += 1
@@ -942,7 +948,7 @@ def main():
         draw_text("── Reward ──", COL_HEADING, True)
         draw_text(f"  Step: {env.step_reward:+.0f}   K⁺={env.k_plus_total}  K⁻={env.k_minus_total}")
         draw_text(f"  Episode: {env.episode_reward:.0f}")
-        draw_text(f"  Step #{env.step_count}  / 1200")
+        draw_text(f"  Step #{env.step_count}  / {env.episode_steps} ({env.episode_length_s:.0f}s)")
         y += 8
 
         draw_text("── Controls ──", (160, 160, 170), True)

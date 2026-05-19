@@ -61,6 +61,10 @@ def _mission_from_task(task: str) -> str:
 
 
 parser = argparse.ArgumentParser(description="SwarmACB — Manual control (Isaac Sim)")
+def _mission_length_s(mission: str) -> float:
+    return 120.0 if mission in ("dgt", "homing") else 180.0
+
+
 parser.add_argument("--task", type=str, default="SwarmACB-DirectionalGate-v0",
                     choices=TASK_CHOICES,
                     help="Mission layout to load in the manual viewer")
@@ -168,6 +172,8 @@ class StandaloneDGTEnv:
         self.max_speed = 0.12
         self.wheelbase = 0.053
         self.dt = dt
+        self.episode_length_s = _mission_length_s(self.mission)
+        self.episode_steps = int(round(self.episode_length_s / self.dt))
 
         # ── Ground zones ────────────────────────────────────────
         self.corridor_width = 0.50
@@ -335,7 +341,7 @@ class StandaloneDGTEnv:
             self.step_count += 1
             return
         if self.mission == "homing":
-            final_step = self.step_count + 1 >= 1200
+            final_step = self.step_count + 1 >= self.episode_steps
             self.step_reward = self._goal_membership(self.pos[0]).float().sum().item() if final_step else 0.0
             self.episode_reward += self.step_reward
             self.step_count += 1
@@ -1343,7 +1349,7 @@ def main():
                 if policy_mode else MODULE_NAMES[others_module]
             )
             print(
-                f"[t={env.step_count * env.dt:6.1f}s step={env.step_count:5d}] "
+                f"[t={env.step_count * env.dt:6.1f}s step={env.step_count:5d}/{env.episode_steps}] "
                 f"pos=({pos0[0]:+.3f},{pos0[1]:+.3f}) "
                 f"yaw={math.degrees(yaws[0]):+6.1f}° "
                 f"ground={g_label} "
