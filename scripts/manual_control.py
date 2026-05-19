@@ -58,6 +58,29 @@ from epuck_sensors import EpuckSensors
 from behavior_modules import BehaviorModules
 
 
+TASK_CHOICES = [
+    "SwarmACB-DirectionalGate-v0",
+    "SwarmACB-XOR-v0",
+    "SwarmACB-Homing-v0",
+    "SwarmACB-Foraging-v0",
+    "SwarmACB-Sheltering-v0",
+    "SwarmACB-SCA-v0",
+    "SwarmACB-SHL-v0",
+]
+
+
+def _mission_from_task(task: str) -> str:
+    if task == "SwarmACB-XOR-v0":
+        return "xor"
+    if task == "SwarmACB-Homing-v0":
+        return "homing"
+    if task == "SwarmACB-Foraging-v0":
+        return "foraging"
+    if task in ("SwarmACB-Sheltering-v0", "SwarmACB-SCA-v0", "SwarmACB-SHL-v0"):
+        return "sheltering"
+    return "dgt"
+
+
 # =======================================================================
 #  Standalone minimalist env (no Isaac Sim dependency)
 # =======================================================================
@@ -69,10 +92,17 @@ class StandaloneDGTEnv:
     matching the full env exactly.
     """
 
-    def __init__(self, num_agents: int = 20, device: str = "cpu"):
+    def __init__(
+        self,
+        num_agents: int = 20,
+        device: str = "cpu",
+        task: str = "SwarmACB-DirectionalGate-v0",
+    ):
         self.device = torch.device(device)
         self.E = 1  # single env
         self.N = num_agents
+        self.task = task
+        self.mission = _mission_from_task(task)
 
         # ── Arena geometry (dodecagon 4.91 m²) ────────────────────
         self.arena_n_sides = 12
@@ -105,6 +135,36 @@ class StandaloneDGTEnv:
 
         # ── Light source (south edge) ─────────────────────────────
         self.light_pos = torch.tensor([0.0, -1.4], device=self.device)
+        self.has_light = self.mission not in ("xor", "homing")
+
+        # XOR aggregation targets: two black disks, diameter 0.60 m,
+        # centered 0.50 m left/right of the arena center.
+        self.target_radius = 0.30
+        self.target_centers = torch.tensor(
+            [[-0.50, 0.0], [0.50, 0.0]],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self.goal_radius = 0.30
+        self.goal_center = torch.tensor([0.0, -0.70], dtype=torch.float32, device=self.device)
+        self.food_radius = 0.15
+        self.food_centers = torch.tensor(
+            [[-0.75, 0.0], [0.75, 0.0]],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self.nest_top_y = -0.63
+        self.nest_center = torch.tensor([0.0, -0.78], dtype=torch.float32, device=self.device)
+        self.nest_size = torch.tensor([1.10, 0.35], dtype=torch.float32, device=self.device)
+        self.shelter_center = torch.tensor([0.0, 0.0], dtype=torch.float32, device=self.device)
+        self.shelter_size = torch.tensor([0.50, 0.30], dtype=torch.float32, device=self.device)
+        self.shelter_wall_thickness = 0.03
+        self.shelter_black_radius = 0.30
+        self.shelter_black_centers = torch.tensor(
+            [[-0.80, 0.0], [0.80, 0.0]],
+            dtype=torch.float32,
+            device=self.device,
+        )
 
         # ── State ─────────────────────────────────────────────────
         self.pos = torch.zeros(self.E, self.N, 2, device=self.device)
@@ -136,6 +196,8 @@ class StandaloneDGTEnv:
         self.step_count = 0
         self.k_plus_total = 0
         self.k_minus_total = 0
+        self.has_food = torch.zeros(self.E, self.N, dtype=torch.bool, device=self.device)
+        self.prev_in_nest = torch.zeros_like(self.has_food)
 
         self.reset()
 
@@ -155,6 +217,15 @@ class StandaloneDGTEnv:
 
     def _build_gate_walls(self):
         """Two vertical side walls at x = ±corr_hw."""
+        if self.mission in ("xor", "homing", "foraging"):
+            return []
+        if self.mission == "sheltering":
+            left, right, bottom, top = self._shelter_bounds()
+            return [
+                (left, bottom, left, top),
+                (right, bottom, right, top),
+                (left, top, right, top),
+            ]
         hw = self.corr_hw
         gs = self.gate_south
         wl = self.side_wall_length
@@ -167,17 +238,21 @@ class StandaloneDGTEnv:
         inradius = self.arena_circumradius * math.cos(math.pi / self.arena_n_sides)
         safe = inradius - self.robot_radius * 2
         r = torch.sqrt(torch.rand(self.N)) * safe
-        th = torch.rand(self.N) * 2 * math.pi
+        th = torch.rand(self.N) * (math.pi if self.mission == "homing" else 2 * math.pi)
         self.pos[0, :, 0] = r * torch.cos(th)
         self.pos[0, :, 1] = r * torch.sin(th)
+        if self.mission == "homing":
+            self.pos[0, :, 1] = self.pos[0, :, 1].abs()
         self.yaw[0] = torch.rand(self.N) * 2 * math.pi - math.pi
         self.prev_y[0] = self.pos[0, :, 1]
-        self.prev_ground_color = torch.full((self.E, self.N), 0.5, device=self.device)
+        self.prev_ground_color = self._ground_scalar(self.pos[0]).unsqueeze(0)
         self.step_reward = 0.0
         self.episode_reward = 0.0
         self.step_count = 0
         self.k_plus_total = 0
         self.k_minus_total = 0
+        self.has_food[:] = False
+        self.prev_in_nest = self._nest_membership(self.pos[0]).unsqueeze(0)
         self.behavior_modules.reset_exploration_state(
             torch.ones(self.E, dtype=torch.bool, device=self.device))
 
@@ -185,6 +260,21 @@ class StandaloneDGTEnv:
         """(N, 2) → (N,)  scalar ground value."""
         x, y = pos_2d[:, 0], pos_2d[:, 1]
         c = torch.full_like(x, 0.5)
+        if self.mission == "xor":
+            in_target = self._target_membership(pos_2d).any(dim=-1)
+            return torch.where(in_target, torch.zeros_like(c), c)
+        if self.mission == "homing":
+            return torch.where(self._goal_membership(pos_2d), torch.zeros_like(c), c)
+        if self.mission == "foraging":
+            in_food = self._food_membership(pos_2d).any(dim=-1)
+            in_nest = self._nest_membership(pos_2d)
+            c = torch.where(in_food, torch.zeros_like(c), c)
+            return torch.where(in_nest, torch.ones_like(c), c)
+        if self.mission == "sheltering":
+            in_black = self._shelter_black_membership(pos_2d).any(dim=-1)
+            in_shelter = self._shelter_membership(pos_2d)
+            c = torch.where(in_black, torch.zeros_like(c), c)
+            return torch.where(in_shelter, torch.ones_like(c), c)
         # White gate
         in_gate = (
             (x.abs() < self.gate_hw)
@@ -201,10 +291,54 @@ class StandaloneDGTEnv:
         c = torch.where(in_corr, torch.zeros_like(c), c)
         return c
 
+    def _target_membership(self, pos_2d):
+        diff = pos_2d.unsqueeze(1) - self.target_centers.view(1, 2, 2)
+        dist_sq = (diff * diff).sum(dim=-1)
+        return dist_sq <= self.target_radius ** 2
+
+    def _goal_membership(self, pos_2d):
+        diff = pos_2d - self.goal_center.view(1, 2)
+        return (diff * diff).sum(dim=-1) <= self.goal_radius ** 2
+
+    def _food_membership(self, pos_2d):
+        diff = pos_2d.unsqueeze(1) - self.food_centers.view(1, 2, 2)
+        return (diff * diff).sum(dim=-1) <= self.food_radius ** 2
+
+    def _nest_membership(self, pos_2d):
+        return pos_2d[:, 1] <= self.nest_top_y
+
+    def _shelter_bounds(self):
+        half = self.shelter_size / 2.0
+        return (
+            (self.shelter_center[0] - half[0]).item(),
+            (self.shelter_center[0] + half[0]).item(),
+            (self.shelter_center[1] - half[1]).item(),
+            (self.shelter_center[1] + half[1]).item(),
+        )
+
+    def _shelter_membership(self, pos_2d):
+        left, right, bottom, top = self._shelter_bounds()
+        return (
+            (pos_2d[:, 0] >= left) & (pos_2d[:, 0] <= right)
+            & (pos_2d[:, 1] >= bottom) & (pos_2d[:, 1] <= top)
+        )
+
+    def _shelter_black_membership(self, pos_2d):
+        diff = pos_2d.unsqueeze(1) - self.shelter_black_centers.view(1, 2, 2)
+        return (diff * diff).sum(dim=-1) <= self.shelter_black_radius ** 2
+
     def _ground_3ch(self, pos):
         """(1, N, 2) → (1, N, 3)"""
         s = self._ground_scalar(pos[0])
         return s.unsqueeze(0).unsqueeze(-1).expand(1, -1, 3)
+
+    def _compute_light_readings(self):
+        if self.has_light:
+            return self.sensors.compute_light(self.pos, self.yaw, self.light_pos)
+        light_vals = torch.zeros(self.E, self.N, 8, device=self.device)
+        light_value = torch.zeros(self.E, self.N, device=self.device)
+        light_angle = torch.zeros(self.E, self.N, device=self.device)
+        return light_vals, light_value, light_angle
 
     def step(self, left_vel: torch.Tensor, right_vel: torch.Tensor):
         """Step all robots. left_vel, right_vel: (1, N)."""
@@ -222,6 +356,36 @@ class StandaloneDGTEnv:
         self._resolve_walls()
         self._resolve_gate_walls()
         self._resolve_robots()
+
+        if self.mission == "xor":
+            in_targets = self._target_membership(self.pos[0])
+            counts = in_targets.float().sum(dim=0)
+            self.step_reward = counts.max().item()
+            self.episode_reward += self.step_reward
+            self.step_count += 1
+            return
+        if self.mission == "homing":
+            final_step = self.step_count + 1 >= 1200
+            self.step_reward = self._goal_membership(self.pos[0]).float().sum().item() if final_step else 0.0
+            self.episode_reward += self.step_reward
+            self.step_count += 1
+            return
+        if self.mission == "foraging":
+            in_food = self._food_membership(self.pos[0]).any(dim=-1).unsqueeze(0)
+            in_nest = self._nest_membership(self.pos[0]).unsqueeze(0)
+            self.has_food = self.has_food | in_food
+            arrived = in_nest & (~self.prev_in_nest) & self.has_food
+            self.step_reward = arrived.float().sum().item()
+            self.has_food = torch.where(arrived, torch.zeros_like(self.has_food), self.has_food)
+            self.prev_in_nest = in_nest.clone()
+            self.episode_reward += self.step_reward
+            self.step_count += 1
+            return
+        if self.mission == "sheltering":
+            self.step_reward = self._shelter_membership(self.pos[0]).float().sum().item()
+            self.episode_reward += self.step_reward
+            self.step_count += 1
+            return
 
         # Reward: colour transitions (matching Unity DirGateEnvController.cs)
         # BLACK → WHITE = +1 (K⁺), WHITE → BLACK = -1 (K⁻)
@@ -254,9 +418,7 @@ class StandaloneDGTEnv:
             all_agent_pos=self.pos,
             robot_radius=self.robot_radius,
         )
-        light_vals, light_value, light_angle = self.sensors.compute_light(
-            self.pos, self.yaw, self.light_pos,
-        )
+        light_vals, light_value, light_angle = self._compute_light_readings()
         ground = self._ground_3ch(self.pos)  # (1, N, 3)
         ztilde, rab_proj, _, _ = self.sensors.compute_rab(
             self.pos, self.yaw,
@@ -292,6 +454,34 @@ class StandaloneDGTEnv:
 
     def _resolve_gate_walls(self):
         """Push robots out of the two vertical side walls."""
+        if self.mission in ("xor", "homing", "foraging"):
+            return
+        if self.mission == "sheltering":
+            r = self.robot_radius
+            t = self.shelter_wall_thickness
+            left, right, bottom, top = self._shelter_bounds()
+            px = self.pos[:, :, 0]
+            py = self.pos[:, :, 1]
+            vertical_y = (py > bottom - r) & (py < top + r)
+            for x0 in (left, right):
+                dx = px - x0
+                near = (dx.abs() < r + t / 2) & vertical_y
+                sign = torch.sign(dx)
+                sign = torch.where(sign == 0, torch.ones_like(sign), sign)
+                self.pos[:, :, 0] = torch.where(
+                    near, x0 + sign * (r + t / 2), self.pos[:, :, 0],
+                )
+            px = self.pos[:, :, 0]
+            py = self.pos[:, :, 1]
+            horizontal_x = (px > left - r) & (px < right + r)
+            dy = py - top
+            near_top = (dy.abs() < r + t / 2) & horizontal_x
+            sign_y = torch.sign(dy)
+            sign_y = torch.where(sign_y == 0, torch.ones_like(sign_y), sign_y)
+            self.pos[:, :, 1] = torch.where(
+                near_top, top + sign_y * (r + t / 2), self.pos[:, :, 1],
+            )
+            return
         r = self.robot_radius
         hw = self.corr_hw
         gs = self.gate_south
@@ -373,9 +563,43 @@ class StandaloneDGTEnv:
 #  Pygame visualisation + keyboard control
 # =======================================================================
 
+def _dodecagon_vertices(radius: float, n_sides: int = 12):
+    return [
+        (
+            radius * math.cos(2 * math.pi * i / n_sides + math.pi / n_sides),
+            radius * math.sin(2 * math.pi * i / n_sides + math.pi / n_sides),
+        )
+        for i in range(n_sides)
+    ]
+
+
+def _clip_polygon_below_y(points, y_max: float):
+    if not points:
+        return []
+    clipped = []
+    prev = points[-1]
+    prev_inside = prev[1] <= y_max
+    for curr in points:
+        curr_inside = curr[1] <= y_max
+        if curr_inside != prev_inside:
+            denom = curr[1] - prev[1]
+            alpha = 0.0 if abs(denom) < 1e-8 else (y_max - prev[1]) / denom
+            clipped.append((prev[0] + alpha * (curr[0] - prev[0]), y_max))
+        if curr_inside:
+            clipped.append(curr)
+        prev, prev_inside = curr, curr_inside
+    return clipped
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Manual control for DGT env",
+        description="Manual control for SwarmACB missions",
+    )
+    parser.add_argument(
+        "--task", dest="task", type=str,
+        default="SwarmACB-DirectionalGate-v0",
+        choices=TASK_CHOICES,
+        help="Mission layout to load.",
     )
     parser.add_argument(
         "--num-agents", type=int, default=20,
@@ -393,7 +617,11 @@ def main():
         sys.exit(1)
 
     # ── Create env ────────────────────────────────────────────────
-    env = StandaloneDGTEnv(num_agents=args.num_agents, device="cpu")
+    env = StandaloneDGTEnv(
+        num_agents=args.num_agents,
+        device="cpu",
+        task=args.task,
+    )
 
     # ── Pygame setup ──────────────────────────────────────────────
     WIDTH, HEIGHT = 900, 700
@@ -402,6 +630,8 @@ def main():
     pygame.init()
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
     pygame.display.set_caption("SwarmACB — Directional Gate — Manual Control")
+    mission_title = "XOR Aggregation" if env.mission == "xor" else "Directional Gate"
+    pygame.display.set_caption(f"SwarmACB - {mission_title} - Manual Control")
     clock = pygame.time.Clock()
     font = pygame.font.SysFont("consolas", 12)
     font_big = pygame.font.SysFont("consolas", 14, bold=True)
@@ -495,10 +725,7 @@ def main():
                 (1, N), others_module, dtype=torch.long,
             )
             module_ids[0, 0] = 1  # robot 0 = stop (overridden)
-            light_v, light_val, light_ang = (
-                env.sensors.compute_light(
-                    env.pos, env.yaw, env.light_pos,
-                ))
+            light_v, light_val, light_ang = env._compute_light_readings()
             zt, rp, rab_ax, rab_ay = env.sensors.compute_rab(
                 env.pos, env.yaw,
             )
@@ -526,24 +753,72 @@ def main():
             poly_pts.append(arena_to_px(seg[0], seg[1]))
         pygame.draw.polygon(screen, COL_GREY, poly_pts)
 
-        # White gate rectangle
-        ghw = env.gate_hw
-        gs = env.gate_south
-        cs = env.corr_south
-        gate_pts = [
-            arena_to_px(-ghw, gs), arena_to_px(ghw, gs),
-            arena_to_px(ghw, cs), arena_to_px(-ghw, cs),
-        ]
-        pygame.draw.polygon(screen, COL_WHITE, gate_pts)
+        if env.mission == "xor":
+            target_radius_px = max(int(env.target_radius * scale), 1)
+            for center in env.target_centers.cpu():
+                pygame.draw.circle(
+                    screen,
+                    COL_BLACK,
+                    arena_to_px(center[0].item(), center[1].item()),
+                    target_radius_px,
+                )
+        elif env.mission == "homing":
+            pygame.draw.circle(
+                screen,
+                COL_BLACK,
+                arena_to_px(env.goal_center[0].item(), env.goal_center[1].item()),
+                max(int(env.goal_radius * scale), 1),
+            )
+        elif env.mission == "foraging":
+            nest_poly = _clip_polygon_below_y(
+                _dodecagon_vertices(env.arena_circumradius, env.arena_n_sides),
+                env.nest_top_y,
+            )
+            pygame.draw.polygon(screen, COL_WHITE, [arena_to_px(x, y) for x, y in nest_poly])
+            food_radius_px = max(int(env.food_radius * scale), 1)
+            for center in env.food_centers.cpu():
+                pygame.draw.circle(
+                    screen,
+                    COL_BLACK,
+                    arena_to_px(center[0].item(), center[1].item()),
+                    food_radius_px,
+                )
+        elif env.mission == "sheltering":
+            black_radius_px = max(int(env.shelter_black_radius * scale), 1)
+            for center in env.shelter_black_centers.cpu():
+                pygame.draw.circle(
+                    screen,
+                    COL_BLACK,
+                    arena_to_px(center[0].item(), center[1].item()),
+                    black_radius_px,
+                )
+            left, right, bottom, top = env._shelter_bounds()
+            shelter_pts = [
+                arena_to_px(left, bottom),
+                arena_to_px(right, bottom),
+                arena_to_px(right, top),
+                arena_to_px(left, top),
+            ]
+            pygame.draw.polygon(screen, COL_WHITE, shelter_pts)
+        else:
+            # White gate rectangle
+            ghw = env.gate_hw
+            gs = env.gate_south
+            cs = env.corr_south
+            gate_pts = [
+                arena_to_px(-ghw, gs), arena_to_px(ghw, gs),
+                arena_to_px(ghw, cs), arena_to_px(-ghw, cs),
+            ]
+            pygame.draw.polygon(screen, COL_WHITE, gate_pts)
 
-        # Black corridor rectangle
-        chw = env.corr_hw
-        ni = env.north_inradius
-        corr_pts = [
-            arena_to_px(-chw, cs), arena_to_px(chw, cs),
-            arena_to_px(chw, ni), arena_to_px(-chw, ni),
-        ]
-        pygame.draw.polygon(screen, COL_BLACK, corr_pts)
+            # Black corridor rectangle
+            chw = env.corr_hw
+            ni = env.north_inradius
+            corr_pts = [
+                arena_to_px(-chw, cs), arena_to_px(chw, cs),
+                arena_to_px(chw, ni), arena_to_px(-chw, ni),
+            ]
+            pygame.draw.polygon(screen, COL_BLACK, corr_pts)
 
         # -- Arena walls --
         for seg in arena_segs:
@@ -559,9 +834,10 @@ def main():
             pygame.draw.line(screen, COL_GATE_WALL, p1, p2, 3)
 
         # -- Light source (red dot at south) --
-        lp = arena_to_px(env.light_pos[0].item(), env.light_pos[1].item())
-        pygame.draw.circle(screen, COL_LIGHT, lp, 8)
-        pygame.draw.circle(screen, (255, 120, 120), lp, 12, 2)
+        if env.has_light:
+            lp = arena_to_px(env.light_pos[0].item(), env.light_pos[1].item())
+            pygame.draw.circle(screen, COL_LIGHT, lp, 8)
+            pygame.draw.circle(screen, (255, 120, 120), lp, 12, 2)
 
         # -- Robots --
         positions = env.pos[0].cpu()

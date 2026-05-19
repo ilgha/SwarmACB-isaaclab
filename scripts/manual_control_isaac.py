@@ -37,7 +37,33 @@ import argparse
 from isaaclab.app import AppLauncher
 from _isaac_launch import apply_windows_kit_defaults
 
+TASK_CHOICES = [
+    "SwarmACB-DirectionalGate-v0",
+    "SwarmACB-XOR-v0",
+    "SwarmACB-Homing-v0",
+    "SwarmACB-Foraging-v0",
+    "SwarmACB-Sheltering-v0",
+    "SwarmACB-SCA-v0",
+    "SwarmACB-SHL-v0",
+]
+
+
+def _mission_from_task(task: str) -> str:
+    if task == "SwarmACB-XOR-v0":
+        return "xor"
+    if task == "SwarmACB-Homing-v0":
+        return "homing"
+    if task == "SwarmACB-Foraging-v0":
+        return "foraging"
+    if task in ("SwarmACB-Sheltering-v0", "SwarmACB-SCA-v0", "SwarmACB-SHL-v0"):
+        return "sheltering"
+    return "dgt"
+
+
 parser = argparse.ArgumentParser(description="SwarmACB — Manual control (Isaac Sim)")
+parser.add_argument("--task", type=str, default="SwarmACB-DirectionalGate-v0",
+                    choices=TASK_CHOICES,
+                    help="Mission layout to load in the manual viewer")
 parser.add_argument("--num-agents", type=int, default=20)
 parser.add_argument("--speed", type=float, default=0.08, help="Keyboard control speed (m/s)")
 parser.add_argument("--others-explore", action="store_true",
@@ -50,6 +76,16 @@ parser.add_argument("--sim-hz", type=float, default=60.0,
                     help="Kinematic integration and viewport update rate")
 parser.add_argument("--control-hz", type=float, default=10.0,
                     help="Behaviour-module decision rate; 10 Hz matches the original 0.1 s step")
+parser.add_argument("--policy-checkpoint", "--checkpoint", dest="policy_checkpoint",
+                    type=str, default=None,
+                    help="Optional POCA checkpoint to drive all robots in the fast viewer")
+parser.add_argument("--config", type=str, default=None,
+                    help="Training config used to infer the CASA variant for policy playback")
+parser.add_argument("--variant", type=str, default=None,
+                    choices=["dandelion", "daisy", "lily", "tulip", "cyclamen"],
+                    help="CASA variant override for policy playback")
+parser.add_argument("--deterministic", action="store_true",
+                    help="Use deterministic policy actions during checkpoint playback")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 apply_windows_kit_defaults(args, "ManualIsaac")
@@ -71,7 +107,9 @@ import weakref
 import carb
 import numpy as np
 import omni
+import omni.usd
 import torch
+from pxr import Gf, UsdGeom, Vt
 
 import isaaclab.sim as sim_utils
 from isaaclab.markers import VisualizationMarkersCfg, VisualizationMarkers
@@ -86,10 +124,17 @@ _EPUCK_DIR = os.path.join(
     _PROJECT_ROOT, "source", "SwarmACB_isaac", "SwarmACB_isaac",
     "tasks", "direct", "epuck",
 )
-sys.path.insert(0, _EPUCK_DIR)
+_AGENTS_DIR = os.path.join(
+    _PROJECT_ROOT, "source", "SwarmACB_isaac", "SwarmACB_isaac",
+    "tasks", "direct", "agents",
+)
+for _path in (_EPUCK_DIR, _AGENTS_DIR):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
 from epuck_sensors import EpuckSensors
 from behavior_modules import BehaviorModules
+from poca_networks import Actor, DiscreteActor, RecurrentDiscreteActor
 
 
 # =====================================================================
@@ -99,10 +144,18 @@ from behavior_modules import BehaviorModules
 class StandaloneDGTEnv:
     """Lightweight DGT env (pure-PyTorch kinematic sim, no USD physics)."""
 
-    def __init__(self, num_agents: int = 20, device: str = "cpu", dt: float = 0.1):
+    def __init__(
+        self,
+        num_agents: int = 20,
+        device: str = "cpu",
+        dt: float = 0.1,
+        task: str = "SwarmACB-DirectionalGate-v0",
+    ):
         self.device = torch.device(device)
         self.E = 1
         self.N = num_agents
+        self.task = task
+        self.mission = _mission_from_task(task)
 
         # ── Arena geometry (dodecagon 4.91 m²) ─────────────────
         self.arena_n_sides = 12
@@ -132,6 +185,42 @@ class StandaloneDGTEnv:
 
         # ── Light source ────────────────────────────────────────
         self.light_pos = torch.tensor([0.0, -1.4], device=self.device)
+        self.has_light = self.mission not in ("xor", "homing")
+
+        # XOR aggregation targets: two black disks, diameter 0.60 m,
+        # centered 0.50 m left/right of the arena center.
+        self.target_radius = 0.30
+        self.target_centers = torch.tensor(
+            [[-0.50, 0.0], [0.50, 0.0]],
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        # Homing goal: a single black disk in the southern half.
+        self.goal_radius = 0.30
+        self.goal_center = torch.tensor([0.0, -0.70], dtype=torch.float32, device=self.device)
+
+        # Foraging: two black food disks and one white nest near the light.
+        self.food_radius = 0.15
+        self.food_centers = torch.tensor(
+            [[-0.75, 0.0], [0.75, 0.0]],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self.nest_top_y = -0.63
+        self.nest_center = torch.tensor([0.0, -0.78], dtype=torch.float32, device=self.device)
+        self.nest_size = torch.tensor([1.10, 0.35], dtype=torch.float32, device=self.device)
+
+        # Sheltering: white center shelter, three walls, two black side cues.
+        self.shelter_center = torch.tensor([0.0, 0.0], dtype=torch.float32, device=self.device)
+        self.shelter_size = torch.tensor([0.50, 0.30], dtype=torch.float32, device=self.device)
+        self.shelter_wall_thickness = 0.03
+        self.shelter_black_radius = 0.30
+        self.shelter_black_centers = torch.tensor(
+            [[-0.80, 0.0], [0.80, 0.0]],
+            dtype=torch.float32,
+            device=self.device,
+        )
 
         # ── State ───────────────────────────────────────────────
         self.pos = torch.zeros(self.E, self.N, 2, device=self.device)
@@ -160,6 +249,8 @@ class StandaloneDGTEnv:
         self.step_count = 0
         self.k_plus_total = 0
         self.k_minus_total = 0
+        self.has_food = torch.zeros(self.E, self.N, dtype=torch.bool, device=self.device)
+        self.prev_in_nest = torch.zeros_like(self.has_food)
 
         self.reset()
 
@@ -180,6 +271,15 @@ class StandaloneDGTEnv:
         return segs
 
     def _build_gate_walls(self):
+        if self.mission in ("xor", "homing", "foraging"):
+            return []
+        if self.mission == "sheltering":
+            left, right, bottom, top = self._shelter_bounds()
+            return [
+                (left, bottom, left, top),
+                (right, bottom, right, top),
+                (left, top, right, top),
+            ]
         hw = self.corr_hw
         gs = self.gate_south
         wl = self.side_wall_length
@@ -192,17 +292,24 @@ class StandaloneDGTEnv:
         inradius = self.arena_circumradius * math.cos(math.pi / self.arena_n_sides)
         safe = inradius - self.robot_radius * 2
         r = torch.sqrt(torch.rand(self.N)) * safe
-        th = torch.rand(self.N) * 2 * math.pi
+        if self.mission == "homing":
+            th = torch.rand(self.N) * math.pi
+        else:
+            th = torch.rand(self.N) * 2 * math.pi
         self.pos[0, :, 0] = r * torch.cos(th)
         self.pos[0, :, 1] = r * torch.sin(th)
+        if self.mission == "homing":
+            self.pos[0, :, 1] = self.pos[0, :, 1].abs()
         self.yaw[0] = torch.rand(self.N) * 2 * math.pi - math.pi
         self.prev_y[0] = self.pos[0, :, 1]
-        self.prev_ground_color = torch.full((self.E, self.N), 0.5, device=self.device)
+        self.prev_ground_color = self._ground_scalar(self.pos[0]).unsqueeze(0)
         self.step_reward = 0.0
         self.episode_reward = 0.0
         self.step_count = 0
         self.k_plus_total = 0
         self.k_minus_total = 0
+        self.has_food[:] = False
+        self.prev_in_nest = self._nest_membership(self.pos[0]).unsqueeze(0)
         self.behavior_modules.reset_exploration_state(
             torch.ones(self.E, dtype=torch.bool, device=self.device))
 
@@ -219,6 +326,36 @@ class StandaloneDGTEnv:
         self._resolve_walls()
         self._resolve_gate_walls()
         self._resolve_robots()
+
+        if self.mission == "xor":
+            in_targets = self._target_membership(self.pos[0])
+            counts = in_targets.float().sum(dim=0)
+            self.step_reward = counts.max().item()
+            self.episode_reward += self.step_reward
+            self.step_count += 1
+            return
+        if self.mission == "homing":
+            final_step = self.step_count + 1 >= 1200
+            self.step_reward = self._goal_membership(self.pos[0]).float().sum().item() if final_step else 0.0
+            self.episode_reward += self.step_reward
+            self.step_count += 1
+            return
+        if self.mission == "foraging":
+            in_food = self._food_membership(self.pos[0]).any(dim=-1).unsqueeze(0)
+            in_nest = self._nest_membership(self.pos[0]).unsqueeze(0)
+            self.has_food = self.has_food | in_food
+            arrived = in_nest & (~self.prev_in_nest) & self.has_food
+            self.step_reward = arrived.float().sum().item()
+            self.has_food = torch.where(arrived, torch.zeros_like(self.has_food), self.has_food)
+            self.prev_in_nest = in_nest.clone()
+            self.episode_reward += self.step_reward
+            self.step_count += 1
+            return
+        if self.mission == "sheltering":
+            self.step_reward = self._shelter_membership(self.pos[0]).float().sum().item()
+            self.episode_reward += self.step_reward
+            self.step_count += 1
+            return
 
         # Reward: colour transitions (matching Unity DirGateEnvController.cs)
         # BLACK → WHITE = +1 (K⁺), WHITE → BLACK = -1 (K⁻)
@@ -243,13 +380,19 @@ class StandaloneDGTEnv:
         self.k_minus_total += int(k_minus)
         self.step_count += 1
 
+    def _compute_light_readings(self):
+        if self.has_light:
+            return self.sensors.compute_light(self.pos, self.yaw, self.light_pos)
+        light_vals = torch.zeros(self.E, self.N, 8, device=self.device)
+        light_value = torch.zeros(self.E, self.N, device=self.device)
+        light_angle = torch.zeros(self.E, self.N, device=self.device)
+        return light_vals, light_value, light_angle
+
     def compute_obs_robot0(self):
         prox_vals, prox_value, prox_angle = self.sensors.compute_proximity(
             self.pos, self.yaw, self.wall_segments, self.pos, self.robot_radius,
         )
-        light_vals, light_value, light_angle = self.sensors.compute_light(
-            self.pos, self.yaw, self.light_pos,
-        )
+        light_vals, light_value, light_angle = self._compute_light_readings()
         ground = self._ground_3ch(self.pos)
         ztilde, rab_proj, _, _ = self.sensors.compute_rab(self.pos, self.yaw)
         dx = self.pos[0, :, 0] - self.pos[0, 0, 0]
@@ -272,17 +415,91 @@ class StandaloneDGTEnv:
     def _ground_scalar(self, pos_2d):
         x, y = pos_2d[:, 0], pos_2d[:, 1]
         c = torch.full_like(x, 0.5)
+        if self.mission == "xor":
+            in_target = self._target_membership(pos_2d).any(dim=-1)
+            return torch.where(in_target, torch.zeros_like(c), c)
+        if self.mission == "homing":
+            return torch.where(self._goal_membership(pos_2d), torch.zeros_like(c), c)
+        if self.mission == "foraging":
+            in_food = self._food_membership(pos_2d).any(dim=-1)
+            in_nest = self._nest_membership(pos_2d)
+            c = torch.where(in_food, torch.zeros_like(c), c)
+            return torch.where(in_nest, torch.ones_like(c), c)
+        if self.mission == "sheltering":
+            in_black = self._shelter_black_membership(pos_2d).any(dim=-1)
+            in_shelter = self._shelter_membership(pos_2d)
+            c = torch.where(in_black, torch.zeros_like(c), c)
+            return torch.where(in_shelter, torch.ones_like(c), c)
         in_gate = (x.abs() < self.gate_hw) & (y > self.gate_south) & (y < self.corr_south)
         c = torch.where(in_gate, torch.ones_like(c), c)
         in_corr = (x.abs() < self.corr_hw) & (y >= self.corr_south) & (y < self.north_inradius)
         c = torch.where(in_corr, torch.zeros_like(c), c)
         return c
 
+    def _target_membership(self, pos_2d):
+        diff = pos_2d.unsqueeze(1) - self.target_centers.view(1, 2, 2)
+        dist_sq = (diff * diff).sum(dim=-1)
+        return dist_sq <= self.target_radius ** 2
+
+    def _goal_membership(self, pos_2d):
+        diff = pos_2d - self.goal_center.view(1, 2)
+        return (diff * diff).sum(dim=-1) <= self.goal_radius ** 2
+
+    def _food_membership(self, pos_2d):
+        diff = pos_2d.unsqueeze(1) - self.food_centers.view(1, 2, 2)
+        return (diff * diff).sum(dim=-1) <= self.food_radius ** 2
+
+    def _nest_membership(self, pos_2d):
+        return pos_2d[:, 1] <= self.nest_top_y
+
+    def _shelter_bounds(self):
+        half = self.shelter_size / 2.0
+        left = (self.shelter_center[0] - half[0]).item()
+        right = (self.shelter_center[0] + half[0]).item()
+        bottom = (self.shelter_center[1] - half[1]).item()
+        top = (self.shelter_center[1] + half[1]).item()
+        return left, right, bottom, top
+
+    def _shelter_membership(self, pos_2d):
+        left, right, bottom, top = self._shelter_bounds()
+        return (
+            (pos_2d[:, 0] >= left) & (pos_2d[:, 0] <= right)
+            & (pos_2d[:, 1] >= bottom) & (pos_2d[:, 1] <= top)
+        )
+
+    def _shelter_black_membership(self, pos_2d):
+        diff = pos_2d.unsqueeze(1) - self.shelter_black_centers.view(1, 2, 2)
+        return (diff * diff).sum(dim=-1) <= self.shelter_black_radius ** 2
+
     def _ground_3ch(self, pos):
         s = self._ground_scalar(pos[0])
         return s.unsqueeze(0).unsqueeze(-1).expand(1, -1, 3)
 
     def _resolve_gate_walls(self):
+        if self.mission in ("xor", "homing", "foraging"):
+            return
+        if self.mission == "sheltering":
+            r = self.robot_radius
+            t = self.shelter_wall_thickness
+            left, right, bottom, top = self._shelter_bounds()
+            px = self.pos[:, :, 0]
+            py = self.pos[:, :, 1]
+            vertical_y = (py > bottom - r) & (py < top + r)
+            for x0 in (left, right):
+                dx = px - x0
+                near = (dx.abs() < r + t / 2) & vertical_y
+                sign = torch.sign(dx)
+                sign = torch.where(sign == 0, torch.ones_like(sign), sign)
+                self.pos[:, :, 0] = torch.where(near, x0 + sign * (r + t / 2), self.pos[:, :, 0])
+            px = self.pos[:, :, 0]
+            py = self.pos[:, :, 1]
+            horizontal_x = (px > left - r) & (px < right + r)
+            dy = py - top
+            near_top = (dy.abs() < r + t / 2) & horizontal_x
+            sign_y = torch.sign(dy)
+            sign_y = torch.where(sign_y == 0, torch.ones_like(sign_y), sign_y)
+            self.pos[:, :, 1] = torch.where(near_top, top + sign_y * (r + t / 2), self.pos[:, :, 1])
+            return
         r = self.robot_radius
         hw = self.corr_hw
         gs = self.gate_south
@@ -347,6 +564,91 @@ class StandaloneDGTEnv:
 #  Isaac Sim visual scene builder
 # =====================================================================
 
+def _spawn_flat_circle(
+    prim_path: str,
+    center_xy,
+    radius: float,
+    z: float = 0.004,
+    segments: int = 96,
+    color: tuple[float, float, float] = (0.02, 0.02, 0.02),
+):
+    """Spawn a true flat circular floor patch as a USD triangle-fan mesh."""
+    cx, cy = float(center_xy[0]), float(center_xy[1])
+    stage = omni.usd.get_context().get_stage()
+    mesh = UsdGeom.Mesh.Define(stage, prim_path)
+
+    points = [Gf.Vec3f(cx, cy, z)]
+    for i in range(segments):
+        angle = 2.0 * math.pi * i / segments
+        points.append(Gf.Vec3f(
+            cx + radius * math.cos(angle),
+            cy + radius * math.sin(angle),
+            z,
+        ))
+
+    indices: list[int] = []
+    for i in range(segments):
+        indices.extend([0, i + 1, (i + 1) % segments + 1])
+
+    mesh.CreatePointsAttr(points)
+    mesh.CreateFaceVertexCountsAttr([3] * segments)
+    mesh.CreateFaceVertexIndicesAttr(indices)
+    mesh.CreateDoubleSidedAttr(True)
+    mesh.CreateDisplayColorAttr(Vt.Vec3fArray([Gf.Vec3f(*color)]))
+
+
+def _dodecagon_vertices(radius: float, n_sides: int = 12):
+    return [
+        (
+            radius * math.cos(2 * math.pi * i / n_sides + math.pi / n_sides),
+            radius * math.sin(2 * math.pi * i / n_sides + math.pi / n_sides),
+        )
+        for i in range(n_sides)
+    ]
+
+
+def _clip_polygon_below_y(points, y_max: float):
+    if not points:
+        return []
+    clipped = []
+    prev = points[-1]
+    prev_inside = prev[1] <= y_max
+    for curr in points:
+        curr_inside = curr[1] <= y_max
+        if curr_inside != prev_inside:
+            denom = curr[1] - prev[1]
+            alpha = 0.0 if abs(denom) < 1e-8 else (y_max - prev[1]) / denom
+            clipped.append((prev[0] + alpha * (curr[0] - prev[0]), y_max))
+        if curr_inside:
+            clipped.append(curr)
+        prev, prev_inside = curr, curr_inside
+    return clipped
+
+
+def _spawn_flat_polygon(
+    prim_path: str,
+    points_xy,
+    z: float = 0.004,
+    color: tuple[float, float, float] = (0.95, 0.95, 0.95),
+):
+    if len(points_xy) < 3:
+        return
+    cx = sum(p[0] for p in points_xy) / len(points_xy)
+    cy = sum(p[1] for p in points_xy) / len(points_xy)
+    stage = omni.usd.get_context().get_stage()
+    mesh = UsdGeom.Mesh.Define(stage, prim_path)
+    points = [Gf.Vec3f(cx, cy, z)]
+    points.extend(Gf.Vec3f(float(x), float(y), z) for x, y in points_xy)
+    indices: list[int] = []
+    for i in range(len(points_xy)):
+        indices.extend([0, i + 1, (i + 1) % len(points_xy) + 1])
+    mesh.CreatePointsAttr(points)
+    mesh.CreateFaceVertexCountsAttr([3] * len(points_xy))
+    mesh.CreateFaceVertexIndicesAttr(indices)
+    mesh.CreateDoubleSidedAttr(True)
+    mesh.CreateDisplayColorAttr(Vt.Vec3fArray([Gf.Vec3f(*color)]))
+
+
 def _build_arena_visuals(env: StandaloneDGTEnv):
     """Spawn static visual geometry for the arena in USD."""
     R = env.arena_circumradius
@@ -368,6 +670,108 @@ def _build_arena_visuals(env: StandaloneDGTEnv):
     )
 
     # ── White gate zone ─────────────────────────────────────────
+    if env.mission != "dgt":
+        if env.mission == "xor":
+            for idx, center in enumerate(env.target_centers.cpu().numpy()):
+                _spawn_flat_circle(
+                    f"/World/Arena/BlackTarget_{idx}",
+                    center,
+                    env.target_radius,
+                )
+        elif env.mission == "homing":
+            _spawn_flat_circle(
+                "/World/Arena/HomingGoal",
+                env.goal_center.cpu().numpy(),
+                env.goal_radius,
+            )
+        elif env.mission == "foraging":
+            nest_poly = _clip_polygon_below_y(
+                _dodecagon_vertices(R, n),
+                env.nest_top_y,
+            )
+            _spawn_flat_polygon(
+                "/World/Arena/Nest",
+                nest_poly,
+                color=(0.95, 0.95, 0.95),
+            )
+            for idx, center in enumerate(env.food_centers.cpu().numpy()):
+                _spawn_flat_circle(
+                    f"/World/Arena/Food_{idx}",
+                    center,
+                    env.food_radius,
+                )
+        elif env.mission == "sheltering":
+            for idx, center in enumerate(env.shelter_black_centers.cpu().numpy()):
+                _spawn_flat_circle(
+                    f"/World/Arena/BlackCue_{idx}",
+                    center,
+                    env.shelter_black_radius,
+                )
+            shelter_cfg = sim_utils.CuboidCfg(
+                size=(float(env.shelter_size[0]), float(env.shelter_size[1]), 0.003),
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.95, 0.95, 0.95)),
+            )
+            shelter_cfg.func(
+                "/World/Arena/ShelterArea",
+                shelter_cfg,
+                translation=(float(env.shelter_center[0]), float(env.shelter_center[1]), 0.003),
+            )
+            left, right, bottom, top = env._shelter_bounds()
+            sx, sy = float(env.shelter_size[0]), float(env.shelter_size[1])
+            t = env.shelter_wall_thickness
+            shelter_wall_mat = sim_utils.PreviewSurfaceCfg(diffuse_color=(0.86, 0.39, 0.20))
+            wall_specs = [
+                ("ShelterWallLeft", (t, sy, wall_h), (left, float(env.shelter_center[1]), wall_h / 2)),
+                ("ShelterWallRight", (t, sy, wall_h), (right, float(env.shelter_center[1]), wall_h / 2)),
+                ("ShelterWallTop", (sx, t, wall_h), (float(env.shelter_center[0]), top, wall_h / 2)),
+            ]
+            for name, size, translation in wall_specs:
+                wall_cfg = sim_utils.CuboidCfg(size=size, visual_material=shelter_wall_mat)
+                wall_cfg.func(f"/World/Arena/{name}", wall_cfg, translation=translation)
+
+        if env.has_light:
+            light_cfg = sim_utils.SphereCfg(
+                radius=0.04,
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.9, 0.15, 0.15)),
+            )
+            light_cfg.func("/World/Arena/LightIndicator", light_cfg,
+                           translation=(float(env.light_pos[0]), float(env.light_pos[1]), 0.04))
+
+        wall_mat = sim_utils.PreviewSurfaceCfg(diffuse_color=(0.78, 0.70, 0.40))
+        for i in range(n):
+            a1 = 2 * math.pi * i / n + math.pi / n
+            a2 = 2 * math.pi * ((i + 1) % n) / n + math.pi / n
+            ax, ay = R * math.cos(a1), R * math.sin(a1)
+            bx, by = R * math.cos(a2), R * math.sin(a2)
+            cx = (ax + bx) / 2.0
+            cy = (ay + by) / 2.0
+            seg_len = math.sqrt((bx - ax) ** 2 + (by - ay) ** 2)
+            seg_angle = math.atan2(by - ay, bx - ax)
+            wall_cfg = sim_utils.CuboidCfg(
+                size=(seg_len, wall_thick, wall_h),
+                visual_material=wall_mat,
+            )
+            wall_cfg.func(
+                f"/World/Arena/Wall_{i}",
+                wall_cfg,
+                translation=(cx, cy, wall_h / 2),
+                orientation=(math.cos(seg_angle / 2), 0.0, 0.0, math.sin(seg_angle / 2)),
+            )
+
+        n_marker_cfg = sim_utils.SphereCfg(
+            radius=0.03,
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.2, 0.6, 1.0)),
+        )
+        n_marker_cfg.func("/World/Arena/NorthMarker", n_marker_cfg,
+                          translation=(0.0, R + 0.1, 0.03))
+        s_marker_cfg = sim_utils.SphereCfg(
+            radius=0.03,
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.3, 0.3)),
+        )
+        s_marker_cfg.func("/World/Arena/SouthMarker", s_marker_cfg,
+                          translation=(0.0, -(R + 0.1), 0.03))
+        return
+
     gate_w = env.gate_hw * 2
     gate_l = env.corr_south - env.gate_south
     gate_cy = (env.gate_south + env.corr_south) / 2.0
@@ -519,6 +923,116 @@ MODULE_NAMES = [
     "Anti-photo", "Attraction", "Repulsion",
 ]
 
+
+def _variant_from_config(config_path: str) -> str:
+    """Read the CASA variant from an ML-Agents-style YAML config."""
+    import yaml
+
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    with open(config_path, "r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+
+    behaviors = raw.get("behaviors", raw)
+    if not behaviors:
+        raise ValueError("Config must have a top-level 'behaviors' key.")
+    run_name = next(iter(behaviors))
+    return behaviors[run_name].get("variant", "dandelion")
+
+
+def _infer_variant_from_checkpoint(ckpt: dict) -> str:
+    if not ckpt.get("discrete", False):
+        return "dandelion"
+    if ckpt.get("recurrent", False):
+        return "cyclamen"
+    if ckpt.get("obs_dim", 0) == 24:
+        return "daisy"
+    return "tulip"
+
+
+def _expected_obs_dim(variant: str) -> int:
+    return 24 if variant in ("dandelion", "daisy") else 4
+
+
+def _policy_observations(env: StandaloneDGTEnv, variant: str):
+    """Compute the same local observations used by the training environment."""
+    prox_vals, prox_value, prox_angle = env.sensors.compute_proximity(
+        env.pos, env.yaw, env.wall_segments, env.pos, env.robot_radius,
+    )
+    light_vals, light_value, light_angle = env._compute_light_readings()
+    ground = env._ground_3ch(env.pos)
+    ztilde, rab_proj, rab_attr_x, rab_attr_y = env.sensors.compute_rab(env.pos, env.yaw)
+
+    if variant in ("dandelion", "daisy"):
+        obs_all = env.sensors.collect_obs_dandelion(
+            prox_vals, light_vals, ground, ztilde, rab_proj,
+        )
+    else:
+        obs_all = EpuckSensors.collect_obs_lily(ground, ztilde)
+
+    behavior_inputs = (prox_value, prox_angle, light_value, light_angle, rab_attr_x, rab_attr_y)
+    return obs_all, behavior_inputs
+
+
+def _load_policy_actor(
+    checkpoint_path: str,
+    config_path: str | None,
+    cli_variant: str | None,
+    device: torch.device,
+):
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    ckpt = torch.load(checkpoint_path, map_location=device)
+    variant = cli_variant
+    if variant is None and config_path:
+        variant = _variant_from_config(config_path)
+    if variant is None:
+        variant = _infer_variant_from_checkpoint(ckpt)
+
+    discrete = bool(ckpt.get("discrete", False))
+    recurrent = bool(ckpt.get("recurrent", False))
+    hidden_dim = int(ckpt.get("hidden_dim", 256))
+    num_layers = int(ckpt.get("num_layers", 2))
+    obs_dim = int(ckpt.get("obs_dim", _expected_obs_dim(variant)))
+    num_actions = int(ckpt.get("num_actions", 6))
+    act_dim = int(ckpt.get("act_dim", 2))
+    memory_size = int(ckpt.get("memory_size", 128))
+
+    if obs_dim != _expected_obs_dim(variant):
+        print(
+            f"[Policy] Warning: checkpoint obs_dim={obs_dim}, "
+            f"but variant '{variant}' expects {_expected_obs_dim(variant)}.",
+            flush=True,
+        )
+
+    if discrete:
+        if recurrent:
+            actor = RecurrentDiscreteActor(
+                obs_dim, num_actions, hidden_dim, num_layers, memory_size,
+            ).to(device)
+        else:
+            actor = DiscreteActor(obs_dim, num_actions, hidden_dim, num_layers).to(device)
+    else:
+        actor = Actor(obs_dim, act_dim, hidden_dim, num_layers).to(device)
+
+    actor.load_state_dict(ckpt["actor"])
+    actor.eval()
+
+    meta = {
+        "variant": variant,
+        "discrete": discrete,
+        "recurrent": recurrent,
+        "hidden_dim": hidden_dim,
+        "num_layers": num_layers,
+        "obs_dim": obs_dim,
+        "num_actions": num_actions,
+        "act_dim": act_dim,
+        "memory_size": memory_size,
+    }
+    return actor, meta
+
+
 class KeyboardController:
     """Capture keyboard state via carb.input for manual robot control."""
 
@@ -594,7 +1108,24 @@ def main():
     spawn_ground_plane("/World/GroundPlane", GroundPlaneCfg())
 
     # ── Kinematic env ─────────────────────────────────────────────
-    env = StandaloneDGTEnv(num_agents=N, device="cpu", dt=sim_dt)
+    env = StandaloneDGTEnv(num_agents=N, device="cpu", dt=sim_dt, task=args.task)
+
+    policy_mode = args.policy_checkpoint is not None
+    policy_device = torch.device("cpu")
+    policy_actor = None
+    policy_meta: dict[str, object] = {}
+    if policy_mode:
+        policy_actor, policy_meta = _load_policy_actor(
+            args.policy_checkpoint, args.config, args.variant, policy_device,
+        )
+        print(
+            f"[Policy] Loaded {args.policy_checkpoint} "
+            f"variant={policy_meta['variant']} "
+            f"discrete={policy_meta['discrete']} "
+            f"recurrent={policy_meta['recurrent']} "
+            f"obs={policy_meta['obs_dim']}",
+            flush=True,
+        )
 
     # ── Visual scene ──────────────────────────────────────────────
     print("[ManualIsaac] Building arena visuals...", flush=True)
@@ -623,10 +1154,23 @@ def main():
     print("  Numpad 0-5: set others' behaviour module")
     print("  R=reset  ESC=quit")
     print("=" * 60 + "\n")
+    if policy_mode:
+        mode = "deterministic" if args.deterministic else "stochastic"
+        print(
+            f"[Policy] Fast viewer playback active: variant={policy_meta['variant']} "
+            f"actions={mode}; policy drives all robots.",
+            flush=True,
+        )
 
     step_counter = 0
     other_left_cmd = torch.zeros(1, N)
     other_right_cmd = torch.zeros(1, N)
+    policy_left_cmd = torch.zeros(1, N)
+    policy_right_cmd = torch.zeros(1, N)
+    if policy_mode and policy_meta["recurrent"]:
+        policy_memory = policy_actor.initial_state(N, policy_device)
+    else:
+        policy_memory = None
     force_control_update = True
 
     while simulation_app.is_running():
@@ -642,6 +1186,8 @@ def main():
                 env.reset()
                 step_counter = 0
                 force_control_update = True
+                if policy_mode and policy_meta["recurrent"]:
+                    policy_memory = policy_actor.initial_state(N, policy_device)
                 print("[RESET] Episode reset")
             elif evt == "NUMPAD_0":
                 others_module = 0
@@ -690,15 +1236,13 @@ def main():
         right[0, 0] = rv0
 
         # ── Others: run selected behaviour module ─────────────────
-        if N > 1 and (force_control_update or step_counter % control_interval == 0):
+        if (not policy_mode) and N > 1 and (force_control_update or step_counter % control_interval == 0):
             prox_v, prox_val, prox_ang = env.sensors.compute_proximity(
                 env.pos, env.yaw, env.wall_segments, env.pos, env.robot_radius,
             )
             module_ids = torch.full((1, N), others_module, dtype=torch.long)
             module_ids[0, 0] = 1  # robot 0 overridden by keyboard
-            light_v, light_val, light_ang = env.sensors.compute_light(
-                env.pos, env.yaw, env.light_pos,
-            )
+            light_v, light_val, light_ang = env._compute_light_readings()
             zt, rp, rab_ax, rab_ay = env.sensors.compute_rab(env.pos, env.yaw)
             el, er = env.behavior_modules.dispatch(
                 module_ids, prox_val, prox_ang, light_val, light_ang, rab_ax, rab_ay,
@@ -707,9 +1251,48 @@ def main():
             other_right_cmd = er
             force_control_update = False
 
-        if N > 1:
+        if (not policy_mode) and N > 1:
             left[0, 1:] = other_left_cmd[0, 1:]
             right[0, 1:] = other_right_cmd[0, 1:]
+
+        if policy_mode:
+            if force_control_update or step_counter % control_interval == 0:
+                obs_all, behavior_inputs = _policy_observations(
+                    env, str(policy_meta["variant"]),
+                )
+                flat_obs = obs_all.reshape(N, -1).to(policy_device)
+                with torch.no_grad():
+                    if policy_meta["discrete"]:
+                        if policy_meta["recurrent"]:
+                            logits, policy_memory = policy_actor.step(flat_obs, policy_memory)
+                            policy_memory = (
+                                policy_memory[0].detach(),
+                                policy_memory[1].detach(),
+                            )
+                            dist = torch.distributions.Categorical(logits=logits)
+                        else:
+                            dist = policy_actor.get_dist(flat_obs)
+
+                        if args.deterministic:
+                            action_ids = dist.probs.argmax(dim=-1)
+                        else:
+                            action_ids = dist.sample()
+                        module_ids = action_ids.view(1, N).cpu().long()
+                        policy_left_cmd, policy_right_cmd = env.behavior_modules.dispatch(
+                            module_ids, *behavior_inputs,
+                        )
+                    else:
+                        dist = policy_actor.get_dist(flat_obs)
+                        raw_actions = dist.mean if args.deterministic else dist.sample()
+                        wheel_actions = raw_actions.clamp(-3.0, 3.0) / 3.0
+                        wheel_actions = wheel_actions.view(1, N, 2).cpu()
+                        policy_left_cmd = wheel_actions[:, :, 0] * env.max_speed
+                        policy_right_cmd = wheel_actions[:, :, 1] * env.max_speed
+
+                force_control_update = False
+
+            left = policy_left_cmd.clone()
+            right = policy_right_cmd.clone()
 
         # ── Step kinematic env ────────────────────────────────────
         env.step(left, right)
@@ -755,6 +1338,10 @@ def main():
             gv = info["ground_3"]
             g_label = "BLACK" if gv[0] < 0.1 else ("WHITE" if gv[0] > 0.9 else "GREY")
             pos0 = pos_2d[0]
+            mode_label = (
+                f"policy:{policy_meta['variant']}"
+                if policy_mode else MODULE_NAMES[others_module]
+            )
             print(
                 f"[t={env.step_count * env.dt:6.1f}s step={env.step_count:5d}] "
                 f"pos=({pos0[0]:+.3f},{pos0[1]:+.3f}) "
@@ -766,7 +1353,7 @@ def main():
                 f"neighbors={info['n_neighbors']} "
                 f"reward={env.step_reward:+.0f} "
                 f"K+={env.k_plus_total} K-={env.k_minus_total} "
-                f"module={MODULE_NAMES[others_module]}"
+                f"module={mode_label}"
             )
 
         # ── Sim step (renders the viewport) ───────────────────────

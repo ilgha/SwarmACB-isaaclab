@@ -34,8 +34,8 @@ parser.add_argument("--config", type=str, default=None,
                     help="Path to ML-Agents-style YAML config file")
 
 # ── CLI overrides (used with or without --config) ────────────────
-parser.add_argument("--task", type=str, default="SwarmACB-DirectionalGate-v0",
-                    help="Registered Gymnasium task ID")
+parser.add_argument("--task", type=str, default=None,
+                    help="Registered Gymnasium task ID; overrides config task")
 parser.add_argument("--variant", type=str, default=None,
                     choices=["dandelion", "daisy", "lily", "tulip", "cyclamen"],
                     help="CASA variant (overrides config file)")
@@ -102,7 +102,8 @@ def main():
     else:
         # Legacy: build config from CLI args alone
         variant = args.variant or "dandelion"
-        run_name = f"poca_{variant}_{args.task}"
+        legacy_task = args.task or "SwarmACB-DirectionalGate-v0"
+        run_name = f"poca_{variant}_{legacy_task}"
 
         if variant in ("tulip", "cyclamen"):
             hd, nl = 128, 1
@@ -137,12 +138,13 @@ def main():
         cfg.checkpoint_dir = args.checkpoint_dir
     if args.num_envs is not None:
         env_overrides["num_envs"] = args.num_envs
+    task_id = args.task or env_overrides.pop("task", None) or "SwarmACB-DirectionalGate-v0"
 
     # ── Print resolved config ─────────────────────────────────────
     print_config(run_name, variant, cfg, env_overrides)
 
     # ── Build env config and apply overrides BEFORE gym.make ─────
-    env_cfg = _resolve_env_cfg(args.task)
+    env_cfg = _resolve_env_cfg(task_id)
 
     if hasattr(env_cfg, "update_variant"):
         env_cfg.update_variant(variant)
@@ -152,7 +154,7 @@ def main():
         env_cfg.episode_length_s = env_overrides["episode_length_s"]
 
     # ── Create environment ────────────────────────────────────────
-    env = gym.make(args.task, cfg=env_cfg)
+    env = gym.make(task_id, cfg=env_cfg)
 
     # ── Create trainer and run ────────────────────────────────────
     trainer = POCATrainer(env, cfg)

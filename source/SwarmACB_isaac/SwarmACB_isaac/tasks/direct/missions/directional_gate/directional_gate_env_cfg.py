@@ -147,6 +147,7 @@ class DirectionalGateEnvCfg(DirectMARLEnvCfg):
     # ── Light source ──────────────────────────────────────────────
     #  At south edge of arena, just outside the wall.
     light_position: tuple = (0.0, -1.4, 0.0)
+    has_light: bool = True
 
     # ── Reward ────────────────────────────────────────────────────
     #  r(t) = K⁺(t) − K⁻(t)  (paper)

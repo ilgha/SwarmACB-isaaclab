@@ -5,10 +5,10 @@
 
 Each sub-package registers a Gymnasium environment for one mission:
   - directional_gate  (DGT)
-  - (future) xor_aggregation  (XOR)
-  - (future) homing           (HOM)
-  - (future) foraging         (FOR)
-  - (future) sheltering       (SHL)
+  - xor_aggregation  (XOR)
+  - homing           (HOM)
+  - foraging         (FOR)
+  - sheltering       (SHL/SCA)
 """
 
 import gymnasium as gym  # noqa: F401

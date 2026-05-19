@@ -60,6 +60,7 @@ def load_config(path: str | Path) -> tuple[str, str, POCAConfig, dict[str, Any]]
     network = block.get("network_settings", {})
     reward = block.get("reward_signals", {})
     environment = block.get("environment", {})
+    task_id = block.get("task", environment.get("task", None))
 
     # ── Build POCAConfig ──────────────────────────────────────────
     cfg = POCAConfig()
@@ -110,6 +111,8 @@ def load_config(path: str | Path) -> tuple[str, str, POCAConfig, dict[str, Any]]
 
     # ── Environment overrides ─────────────────────────────────────
     env_overrides: dict[str, Any] = {}
+    if task_id is not None:
+        env_overrides["task"] = task_id
     if "num_envs" in environment:
         env_overrides["num_envs"] = environment["num_envs"]
     if "episode_length_s" in environment:

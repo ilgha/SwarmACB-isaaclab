@@ -102,6 +102,11 @@ class DirectionalGateEnv(DirectMARLEnv):
 
         # ── Sensor cache (avoids double computation for discrete variants) ──
         self._sensor_cache = None
+        # Reuse one low-level wheel command across physics substeps, so ACB modules
+        # keep the same 10 Hz clock when GUI playback raises the physics rate.
+        self._cached_left_vel = torch.zeros(E, N, device=dev)
+        self._cached_right_vel = torch.zeros(E, N, device=dev)
+        self._low_level_action_dirty = True
 
         # ── Precompute wall face normals/points for vectorized collision ──
         self._wall_normals, self._wall_points = self._precompute_wall_faces()
@@ -257,6 +262,19 @@ class DirectionalGateEnv(DirectMARLEnv):
             },
         )
         return VisualizationMarkers(marker_cfg)
+
+    def _compute_light_readings(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return light sensor readings, or zeros for missions without a light cue."""
+        if getattr(self.cfg, "has_light", True):
+            return self.sensors.compute_light(
+                self.agent_pos, self.agent_yaw, self.light_pos,
+            )
+
+        E, N = self.num_envs, self.cfg.num_agents
+        light_vals = torch.zeros(E, N, 8, device=self.device)
+        light_value = torch.zeros(E, N, device=self.device)
+        light_angle = torch.zeros(E, N, device=self.device)
+        return light_vals, light_value, light_angle
 
     def _update_visual_markers(self):
         """Update robot and heading marker positions from kinematic state.
@@ -458,6 +476,7 @@ class DirectionalGateEnv(DirectMARLEnv):
     def _pre_physics_step(self, actions: dict[str, torch.Tensor]) -> None:
         """Store raw actions from the policy.  (E, act_dim) per agent."""
         self._raw_actions = actions
+        self._low_level_action_dirty = True
 
     def _apply_action(self) -> None:
         """Convert actions → wheel velocities → kinematic integration.
@@ -469,7 +488,10 @@ class DirectionalGateEnv(DirectMARLEnv):
         E, N = self.num_envs, cfg.num_agents
         dev = self.device
 
-        if cfg.discrete_actions:
+        if not self._low_level_action_dirty:
+            left_vel = self._cached_left_vel
+            right_vel = self._cached_right_vel
+        elif cfg.discrete_actions:
             # ── ACB discrete dispatch ─────────────────────────────
             # Stack module indices: (E, N)
             module_ids = torch.stack(
@@ -484,9 +506,7 @@ class DirectionalGateEnv(DirectMARLEnv):
                 all_agent_pos=self.agent_pos,
                 robot_radius=cfg.robot_radius,
             )
-            light_vals, light_value, light_angle = self.sensors.compute_light(
-                self.agent_pos, self.agent_yaw, self.light_pos,
-            )
+            light_vals, light_value, light_angle = self._compute_light_readings()
             ztilde, rab_proj, rab_attr_x, rab_attr_y = self.sensors.compute_rab(
                 self.agent_pos, self.agent_yaw,
             )
@@ -523,6 +543,11 @@ class DirectionalGateEnv(DirectMARLEnv):
             actions_clamped = actions_stacked.clamp(-1.0, 1.0)
             left_vel = actions_clamped[:, :, 0] * cfg.max_wheel_speed
             right_vel = actions_clamped[:, :, 1] * cfg.max_wheel_speed
+
+        if self._low_level_action_dirty:
+            self._cached_left_vel = left_vel
+            self._cached_right_vel = right_vel
+            self._low_level_action_dirty = False
 
         # ── Differential-drive kinematic integration ──────────────
         dt = cfg.sim.dt
@@ -667,9 +692,7 @@ class DirectionalGateEnv(DirectMARLEnv):
                 all_agent_pos=self.agent_pos,
                 robot_radius=cfg.robot_radius,
             )
-            light_vals, _, _ = self.sensors.compute_light(
-                self.agent_pos, self.agent_yaw, self.light_pos,
-            )
+            light_vals, _, _ = self._compute_light_readings()
             ztilde, rab_proj, _, _ = self.sensors.compute_rab(
                 self.agent_pos, self.agent_yaw,
             )
@@ -790,6 +813,8 @@ class DirectionalGateEnv(DirectMARLEnv):
         mask = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
         mask[idx] = True
         self.behavior_modules.reset_exploration_state(mask)
+        self._sensor_cache = None
+        self._low_level_action_dirty = True
 
     # ──────────────────────────────────────────────────────────────
     #  Critic state (called externally by trainer if needed)

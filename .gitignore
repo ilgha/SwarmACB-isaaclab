@@ -43,6 +43,8 @@ docker/.container.cfg
 **/videos/*
 **/wandb/*
 **/.neptune/*
+**/checkpoints/*
+**/lyra_runs/*
 docker/artifacts/
 *.tmp
 

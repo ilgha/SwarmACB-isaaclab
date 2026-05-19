@@ -1,156 +1,247 @@
-# SwarmACB — Isaac Lab
+# SwarmACB Isaac Lab
 
-Multi-agent swarm robotics reinforcement learning built on [Isaac Lab](https://isaac-sim.github.io/IsaacLab/).
+Multi-agent swarm robotics reinforcement learning built on
+[Isaac Lab](https://isaac-sim.github.io/IsaacLab/).
 
-This project implements the **Directional Gate** mission from the CASA (Collective Autonomous Swarm Adaptation) framework: 20 simulated e-puck robots must learn to cross a gate in a specific direction inside a dodecagonal arena, trained with **MA-POCA** (Multi-Agent POsthumous Credit Assignment).
+This repository reimplements the SwarmACB/CASA swarm missions in Isaac Lab. It
+uses 20 simulated e-puck robots in a shared dodecagonal arena and trains the
+collective behavior with MA-POCA (Multi-Agent POsthumous Credit Assignment).
 
----
+## Implemented Missions
+
+All five benchmark missions are available as Gymnasium tasks:
+
+| Mission | Task ID | Duration | Light | Reward / performance |
+|---|---|---:|---|---|
+| XOR aggregation | `SwarmACB-XOR-v0` | 180 s | No | Number of robots in the most occupied black target |
+| Homing | `SwarmACB-Homing-v0` | 120 s | No | Final number of robots inside the black goal |
+| Foraging | `SwarmACB-Foraging-v0` | 180 s | Yes | Food-to-nest trips completed by the swarm |
+| Sheltering / SCA | `SwarmACB-Sheltering-v0` | 180 s | Yes | Number of robots inside the central white shelter |
+| Directional Gate | `SwarmACB-DirectionalGate-v0` | 120 s | Yes | Correct minus incorrect gate crossings |
+
+Sheltering aliases are also registered:
+
+```text
+SwarmACB-SCA-v0
+SwarmACB-SHL-v0
+```
 
 ## Architecture
 
-```
+```text
 SwarmACB_isaac/
-├── configs/                        # ML-Agents-style YAML training configs
-│   ├── DirGate_dandelion.yaml      #   continuous 2D wheels (obs=24)
-│   ├── DirGate_daisy.yaml          #   discrete 6 modules  (obs=24)
-│   ├── DirGate_lily.yaml           #   discrete 6 modules  (obs=4)
-│   ├── DirGate_tulip.yaml          #   discrete 6 modules  (obs=4, small net)
-│   └── DirGate_cyclamen.yaml       #   discrete 6 modules  (obs=4, LSTM)
-├── scripts/
-│   ├── train.py                    # Training entry point (Isaac Sim + POCA)
-│   ├── play.py                     # Evaluation / replay from checkpoint
-│   ├── manual_control.py           # Pygame manual control (no Isaac Sim)
-│   └── manual_control_isaac.py     # Isaac Sim viewport manual control
-└── source/SwarmACB_isaac/SwarmACB_isaac/tasks/direct/
-    ├── agents/                     # POCA trainer, networks, buffer, config loader
-    ├── epuck/                      # E-puck sensor suite & behaviour modules
-    └── missions/directional_gate/  # DirectMARLEnv + env config
+  configs/
+    DirGate_*.yaml              # Directional Gate configs for all CASA variants
+    XOR_cyclamen.yaml           # Cyclamen config for XOR
+    Homing_cyclamen.yaml        # Cyclamen config for Homing
+    Foraging_cyclamen.yaml      # Cyclamen config for Foraging
+    Sheltering_cyclamen.yaml    # Cyclamen config for Sheltering/SCA
+  scripts/
+    train.py                    # Training entry point
+    play.py                     # Evaluation / replay from checkpoint
+    manual_control.py           # Pygame manual control, no Isaac Sim
+    manual_control_isaac.py     # Isaac Sim viewport manual control / fast viewer
+    hpc/                        # Cluster helper scripts
+  source/SwarmACB_isaac/SwarmACB_isaac/tasks/direct/
+    agents/                     # POCA trainer, networks, buffer, config loader
+    epuck/                      # E-puck sensors and behavior modules
+    missions/
+      directional_gate/
+      xor_aggregation/
+      homing/
+      foraging/
+      sheltering/
 ```
-
-## The Mission
-
-| Element | Detail |
-|---|---|
-| **Arena** | Regular dodecagon (12 sides), area = 4.91 m², circumradius ≈ 1.28 m |
-| **Robots** | 20 e-puck cylinders (r = 0.035 m, differential drive) |
-| **Gate** | White strip (0.45 m wide) with a black corridor (0.50 m wide) north of it |
-| **Light** | Point light source at the south edge |
-| **Reward** | r(t) = K⁺ − K⁻ (correct north→south crossings minus incorrect south→north) |
-| **Episode** | 120 s at 10 Hz = 1200 steps |
 
 ## CASA Variants
 
-All five variants from the paper are supported:
+The trainer supports the five CASA variants:
 
-| Variant | Obs dim | Action | Description |
-|---|---|---|---|
-| **Dandelion** | 24 | Continuous (left/right wheel) | Full sensor vector, direct motor control |
-| **Daisy** | 24 | Discrete (6 modules) | Full sensors, behaviour module selection |
-| **Lily** | 4 | Discrete (6 modules) | Minimal sensors (ground + z̃) |
-| **Tulip** | 4 | Discrete (6 modules) | Same as Lily, smaller network |
-| **Cyclamen** | 4 | Discrete (6 modules) | Same as Lily, LSTM memory |
+| Variant | Observation | Action | Notes |
+|---|---:|---|---|
+| `dandelion` | 24 | Continuous wheel velocities | Full sensor vector, direct motor control |
+| `daisy` | 24 | Discrete module ID | Full sensors, behavior module selection |
+| `lily` | 4 | Discrete module ID | Ground sensors plus neighborhood density |
+| `tulip` | 4 | Discrete module ID | Lily observation with a smaller network |
+| `cyclamen` | 4 | Discrete module ID | Lily observation with LSTM memory |
 
-The 6 behaviour modules are: **Exploration**, **Stop**, **Phototaxis**, **Anti-phototaxis**, **Attraction**, **Repulsion**.
+The six discrete behavior modules are:
+
+```text
+Exploration, Stop, Phototaxis, Anti-phototaxis, Attraction, Repulsion
+```
 
 ## Sensor Suite
 
 Each e-puck has:
-- **8 IR proximity sensors** — short-range obstacle detection (0.10 m)
-- **8 light sensors** — directional light intensity
-- **3-channel ground sensor** — grey (0.5), white (1.0), or black (0.0)
-- **Range-and-bearing (RAB)** — neighbour presence (z̃) + 4D directional projection (0.20 m range)
 
-## Physics
-
-The simulation is **kinematic** (pure PyTorch tensors, no USD articulations):
-- Differential-drive integration at 10 Hz
-- Analytical wall collision (dodecagonal boundary + gate side walls)
-- Elastic inter-robot push-out
-- Massively parallelisable on GPU
-
----
+- 8 IR proximity sensors, range 0.10 m
+- 8 directional light sensors, disabled in XOR and Homing
+- 3 ground sensors returning grey, white, or black
+- Range-and-bearing neighborhood sensing, range 0.20 m
 
 ## Installation
 
-1. **Install Isaac Lab** following the [official guide](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html) (conda or uv recommended).
+1. Install Isaac Lab following the
+   [official guide](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html).
 
-2. **Clone this repo** (outside the IsaacLab directory):
+2. Clone this repository:
+
    ```bash
    git clone https://github.com/ilgha/SwarmACB-isaaclab.git
    cd SwarmACB-isaaclab
    ```
 
-3. **Install the extension** in editable mode:
+3. Install the extension in editable mode:
+
    ```bash
    python -m pip install -e source/SwarmACB_isaac
    ```
 
-## Usage
+On Windows/RTX 50-series machines, the scripts automatically add the Isaac Sim
+Kit arguments that avoid the Vulkan startup crash:
 
-### Training
-
-```bash
-# Dandelion, 64 parallel envs, headless
-python scripts/train.py --config configs/DirGate_dandelion.yaml --num_envs 64 --headless
-
-# Daisy variant
-python scripts/train.py --config configs/DirGate_daisy.yaml --num_envs 64 --headless
-
-# Resume from checkpoint
-python scripts/train.py --config configs/DirGate_dandelion.yaml --checkpoint checkpoints/DirGate_dandelion/poca_1000000.pt
+```text
+--/app/vulkan=false --/crashreporter/preserveDump=true
 ```
 
-### Evaluation
+## Training
+
+Use the YAML configs:
 
 ```bash
-python scripts/play.py --config configs/DirGate_dandelion.yaml --checkpoint checkpoints/DirGate_dandelion/poca_best.pt
+python scripts/train.py --config configs/DirGate_cyclamen.yaml --headless
+python scripts/train.py --config configs/XOR_cyclamen.yaml --headless
+python scripts/train.py --config configs/Homing_cyclamen.yaml --headless
+python scripts/train.py --config configs/Foraging_cyclamen.yaml --headless
+python scripts/train.py --config configs/Sheltering_cyclamen.yaml --headless
 ```
 
-### Manual Control (Pygame)
+Or override the task and variant from the command line:
 
 ```bash
-python scripts/manual_control.py
+python scripts/train.py --task SwarmACB-Foraging-v0 --variant tulip --headless
+python scripts/train.py --task SwarmACB-SCA-v0 --variant cyclamen --num_envs 5 --headless
 ```
-Drive robot #0 with **Z/↑** (forward), **S/↓** (backward), **Q/←** (left), **D/→** (right). Numpad 0–5 sets the behaviour module for the other 19 robots.
 
-### Manual Control (Isaac Sim)
+Useful smoke test:
 
 ```bash
-python scripts/manual_control_isaac.py
+python scripts/train.py \
+  --config configs/Sheltering_cyclamen.yaml \
+  --headless \
+  --total_timesteps 2000 \
+  --num_envs 1 \
+  --log_dir runs/Sheltering_smoke \
+  --checkpoint_dir checkpoints/Sheltering_smoke
 ```
-Same controls, rendered in the Isaac Sim viewport with full 3D arena visualisation.
 
-### TensorBoard
+## Evaluation
+
+Evaluate an IsaacLab environment exactly:
+
+```bash
+python scripts/play.py \
+  --config configs/DirGate_cyclamen.yaml \
+  --checkpoint checkpoints/DirGate_cyclamen/poca_final.pt \
+  --num_envs 1 \
+  --num_episodes 10 \
+  --deterministic
+```
+
+The play script can also use a fast Isaac viewport viewer for smoother visual
+inspection:
+
+```bash
+python scripts/play.py \
+  --config configs/Sheltering_cyclamen.yaml \
+  --checkpoint checkpoints/Sheltering_cyclamen/poca_final.pt \
+  --fast-viewer \
+  --deterministic
+```
+
+## Manual Mission Checks
+
+Pygame viewer, without Isaac Sim:
+
+```bash
+python scripts/manual_control.py --task SwarmACB-XOR-v0
+python scripts/manual_control.py --task SwarmACB-Homing-v0
+python scripts/manual_control.py --task SwarmACB-Foraging-v0
+python scripts/manual_control.py --task SwarmACB-SCA-v0
+python scripts/manual_control.py --task SwarmACB-DirectionalGate-v0
+```
+
+Isaac Sim viewport viewer:
+
+```bash
+python scripts/manual_control_isaac.py --task SwarmACB-XOR-v0
+python scripts/manual_control_isaac.py --task SwarmACB-Homing-v0
+python scripts/manual_control_isaac.py --task SwarmACB-Foraging-v0
+python scripts/manual_control_isaac.py --task SwarmACB-SCA-v0
+python scripts/manual_control_isaac.py --task SwarmACB-DirectionalGate-v0
+```
+
+Keyboard controls:
+
+```text
+Z / Up       forward
+S / Down     backward
+Q / Left     turn left
+D / Right    turn right
+A            stop
+R            reset
+Esc          quit
+Numpad 0-5   set behavior module for the other robots
+```
+
+## TensorBoard
+
+Local runs:
 
 ```bash
 tensorboard --logdir runs/
 ```
 
+For HPC runs, either copy the run directory locally or forward a port from the
+cluster login node:
+
+```bash
+ssh -L 6006:localhost:6006 user@cluster
+tensorboard --logdir /path/to/SwarmACB-isaaclab/runs --host 127.0.0.1 --port 6006
+```
+
+Then open `http://localhost:6006`.
+
 ## Configuration
 
-Training is configured via YAML files in `configs/`. The format mirrors ML-Agents:
+Training is configured through ML-Agents-style YAML files:
 
 ```yaml
 behaviors:
-  DirGate_dandelion:
-    variant: dandelion
+  Sheltering_cyclamen:
+    task: SwarmACB-Sheltering-v0
+    variant: cyclamen
+    trainer_type: poca
     hyperparameters:
       batch_size: 2048
       learning_rate: 0.0003
-      learning_rate_schedule: linear
-      # ...
     network_settings:
-      hidden_units: 512
-      num_layers: 2
+      hidden_units: 128
+      num_layers: 1
+      memory:
+        memory_size: 128
+        sequence_length: 64
     max_steps: 120000000
     time_horizon: 1000
     environment:
       num_envs: 5
+      decision_period: 1
+      episode_length_s: 180.0
 ```
 
-CLI arguments override YAML values: `--num_envs`, `--variant`, `--total_timesteps`, etc.
-
----
+CLI arguments override YAML values, including `--task`, `--variant`,
+`--num_envs`, `--total_timesteps`, `--log_dir`, and `--checkpoint_dir`.
 
 ## License
 
