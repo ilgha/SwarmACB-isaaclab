@@ -200,6 +200,8 @@ class StandaloneDGTEnv:
         self.step_reward = 0.0
         self.episode_reward = 0.0
         self.step_count = 0
+        self.episode_index = 0
+        self.completed_episode_reward = None
         self.k_plus_total = 0
         self.k_minus_total = 0
         self.has_food = torch.zeros(self.E, self.N, dtype=torch.bool, device=self.device)
@@ -240,7 +242,11 @@ class StandaloneDGTEnv:
             (hw, gs, hw, gs + wl),     # right wall
         ]
 
-    def reset(self):
+    def reset(self, advance_episode: bool = False):
+        if advance_episode:
+            self.completed_episode_reward = self.episode_reward
+            self.episode_index += 1
+
         inradius = self.arena_circumradius * math.cos(math.pi / self.arena_n_sides)
         safe = inradius - self.robot_radius * 2
         r = torch.sqrt(torch.rand(self.N)) * safe
@@ -744,6 +750,8 @@ def main():
 
         # ── Step ──────────────────────────────────────────────────
         env.step(left, right)
+        if env.step_count >= env.episode_steps:
+            env.reset(advance_episode=True)
 
         # ── Sensor readouts for robot 0 ───────────────────────────
         info = env.compute_obs_robot0()
@@ -947,7 +955,10 @@ def main():
 
         draw_text("── Reward ──", COL_HEADING, True)
         draw_text(f"  Step: {env.step_reward:+.0f}   K⁺={env.k_plus_total}  K⁻={env.k_minus_total}")
-        draw_text(f"  Episode: {env.episode_reward:.0f}")
+        draw_text(f"  Episode #: {env.episode_index}")
+        draw_text(f"  Score: {env.episode_reward:.0f}")
+        if env.completed_episode_reward is not None:
+            draw_text(f"  Last score: {env.completed_episode_reward:.0f}")
         draw_text(f"  Step #{env.step_count}  / {env.episode_steps} ({env.episode_length_s:.0f}s)")
         y += 8
 

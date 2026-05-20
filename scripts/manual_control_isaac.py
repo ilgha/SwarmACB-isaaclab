@@ -253,6 +253,8 @@ class StandaloneDGTEnv:
         self.step_reward = 0.0
         self.episode_reward = 0.0
         self.step_count = 0
+        self.episode_index = 0
+        self.completed_episode_reward = None
         self.k_plus_total = 0
         self.k_minus_total = 0
         self.has_food = torch.zeros(self.E, self.N, dtype=torch.bool, device=self.device)
@@ -294,7 +296,11 @@ class StandaloneDGTEnv:
             (hw, gs, hw, gs + wl),
         ]
 
-    def reset(self):
+    def reset(self, advance_episode: bool = False):
+        if advance_episode:
+            self.completed_episode_reward = self.episode_reward
+            self.episode_index += 1
+
         inradius = self.arena_circumradius * math.cos(math.pi / self.arena_n_sides)
         safe = inradius - self.robot_radius * 2
         r = torch.sqrt(torch.rand(self.N)) * safe
@@ -1303,6 +1309,11 @@ def main():
         # ── Step kinematic env ────────────────────────────────────
         env.step(left, right)
         step_counter += 1
+        if env.step_count >= env.episode_steps:
+            env.reset(advance_episode=True)
+            force_control_update = True
+            if policy_mode and policy_meta["recurrent"]:
+                policy_memory = policy_actor.initial_state(N, policy_device)
 
         # ── Update robot markers ──────────────────────────────────
         pos_2d = env.pos[0].cpu().numpy()  # (N, 2)
