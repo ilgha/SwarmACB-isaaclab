@@ -51,7 +51,7 @@ parser.add_argument("--sim-hz", type=float, default=60.0,
                     help="Fast viewer render / kinematic update rate")
 parser.add_argument("--control-hz", type=float, default=10.0,
                     help="Fast viewer policy decision rate")
-parser.add_argument("--visual-hz", type=float, default=10.0,
+parser.add_argument("--visual-hz", type=float, default=60.0,
                     help="GUI simulation/render substep rate; 10 Hz stays closest to real time")
 
 AppLauncher.add_app_launcher_args(parser)

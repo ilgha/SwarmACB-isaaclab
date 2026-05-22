@@ -127,13 +127,7 @@ python scripts/train.py --task SwarmACB-SCA-v0 --variant cyclamen --num_envs 5 -
 Useful smoke test:
 
 ```bash
-python scripts/train.py \
-  --config configs/Sheltering_cyclamen.yaml \
-  --headless \
-  --total_timesteps 2000 \
-  --num_envs 1 \
-  --log_dir runs/Sheltering_smoke \
-  --checkpoint_dir checkpoints/Sheltering_smoke
+python scripts/train.py --config configs/Sheltering_cyclamen.yaml --headless --total_timesteps 2000 --num_envs 1 --log_dir runs/Sheltering_smoke --checkpoint_dir checkpoints/Sheltering_smoke
 ```
 
 ## Evaluation
@@ -141,23 +135,14 @@ python scripts/train.py \
 Evaluate an IsaacLab environment exactly:
 
 ```bash
-python scripts/play.py \
-  --config configs/DirGate_cyclamen.yaml \
-  --checkpoint checkpoints/DirGate_cyclamen/poca_final.pt \
-  --num_envs 1 \
-  --num_episodes 10 \
-  --deterministic
+python scripts/play.py --config configs/DirGate_cyclamen.yaml --checkpoint checkpoints/DirGate_cyclamen/poca_final.pt --num_envs 1 --num_episodes 10 --deterministic
 ```
 
 The play script can also use a fast Isaac viewport viewer for smoother visual
 inspection:
 
 ```bash
-python scripts/play.py \
-  --config configs/Sheltering_cyclamen.yaml \
-  --checkpoint checkpoints/Sheltering_cyclamen/poca_final.pt \
-  --fast-viewer \
-  --deterministic
+python scripts/play.py --config configs/Sheltering_cyclamen.yaml --checkpoint checkpoints/Sheltering_cyclamen/poca_final.pt --fast-viewer --deterministic
 ```
 
 ## Manual Mission Checks
