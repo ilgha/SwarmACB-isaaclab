@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=swarm_dandelion
+#SBATCH --job-name=oc_dirgate
 #SBATCH --array=0-9
 #SBATCH --time=3-00:00:00
 #SBATCH --ntasks=1
@@ -12,18 +12,18 @@
 
 set -euo pipefail
 
-# Train 10 independent dandelion runs on HPC via Apptainer + Isaac Lab.
+# Train 10 independent fixed-option Option-Critic runs on Directional Gate.
 #
 # Submit:
 #   cd /home/ulb/iridia_robo/igharbi/SwarmACB-isaaclab
-#   sbatch scripts/hpc/train_dandelion.slurm
+#   sbatch scripts/hpc/train_oc_dirgate.slurm
 
 PROJECT_DIR="/home/ulb/iridia_robo/igharbi/SwarmACB-isaaclab"
 CONTAINER="/srv/apps/shared/containers/isaacsim.sif"
 OVERLAY="$GLOBALSCRATCH/isaacsim_overlay.img"
 RUN_SUFFIX="${SLURM_ARRAY_TASK_ID:-0}"
-RUN_DIR="runs/DirGate_dandelion_hpc_${RUN_SUFFIX}"
-CHECKPOINT_DIR="checkpoints/DirGate_dandelion_hpc_${RUN_SUFFIX}"
+RUN_DIR="runs/OC_DirGate_cyclamen_hpc_${RUN_SUFFIX}"
+CHECKPOINT_DIR="checkpoints/OC_DirGate_cyclamen_hpc_${RUN_SUFFIX}"
 
 mkdir -p "$PROJECT_DIR/logs"
 
@@ -54,7 +54,7 @@ apptainer exec \
         export PYTHONPATH=$PROJECT_DIR/source/SwarmACB_isaac:\$PYTHONPATH && \
         cd $PROJECT_DIR && \
         python scripts/train.py \
-            --config configs/DirGate_dandelion.yaml \
+            --config configs/OC_DirGate_cyclamen.yaml \
             --headless \
             --log_dir $RUN_DIR \
             --checkpoint_dir $CHECKPOINT_DIR

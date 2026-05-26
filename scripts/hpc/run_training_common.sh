@@ -1,40 +1,27 @@
 #!/bin/bash
-#SBATCH --job-name=swarm_cyclamen
-#SBATCH --array=0-9
-#SBATCH --time=3-00:00:00
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=10
-#SBATCH --gres=gpu:1
-#SBATCH --mem-per-cpu=1000
-#SBATCH --partition=batch
-#SBATCH --output=logs/%x_%A_%a_master.out
-#SBATCH --error=logs/%x_%A_%a_master.err
-
 set -euo pipefail
 
-# Train 10 independent cyclamen runs on HPC via Apptainer + Isaac Lab.
-#
-# Submit:
-#   cd /home/ulb/iridia_robo/igharbi/SwarmACB-isaaclab
-#   sbatch scripts/hpc/train_cyclamen.slurm
+CONFIG_PATH="${1:?Usage: run_training_common.sh CONFIG_PATH RUN_NAME}"
+RUN_NAME="${2:?Usage: run_training_common.sh CONFIG_PATH RUN_NAME}"
 
-PROJECT_DIR="/home/ulb/iridia_robo/igharbi/SwarmACB-isaaclab"
-CONTAINER="/srv/apps/shared/containers/isaacsim.sif"
-OVERLAY="$GLOBALSCRATCH/isaacsim_overlay.img"
+PROJECT_DIR="${PROJECT_DIR:-/home/ulb/iridia_robo/igharbi/SwarmACB-isaaclab}"
+CONTAINER="${CONTAINER:-/srv/apps/shared/containers/isaacsim.sif}"
+OVERLAY="${OVERLAY:-${GLOBALSCRATCH:?GLOBALSCRATCH must be set}/isaacsim_overlay.img}"
 RUN_SUFFIX="${SLURM_ARRAY_TASK_ID:-0}"
-RUN_DIR="runs/DirGate_cyclamen_hpc_${RUN_SUFFIX}"
-CHECKPOINT_DIR="checkpoints/DirGate_cyclamen_hpc_${RUN_SUFFIX}"
+RUN_DIR="runs/${RUN_NAME}_hpc_${RUN_SUFFIX}"
+CHECKPOINT_DIR="checkpoints/${RUN_NAME}_hpc_${RUN_SUFFIX}"
 
 mkdir -p "$PROJECT_DIR/logs"
 
 echo "=========================================="
-echo "  Job ID:       $SLURM_JOB_ID"
+echo "  Job ID:       ${SLURM_JOB_ID:-local}"
 echo "  Node:         $(hostname)"
-echo "  GPUs:         $CUDA_VISIBLE_DEVICES"
+echo "  GPUs:         ${CUDA_VISIBLE_DEVICES:-unset}"
 echo "  Array task:   $RUN_SUFFIX"
 echo "  Date:         $(date)"
 echo "  Project:      $PROJECT_DIR"
 echo "  Container:    $CONTAINER"
+echo "  Config:       $CONFIG_PATH"
 echo "  Run dir:      $RUN_DIR"
 echo "  Checkpoints:  $CHECKPOINT_DIR"
 echo "=========================================="
@@ -54,7 +41,7 @@ apptainer exec \
         export PYTHONPATH=$PROJECT_DIR/source/SwarmACB_isaac:\$PYTHONPATH && \
         cd $PROJECT_DIR && \
         python scripts/train.py \
-            --config configs/DirGate_cyclamen.yaml \
+            --config $CONFIG_PATH \
             --headless \
             --log_dir $RUN_DIR \
             --checkpoint_dir $CHECKPOINT_DIR
