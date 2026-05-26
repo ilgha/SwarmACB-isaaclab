@@ -1,0 +1,46 @@
+# SwarmACB - fixed-module Option-Critic x XOR-Aggregation x Cyclamen
+
+behaviors:
+  OC_XOR_cyclamen:
+    task: SwarmACB-XOR-v0
+    variant: cyclamen
+    trainer_type: option_critic
+
+    hyperparameters:
+      batch_size: 2048
+      buffer_size: 20480
+      learning_rate: 0.0003
+      beta: 0.005
+      epsilon: 0.2
+      lambd: 0.95
+      num_epoch: 3
+      termination_penalty: 0.01
+      termination_coef: 1.0
+      termination_entropy_coef: 0.001
+      learning_rate_schedule: linear
+      epsilon_schedule: linear
+      beta_schedule: linear
+
+    network_settings:
+      hidden_units: 128
+      num_layers: 1
+      num_options: 6
+      memory:
+        memory_size: 128
+        sequence_length: 64
+
+    reward_signals:
+      extrinsic:
+        gamma: 0.99
+        strength: 1.0
+
+    max_steps: 120000000
+    time_horizon: 1000
+    summary_freq: 120000
+    checkpoint_interval: 120000
+    keep_checkpoints: 5
+
+    environment:
+      num_envs: 5
+      decision_period: 1
+      episode_length_s: 180.0

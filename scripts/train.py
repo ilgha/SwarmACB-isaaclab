@@ -2,7 +2,7 @@
 # Copyright (c) 2025 SwarmACB Project
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Train a POCA agent on any registered SwarmACB mission.
+"""Train a POCA or fixed-module Option-Critic agent on SwarmACB missions.
 
 Usage:
     # Preferred: use a YAML config file (ML-Agents style)
@@ -27,7 +27,7 @@ import argparse
 from isaaclab.app import AppLauncher
 from _isaac_launch import apply_windows_kit_defaults
 
-parser = argparse.ArgumentParser(description="SwarmACB POCA Training")
+parser = argparse.ArgumentParser(description="SwarmACB Training")
 
 # ── Config file (primary) ────────────────────────────────────────
 parser.add_argument("--config", type=str, default=None,
@@ -76,6 +76,9 @@ import SwarmACB_isaac.tasks  # noqa: F401
 
 from SwarmACB_isaac.tasks.direct.agents.poca_trainer import (
     POCATrainer, POCAConfig,
+)
+from SwarmACB_isaac.tasks.direct.agents.option_critic_trainer import (
+    FixedOptionCriticTrainer,
 )
 from SwarmACB_isaac.tasks.direct.agents.config_loader import (
     load_config, print_config,
@@ -157,7 +160,13 @@ def main():
     env = gym.make(task_id, cfg=env_cfg)
 
     # ── Create trainer and run ────────────────────────────────────
-    trainer = POCATrainer(env, cfg)
+    trainer_type = getattr(cfg, "trainer_type", "poca")
+    if trainer_type == "option_critic":
+        trainer = FixedOptionCriticTrainer(env, cfg)
+    elif trainer_type == "poca":
+        trainer = POCATrainer(env, cfg)
+    else:
+        raise ValueError(f"Unsupported trainer_type: {trainer_type}")
 
     if args.checkpoint:
         trainer.load_checkpoint(args.checkpoint)

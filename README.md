@@ -43,7 +43,7 @@ SwarmACB_isaac/
     manual_control_isaac.py     # Isaac Sim viewport manual control / fast viewer
     hpc/                        # Cluster helper scripts
   source/SwarmACB_isaac/SwarmACB_isaac/tasks/direct/
-    agents/                     # POCA trainer, networks, buffer, config loader
+    agents/                     # POCA and fixed-option Option-Critic trainers
     epuck/                      # E-puck sensors and behavior modules
     missions/
       directional_gate/
@@ -70,6 +70,24 @@ The six discrete behavior modules are:
 ```text
 Exploration, Stop, Phototaxis, Anti-phototaxis, Attraction, Repulsion
 ```
+
+## Fixed-Option Option-Critic
+
+Phase 1 of the Option-Critic implementation starts from `cyclamen`, the final
+SwarmACB controller form: 4 local observation values, a recurrent memory, and
+the six predefined ACB behavior modules.
+
+In this mode, the behavior modules are fixed options. The learner does not learn
+new intra-option motor policies yet. It learns:
+
+- a recurrent policy over the six fixed options
+- a per-option termination model
+- a centralized team-value critic for training
+
+Execution is still decentralized: each robot keeps its current module until the
+learned termination model switches it to another module. This isolates the value
+of temporal abstraction before adding learned intra-option policies and
+attention/diversity in a later phase.
 
 ## Sensor Suite
 
@@ -117,6 +135,16 @@ python scripts/train.py --config configs/Foraging_cyclamen.yaml --headless
 python scripts/train.py --config configs/Sheltering_cyclamen.yaml --headless
 ```
 
+Train the fixed-option Option-Critic phase-1 controller:
+
+```bash
+python scripts/train.py --config configs/OC_DirGate_cyclamen.yaml --headless
+python scripts/train.py --config configs/OC_XOR_cyclamen.yaml --headless
+python scripts/train.py --config configs/OC_Homing_cyclamen.yaml --headless
+python scripts/train.py --config configs/OC_Foraging_cyclamen.yaml --headless
+python scripts/train.py --config configs/OC_Sheltering_cyclamen.yaml --headless
+```
+
 Or override the task and variant from the command line:
 
 ```bash
@@ -128,6 +156,7 @@ Useful smoke test:
 
 ```bash
 python scripts/train.py --config configs/Sheltering_cyclamen.yaml --headless --total_timesteps 2000 --num_envs 1 --log_dir runs/Sheltering_smoke --checkpoint_dir checkpoints/Sheltering_smoke
+python scripts/train.py --config configs/OC_Sheltering_cyclamen.yaml --headless --total_timesteps 2000 --num_envs 1 --log_dir runs/OC_Sheltering_smoke --checkpoint_dir checkpoints/OC_Sheltering_smoke
 ```
 
 ## Evaluation
@@ -136,9 +165,10 @@ Evaluate an IsaacLab environment exactly:
 
 ```bash
 python scripts/play.py --config configs/DirGate_cyclamen.yaml --checkpoint checkpoints/DirGate_cyclamen/poca_final.pt --num_envs 1 --num_episodes 10 --deterministic
+python scripts/play.py --config configs/OC_DirGate_cyclamen.yaml --checkpoint checkpoints/OC_DirGate_cyclamen/option_critic_final.pt --num_envs 1 --num_episodes 10 --deterministic
 ```
 
-The play script can also use a fast Isaac viewport viewer for smoother visual
+The play script can also use a fast Isaac viewport viewer for smoother POCA
 inspection:
 
 ```bash
@@ -223,6 +253,28 @@ behaviors:
       num_envs: 5
       decision_period: 1
       episode_length_s: 180.0
+```
+
+Fixed-option Option-Critic configs use the same layout with
+`trainer_type: option_critic`:
+
+```yaml
+behaviors:
+  OC_Sheltering_cyclamen:
+    task: SwarmACB-Sheltering-v0
+    variant: cyclamen
+    trainer_type: option_critic
+    hyperparameters:
+      learning_rate: 0.0003
+      termination_penalty: 0.01
+      termination_entropy_coef: 0.001
+    network_settings:
+      hidden_units: 128
+      num_layers: 1
+      num_options: 6
+      memory:
+        memory_size: 128
+        sequence_length: 64
 ```
 
 CLI arguments override YAML values, including `--task`, `--variant`,

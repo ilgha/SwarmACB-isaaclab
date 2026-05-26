@@ -16,7 +16,6 @@ import torch
 from pxr import Gf, UsdGeom, Vt
 
 import isaaclab.sim as sim_utils
-from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 
 from ..directional_gate.directional_gate_env import DirectionalGateEnv
 from .xor_aggregation_env_cfg import XorAggregationEnvCfg
@@ -71,11 +70,6 @@ class XorAggregationEnv(DirectionalGateEnv):
         n = cfg.arena_num_sides
         wall_h = cfg.arena_wall_height
         wall_thick = 0.01
-
-        spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
-
-        light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
-        light_cfg.func("/World/Light", light_cfg)
 
         floor_side = R * 3.0
         floor_cfg = sim_utils.CuboidCfg(

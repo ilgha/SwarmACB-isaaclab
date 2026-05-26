@@ -17,4 +17,7 @@ from .poca_networks import (
 )
 from .poca_buffer import POCARolloutBuffer
 from .poca_trainer import POCATrainer, POCAConfig, PolynomialDecay
+from .option_critic_networks import FixedOptionManager
+from .option_critic_buffer import FixedOptionRolloutBuffer
+from .option_critic_trainer import FixedOptionCriticTrainer, FixedOptionCriticConfig
 from .config_loader import load_config, print_config

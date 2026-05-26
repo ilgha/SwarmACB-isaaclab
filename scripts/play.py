@@ -2,7 +2,7 @@
 # Copyright (c) 2025 SwarmACB Project
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Play / evaluate a trained POCA agent.
+"""Play / evaluate a trained POCA or fixed-option Option-Critic agent.
 
 Usage:
     # Preferred: config + checkpoint
@@ -25,7 +25,7 @@ import time
 from isaaclab.app import AppLauncher
 from _isaac_launch import apply_windows_kit_defaults
 
-parser = argparse.ArgumentParser(description="SwarmACB POCA Evaluation")
+parser = argparse.ArgumentParser(description="SwarmACB Evaluation")
 
 # ── Config file (primary) ────────────────────────────────────────
 parser.add_argument("--config", type=str, default=None,
@@ -128,6 +128,9 @@ import SwarmACB_isaac.tasks  # noqa: F401
 from SwarmACB_isaac.tasks.direct.agents.poca_networks import (
     Actor, DiscreteActor, RecurrentDiscreteActor,
 )
+from SwarmACB_isaac.tasks.direct.agents.option_critic_networks import (
+    FixedOptionManager,
+)
 
 
 def _resolve_env_cfg(task_id: str):
@@ -153,6 +156,10 @@ def main():
         run_name, cfg_variant, cfg, env_overrides = load_config(args.config)
         if variant is None:
             variant = cfg_variant
+
+    ckpt_meta = torch.load(args.checkpoint, map_location="cpu")
+    if variant is None and ckpt_meta.get("variant") is not None:
+        variant = ckpt_meta["variant"]
 
     # Evaluation defaults to one environment unless explicitly overridden.
     if args.num_envs is not None:
@@ -197,25 +204,34 @@ def main():
 
     # ── Load checkpoint ───────────────────────────────────────────
     ckpt = torch.load(args.checkpoint, map_location=device)
+    trainer_type = ckpt.get("trainer_type", "poca")
     discrete = ckpt.get("discrete", False)
     hidden_dim = ckpt.get("hidden_dim", 256)
     num_layers = ckpt.get("num_layers", 2)
     num_actions = ckpt.get("num_actions", 6)
+    num_options = ckpt.get("num_options", num_actions)
     recurrent = bool(ckpt.get("recurrent", False))
     memory_size = ckpt.get("memory_size", 128)
-    if recurrent and not discrete:
+    if trainer_type != "option_critic" and recurrent and not discrete:
         raise ValueError("Recurrent playback is only implemented for discrete actors")
 
     obs_dict, _ = env.reset()
     obs_dim = obs_dict[agents[0]].shape[-1]
     act_dim = ckpt.get("act_dim", 2)
 
-    print(f"[Play] variant={variant}  discrete={discrete}  "
+    print(f"[Play] trainer={trainer_type}  variant={variant}  discrete={discrete}  "
           f"recurrent={recurrent}  "
           f"hidden={hidden_dim}  layers={num_layers}  "
           f"obs={obs_dim}  act={'discrete(' + str(num_actions) + ')' if discrete else str(act_dim)}")
 
-    if discrete:
+    if trainer_type == "option_critic":
+        manager = FixedOptionManager(
+            obs_dim, num_options, hidden_dim, num_layers, memory_size,
+        ).to(device)
+        manager.load_state_dict(ckpt["manager"])
+        manager.eval()
+        actor = None
+    elif discrete:
         if recurrent:
             actor = RecurrentDiscreteActor(
                 obs_dim, num_actions, hidden_dim, num_layers, memory_size,
@@ -225,8 +241,9 @@ def main():
     else:
         actor = Actor(obs_dim, act_dim, hidden_dim, num_layers).to(device)
 
-    actor.load_state_dict(ckpt["actor"])
-    actor.eval()
+    if trainer_type != "option_critic":
+        actor.load_state_dict(ckpt["actor"])
+        actor.eval()
 
     # ── Evaluation loop ───────────────────────────────────────────
     episode_rewards = []
@@ -235,7 +252,15 @@ def main():
     obs_dict, _ = env.reset()
     num_envs = unwrapped.num_envs
     ep_reward = torch.zeros(num_envs, device=device)
-    if recurrent:
+    if trainer_type == "option_critic":
+        memory_h, memory_c = manager.initial_state(num_envs * len(agents), device)
+        current_options = torch.full(
+            (num_envs, len(agents)),
+            -1,
+            dtype=torch.long,
+            device=device,
+        )
+    elif recurrent:
         memory_h, memory_c = actor.initial_state(num_envs * len(agents), device)
     else:
         memory_h = None
@@ -249,7 +274,38 @@ def main():
     while episode_count < args.num_episodes:
         with torch.no_grad():
             action_dict = {}
-            if recurrent:
+            if trainer_type == "option_critic":
+                obs_stacked = torch.stack([obs_dict[a] for a in agents], dim=1)
+                flat_obs = obs_stacked.reshape(-1, obs_stacked.shape[-1])
+                option_logits, termination_logits, next_memory = manager.step(
+                    flat_obs,
+                    (memory_h, memory_c),
+                )
+                memory_h, memory_c = next_memory[0].detach(), next_memory[1].detach()
+                option_dist = torch.distributions.Categorical(logits=option_logits)
+                if args.deterministic:
+                    proposed = option_dist.probs.argmax(dim=-1)
+                else:
+                    proposed = option_dist.sample()
+                proposed = proposed.view(num_envs, len(agents))
+
+                force_new = current_options < 0
+                safe_current = current_options.clamp(min=0).reshape(-1)
+                beta_logits = termination_logits.gather(
+                    -1,
+                    safe_current.unsqueeze(-1),
+                ).squeeze(-1)
+                if args.deterministic:
+                    terminate = (torch.sigmoid(beta_logits) > 0.5).view(num_envs, len(agents))
+                else:
+                    terminate = torch.distributions.Bernoulli(
+                        logits=beta_logits,
+                    ).sample().bool().view(num_envs, len(agents))
+                switch = terminate | force_new
+                current_options = torch.where(switch, proposed, current_options)
+                all_actions = current_options.unsqueeze(-1)
+                action_dict = {a: all_actions[:, i] for i, a in enumerate(agents)}
+            elif recurrent:
                 obs_stacked = torch.stack([obs_dict[a] for a in agents], dim=1)
                 flat_obs = obs_stacked.reshape(-1, obs_stacked.shape[-1])
                 logits, next_memory = actor.step(flat_obs, (memory_h, memory_c))
@@ -289,7 +345,13 @@ def main():
             if done:
                 episode_rewards.append(ep_reward[ei].item())
                 ep_reward[ei] = 0.0
-                if recurrent:
+                if trainer_type == "option_critic":
+                    current_options[ei] = -1
+                    start = ei * len(agents)
+                    end = start + len(agents)
+                    memory_h[:, start:end, :] = 0.0
+                    memory_c[:, start:end, :] = 0.0
+                elif recurrent:
                     start = ei * len(agents)
                     end = start + len(agents)
                     memory_h[:, start:end, :] = 0.0
