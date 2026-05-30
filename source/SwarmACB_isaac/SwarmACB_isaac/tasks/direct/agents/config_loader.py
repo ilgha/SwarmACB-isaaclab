@@ -87,6 +87,8 @@ def load_config(path: str | Path) -> tuple[str, str, Any, dict[str, Any]]:
             cfg.termination_entropy_coef,
         )
         cfg.value_coef = hypers.get("value_coef", cfg.value_coef)
+        cfg.option_value_coef = hypers.get("option_value_coef", cfg.option_value_coef)
+        cfg.baseline_coef = hypers.get("baseline_coef", cfg.baseline_coef)
 
     # Schedules: "linear" or "constant"  (default: constant)
     cfg.lr_schedule = hypers.get("learning_rate_schedule", "constant")
@@ -167,6 +169,8 @@ def print_config(run_name: str, variant: str, cfg: Any, env_ov: dict):
         print(f"    termination_coef    : {cfg.termination_coef}")
         print(f"    termination_entropy : {cfg.termination_entropy_coef}")
         print(f"    value_coef          : {cfg.value_coef}")
+        print(f"    option_value_coef   : {cfg.option_value_coef}")
+        print(f"    baseline_coef       : {cfg.baseline_coef}")
     print(f"  Network")
     print(f"    hidden_units        : {cfg.hidden_dim}")
     print(f"    num_layers          : {cfg.num_layers}")

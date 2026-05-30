@@ -3,9 +3,9 @@
 
 """Networks for the fixed-module Option-Critic phase.
 
-Phase 1 treats the six existing ACB behavior modules as fixed options.  The
-network therefore learns only the option selector and the per-option
-termination model; it does not learn low-level intra-option policies.
+Phase 1 treats the six existing ACB behavior modules as fixed options. The
+local network therefore learns only the shared option selector and per-option
+termination model; the collective critic remains centralized during training.
 """
 
 from __future__ import annotations
@@ -18,13 +18,12 @@ from .poca_networks import LinearEncoder
 
 
 class FixedOptionManager(nn.Module):
-    """Recurrent option selector plus termination model.
+    """Shared recurrent option selector and termination model.
 
     Given a local robot observation, the module emits:
 
     - logits for the policy over fixed options, pi_O(o | h_t)
     - logits for option termination probabilities, beta_o(h_t)
-
     The hidden state lets the phase-1 implementation start from the cyclamen
     setting, where memory is part of the final SwarmACB controller.
     """
@@ -59,7 +58,6 @@ class FixedOptionManager(nn.Module):
         self.termination_head.weight.data *= 0.2
         # Slightly negative bias encourages options to persist at the start.
         nn.init.constant_(self.termination_head.bias, -1.0)
-
         for name, param in self.lstm.named_parameters():
             if "weight_ih" in name:
                 nn.init.xavier_uniform_(param)
@@ -82,7 +80,7 @@ class FixedOptionManager(nn.Module):
         obs_seq: torch.Tensor,
         state: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        """Return option and termination logits for ``(B, T, obs_dim)``."""
+        """Return local selector logits and termination logits."""
         B, T = obs_seq.shape[:2]
         enc = self.encoder(obs_seq.reshape(B * T, self.obs_dim)).view(B, T, -1)
         if state is None:

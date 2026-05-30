@@ -1,12 +1,14 @@
 # Copyright (c) 2025 SwarmACB Project
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Fixed-module Option-Critic trainer for SwarmACB phase 1.
+"""Fixed-module collective Option-Critic trainer for SwarmACB phase 1.
 
 This trainer starts from the cyclamen controller shape: local 4D observations,
 recurrent memory, and the six predefined ACB behavior modules.  Unlike POCA,
-the policy does not choose a fresh module at every decision.  It chooses an
+the policy does not choose a fresh module at every decision. It chooses an
 option and learns a termination model that decides when to keep or switch it.
+Centralized RSA critics train the shared local manager with collective
+counterfactual signals and are discarded during decentralized execution.
 """
 
 from __future__ import annotations
@@ -43,9 +45,11 @@ class FixedOptionCriticConfig:
     clip_eps: float = 0.2
     beta: float = 0.005
     value_coef: float = 0.5
+    option_value_coef: float = 0.5
+    baseline_coef: float = 0.25
 
     # Option termination
-    termination_coef: float = 1.0
+    termination_coef: float = 0.1
     termination_entropy_coef: float = 0.001
     termination_penalty: float = 0.01
 
@@ -88,7 +92,7 @@ class FixedOptionCriticConfig:
 
 
 class FixedOptionCriticTrainer:
-    """Learn option selection and termination over fixed ACB modules."""
+    """Learn decentralized option control from collective critic signals."""
 
     def __init__(self, env, cfg: FixedOptionCriticConfig | None = None):
         self.env = env
@@ -132,7 +136,8 @@ class FixedOptionCriticTrainer:
             f"obs={self.obs_dim}  state={self.state_dim}  options={c.num_options}  "
             f"decision_period={self.decision_period}"
         )
-        print("[FixedOC] Options are fixed ACB modules; learning selector + termination only")
+        print("[FixedOC] Options are fixed ACB modules; learning shared local selector + termination")
+        print("[FixedOC] Centralized RSA critic: collective Q_Omega + CASA counterfactual baselines")
         print(f"[FixedOC] Recurrent manager: LSTM memory={c.memory_size}  sequence_length={c.sequence_length}")
 
         self.manager = FixedOptionManager(
@@ -223,6 +228,12 @@ class FixedOptionCriticTrainer:
         if self.beta_schedule is not None:
             self.current_beta = self.beta_schedule.get(step)
 
+    def _encode_options_for_critic(self, options: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.one_hot(
+            options.long(),
+            num_classes=self.cfg.num_options,
+        ).float()
+
     @torch.no_grad()
     def collect_rollout(self, obs_dict: dict, rollout_steps: int | None = None) -> dict:
         self.buffer.reset()
@@ -254,7 +265,6 @@ class FixedOptionCriticTrainer:
 
             force_new = self.current_options < 0
             termination_options = self.current_options.clamp(min=0)
-            termination_mask = (~force_new).float()
             safe_current = termination_options.reshape(-1)
             beta_logits_selected = termination_logits.gather(
                 -1,
@@ -277,7 +287,13 @@ class FixedOptionCriticTrainer:
             beta_probs = torch.sigmoid(beta_logits_selected).view(self.num_envs, self.num_agents)
 
             critic_state = self.unwrapped.get_critic_state()
-            value = self.critic.critic_pass(critic_state).squeeze(-1)
+            critic_options = self._encode_options_for_critic(self.current_options)
+            team_value = self.critic.critic_pass(critic_state).squeeze(-1)
+            joint_option_value = self.critic.joint_action_pass(
+                critic_state,
+                critic_options,
+            ).squeeze(-1)
+            baselines = self.critic.all_baselines(critic_state, critic_options)
 
             env_actions = self.current_options.unsqueeze(-1)
             action_dict = {a: env_actions[:, i] for i, a in enumerate(agents)}
@@ -290,20 +306,43 @@ class FixedOptionCriticTrainer:
                 step_done = (terminated_dict[agents[0]] | truncated_dict[agents[0]]).float()
                 last_done = torch.max(last_done, step_done)
 
+            next_obs_stacked = torch.stack([obs_dict[a] for a in agents], dim=1)
+            if next_obs_stacked.ndim == 5:
+                next_obs_stacked = next_obs_stacked.view(
+                    next_obs_stacked.shape[0],
+                    next_obs_stacked.shape[1],
+                    -1,
+                )
+            next_memory_h = self.manager_memory_h.squeeze(0).view(
+                self.num_envs,
+                self.num_agents,
+                -1,
+            ).clone()
+            next_memory_c = self.manager_memory_c.squeeze(0).view(
+                self.num_envs,
+                self.num_agents,
+                -1,
+            ).clone()
+            next_critic_state = self.unwrapped.get_critic_state()
+
             self.buffer.add(
                 obs=obs_stacked,
+                next_obs=next_obs_stacked,
                 critic_states=critic_state,
+                next_critic_states=next_critic_state,
                 options=self.current_options,
-                termination_options=termination_options,
-                termination_masks=termination_mask,
                 option_log_probs=option_logp,
                 option_masks=option_mask,
                 beta_probs=beta_probs,
                 reward=accumulated_reward * self.reward_strength,
                 done=last_done,
-                value=value,
+                team_value=team_value,
+                joint_option_value=joint_option_value,
+                baselines=baselines,
                 memory_h=memory_h,
                 memory_c=memory_c,
+                next_memory_h=next_memory_h,
+                next_memory_c=next_memory_c,
             )
 
             self._episode_reward_acc += accumulated_reward
@@ -334,38 +373,50 @@ class FixedOptionCriticTrainer:
         self,
         batch: dict,
         current_eps: float,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         obs = batch["obs"]
+        next_obs = batch["next_obs"]
         critic_states = batch["critic_states"]
+        next_critic_states = batch["next_critic_states"]
         options = batch["options"]
-        termination_options = batch["termination_options"]
-        termination_masks = batch["termination_masks"]
         old_logp = batch["old_option_log_probs"]
         masks = batch["option_masks"]
         advantages = batch["advantages"]
         returns = batch["returns"]
-        old_values = batch["old_values"]
+        old_team_values = batch["old_team_values"]
+        old_joint_option_values = batch["old_joint_option_values"]
+        old_baselines = batch["old_baselines"]
+        dones = batch["dones"]
 
         B, L, N = obs.shape[:3]
         obs_seq = obs.permute(0, 2, 1, 3).reshape(B * N, L, obs.shape[-1])
         opt_seq = options.permute(0, 2, 1).reshape(B * N, L)
-        term_opt_seq = termination_options.permute(0, 2, 1).reshape(B * N, L)
         h0 = batch["memory_h"].reshape(B * N, -1).unsqueeze(0).detach()
         c0 = batch["memory_c"].reshape(B * N, -1).unsqueeze(0).detach()
         state = (h0, c0)
 
         option_logits = []
-        termination_logits = []
         for t in range(L):
-            opt_logits_t, term_logits_t, state = self.manager.step(obs_seq[:, t], state)
+            opt_logits_t, _term_logits_t, state = self.manager.step(
+                obs_seq[:, t],
+                state,
+            )
             option_logits.append(opt_logits_t)
-            termination_logits.append(term_logits_t)
             if t < L - 1:
-                keep = (1.0 - batch["dones"][:, t]).repeat_interleave(N).view(1, B * N, 1)
+                keep = (1.0 - dones[:, t]).repeat_interleave(N).view(1, B * N, 1)
                 state = (state[0] * keep, state[1] * keep)
 
         option_logits = torch.stack(option_logits, dim=1)
-        termination_logits = torch.stack(termination_logits, dim=1)
         opt_dist = Categorical(logits=option_logits.reshape(B * N * L, self.cfg.num_options))
         flat_options = opt_seq.reshape(-1)
         new_logp = opt_dist.log_prob(flat_options).view(B, N, L).permute(0, 2, 1)
@@ -373,8 +424,7 @@ class FixedOptionCriticTrainer:
 
         new_logp_flat = new_logp.reshape(-1)
         old_logp_flat = old_logp.reshape(-1)
-        adv_agent = advantages.unsqueeze(-1).expand(B, L, N)
-        adv_flat = adv_agent.reshape(-1).detach()
+        adv_flat = advantages.reshape(-1).detach()
         mask_flat = masks.reshape(-1) > 0.5
         if mask_flat.any():
             ratio = (new_logp_flat[mask_flat] - old_logp_flat[mask_flat]).exp()
@@ -384,41 +434,123 @@ class FixedOptionCriticTrainer:
         else:
             policy_loss = new_logp_flat.sum() * 0.0
 
-        term_logits_selected = termination_logits.gather(
+        next_obs_seq = next_obs.permute(0, 2, 1, 3).reshape(B * N * L, next_obs.shape[-1])
+        next_h = batch["next_memory_h"].permute(0, 2, 1, 3).reshape(B * N * L, -1)
+        next_c = batch["next_memory_c"].permute(0, 2, 1, 3).reshape(B * N * L, -1)
+        (
+            next_option_logits,
+            next_termination_logits,
+            _next_state,
+        ) = self.manager.step(
+            next_obs_seq,
+            (next_h.unsqueeze(0).detach(), next_c.unsqueeze(0).detach()),
+        )
+        next_option_logits = next_option_logits.view(
+            B,
+            N,
+            L,
+            self.cfg.num_options,
+        ).permute(0, 2, 1, 3)
+        next_termination_logits = next_termination_logits.view(
+            B,
+            N,
+            L,
+            self.cfg.num_options,
+        ).permute(0, 2, 1, 3)
+
+        next_beta_logits = next_termination_logits.gather(
             -1,
-            term_opt_seq.unsqueeze(-1),
+            options.unsqueeze(-1),
         ).squeeze(-1)
-        beta_selected = torch.sigmoid(term_logits_selected).view(B, N, L).permute(0, 2, 1)
-        term_signal = adv_agent.detach() + self.cfg.termination_penalty
-        term_mask = termination_masks
-        term_count = term_mask.sum()
-        if term_count.item() > 0:
-            termination_loss = (beta_selected * term_signal * term_mask).sum() / term_count
-            term_entropy = Bernoulli(logits=term_logits_selected).entropy().view(B, N, L).permute(0, 2, 1)
-            termination_entropy = (term_entropy * term_mask).sum() / term_count
-            mean_beta = (beta_selected * term_mask).sum() / term_count
-        else:
-            termination_loss = beta_selected.sum() * 0.0
-            termination_entropy = beta_selected.sum() * 0.0
-            mean_beta = beta_selected.sum() * 0.0
+        next_beta = torch.sigmoid(next_beta_logits)
+        nonterminal = (1.0 - dones).unsqueeze(-1).expand_as(next_beta)
 
         flat_states = critic_states.reshape(B * L, N, critic_states.shape[-1])
+        flat_next_states = next_critic_states.reshape(
+            B * L,
+            N,
+            next_critic_states.shape[-1],
+        )
+        critic_options = self._encode_options_for_critic(options.reshape(B * L, N))
         flat_returns = returns.reshape(B * L)
-        flat_old_values = old_values.reshape(B * L)
-        new_values = self.critic.critic_pass(flat_states).squeeze(-1)
+        new_team_values = self.critic.critic_pass(flat_states).squeeze(-1)
+        new_joint_option_values = self.critic.joint_action_pass(
+            flat_states,
+            critic_options,
+        ).squeeze(-1)
+        new_baselines = self.critic.all_baselines(flat_states, critic_options)
+
         value_loss = trust_region_value_loss(
-            new_values,
-            flat_old_values,
+            new_team_values,
+            old_team_values.reshape(B * L),
             flat_returns,
             current_eps,
         )
+        joint_option_value_loss = trust_region_value_loss(
+            new_joint_option_values,
+            old_joint_option_values.reshape(B * L),
+            flat_returns,
+            current_eps,
+        )
+        baseline_returns = flat_returns.unsqueeze(-1).expand(B * L, N)
+        baseline_loss = trust_region_value_loss(
+            new_baselines.reshape(-1),
+            old_baselines.reshape(-1),
+            baseline_returns.reshape(-1),
+            current_eps,
+        )
+
+        # The termination theorem is evaluated after entering s'. For robot i,
+        # continuation uses the current collective joint-option value while
+        # reselection marginalizes only i's alternatives and holds peers fixed.
+        with torch.no_grad():
+            flat_option_ids = options.reshape(B * L, N)
+            next_q_current = self.critic.joint_action_pass(
+                flat_next_states,
+                critic_options,
+            ).squeeze(-1)
+            next_counterfactual_values = self.critic.all_discrete_counterfactual_values(
+                flat_next_states,
+                flat_option_ids,
+                self.cfg.num_options,
+            )
+            next_selector_probs = torch.softmax(next_option_logits, dim=-1).reshape(
+                B * L,
+                N,
+                self.cfg.num_options,
+            )
+            next_reselection_values = (
+                next_counterfactual_values * next_selector_probs
+            ).sum(dim=-1)
+            option_advantage = (
+                next_q_current.unsqueeze(-1) - next_reselection_values
+            ).reshape(B, L, N)
+
+        term_signal = option_advantage + self.cfg.termination_penalty
+        term_mask = nonterminal
+        term_count = term_mask.sum()
+        if term_count.item() > 0:
+            termination_loss = (next_beta * term_signal * term_mask).sum() / term_count
+            term_entropy = Bernoulli(logits=next_beta_logits).entropy()
+            termination_entropy = (term_entropy * term_mask).sum() / term_count
+            mean_beta = (next_beta * term_mask).sum() / term_count
+            mean_option_advantage = (option_advantage * term_mask).sum() / term_count
+        else:
+            termination_loss = next_beta.sum() * 0.0
+            termination_entropy = next_beta.sum() * 0.0
+            mean_beta = next_beta.sum() * 0.0
+            mean_option_advantage = next_beta.sum() * 0.0
+
         return (
             policy_loss,
             value_loss,
+            joint_option_value_loss,
+            baseline_loss,
             termination_loss,
             option_entropy,
             termination_entropy,
             mean_beta,
+            mean_option_advantage,
         )
 
     def update(self) -> dict:
@@ -443,10 +575,13 @@ class FixedOptionCriticTrainer:
         totals = {
             "policy_loss": 0.0,
             "value_loss": 0.0,
+            "joint_option_value_loss": 0.0,
+            "baseline_loss": 0.0,
             "termination_loss": 0.0,
             "option_entropy": 0.0,
             "termination_entropy": 0.0,
             "mean_beta": 0.0,
+            "mean_option_advantage": 0.0,
         }
         n_updates = 0
 
@@ -455,15 +590,20 @@ class FixedOptionCriticTrainer:
                 (
                     policy_loss,
                     value_loss,
+                    joint_option_value_loss,
+                    baseline_loss,
                     termination_loss,
                     option_entropy,
                     termination_entropy,
                     mean_beta,
+                    mean_option_advantage,
                 ) = self._compute_sequence_losses(batch, current_eps)
 
                 loss = (
                     policy_loss
                     + cfg.value_coef * value_loss
+                    + cfg.option_value_coef * joint_option_value_loss
+                    + cfg.baseline_coef * baseline_loss
                     + cfg.termination_coef * termination_loss
                     - current_beta * option_entropy
                     - cfg.termination_entropy_coef * termination_entropy
@@ -475,25 +615,37 @@ class FixedOptionCriticTrainer:
 
                 totals["policy_loss"] += policy_loss.item()
                 totals["value_loss"] += value_loss.item()
+                totals["joint_option_value_loss"] += joint_option_value_loss.item()
+                totals["baseline_loss"] += baseline_loss.item()
                 totals["termination_loss"] += termination_loss.item()
                 totals["option_entropy"] += option_entropy.item()
                 totals["termination_entropy"] += termination_entropy.item()
                 totals["mean_beta"] += mean_beta.item()
+                totals["mean_option_advantage"] += mean_option_advantage.item()
                 n_updates += 1
 
         self.update_count += 1
         n = max(n_updates, 1)
+        option_counts = torch.bincount(
+            self.buffer.options[:active].reshape(-1),
+            minlength=cfg.num_options,
+        ).float()
+        option_usage = (option_counts / option_counts.sum().clamp(min=1.0)).tolist()
         return {
             "policy_loss": totals["policy_loss"] / n,
             "value_loss": totals["value_loss"] / n,
+            "joint_option_value_loss": totals["joint_option_value_loss"] / n,
+            "baseline_loss": totals["baseline_loss"] / n,
             "termination_loss": totals["termination_loss"] / n,
             "option_entropy": totals["option_entropy"] / n,
             "termination_entropy": totals["termination_entropy"] / n,
             "mean_beta": totals["mean_beta"] / n,
+            "mean_option_advantage": totals["mean_option_advantage"] / n,
             "lr": self.current_lr,
             "eps": self.current_eps,
             "beta": self.current_beta,
             "switch_rate": self.buffer.option_masks[:active].mean().item(),
+            "option_usage": option_usage,
         }
 
     def train(self):
@@ -552,16 +704,21 @@ class FixedOptionCriticTrainer:
                 s = self.global_step
                 self.writer.add_scalar("Losses/Policy Loss", metrics["policy_loss"], s)
                 self.writer.add_scalar("Losses/Value Loss", metrics["value_loss"], s)
+                self.writer.add_scalar("Losses/OptionCritic/Collective Option Value Loss", metrics["joint_option_value_loss"], s)
+                self.writer.add_scalar("Losses/OptionCritic/Counterfactual Baseline Loss", metrics["baseline_loss"], s)
                 self.writer.add_scalar("Losses/OptionCritic/Termination Loss", metrics["termination_loss"], s)
                 self.writer.add_scalar("Policy/Option Entropy", metrics["option_entropy"], s)
                 self.writer.add_scalar("Policy/Termination Entropy", metrics["termination_entropy"], s)
                 self.writer.add_scalar("Policy/Mean Termination Probability", metrics["mean_beta"], s)
+                self.writer.add_scalar("Policy/Mean Option Advantage", metrics["mean_option_advantage"], s)
                 self.writer.add_scalar("Policy/Switch Rate", metrics["switch_rate"], s)
                 self.writer.add_scalar("Policy/Learning Rate", metrics["lr"], s)
                 self.writer.add_scalar("Policy/Epsilon", metrics["eps"], s)
                 self.writer.add_scalar("Policy/Beta", metrics["beta"], s)
+                for option_id, usage in enumerate(metrics["option_usage"]):
+                    self.writer.add_scalar(f"Policy/Option Usage/{option_id}", usage, s)
                 active_rewards = self.buffer.rewards[:self.buffer.ptr]
-                active_values = self.buffer.values[:self.buffer.ptr]
+                active_values = self.buffer.team_values[:self.buffer.ptr]
                 self.writer.add_scalar("Policy/Extrinsic Reward", active_rewards.mean().item(), s)
                 self.writer.add_scalar("Policy/Extrinsic Value Estimate", active_values.mean().item(), s)
                 self.writer.add_scalar("Extra/SPS", sps, s)
@@ -599,7 +756,9 @@ class FixedOptionCriticTrainer:
     def save_checkpoint(self, path):
         torch.save({
             "trainer_type": "option_critic",
+            "option_critic_version": 3,
             "fixed_options": True,
+            "collective_counterfactual": True,
             "variant": self.variant,
             "manager": self.manager.state_dict(),
             "critic": self.critic.state_dict(),

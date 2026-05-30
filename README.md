@@ -80,14 +80,46 @@ the six predefined ACB behavior modules.
 In this mode, the behavior modules are fixed options. The learner does not learn
 new intra-option motor policies yet. It learns:
 
-- a recurrent policy over the six fixed options
-- a per-option termination model
-- a centralized team-value critic for training
+- a shared recurrent local policy over the six fixed options
+- a shared local per-option termination model
+- a centralized permutation-invariant team-value critic, `V(s)`
+- a centralized permutation-invariant collective option critic,
+  `Q_Omega(s, omega_vector)`
+- a centralized POCA-style counterfactual baseline for each robot
 
 Execution is still decentralized: each robot keeps its current module until the
 learned termination model switches it to another module. This isolates the value
 of temporal abstraction before adding learned intra-option policies and
-attention/diversity in a later phase.
+attention/diversity in a later phase. The centralized critics are used only
+during training and are not part of the deployed robot controller.
+
+The implementation keeps the SwarmACB counterfactual philosophy: when evaluating
+robot `i`, all peers keep their active modules fixed. The selector PPO advantage
+uses the learned POCA-style approximation:
+
+```text
+A_i(s, omega_vector) = lambda_return(s) - b_i(s, omega_-i)
+```
+
+The termination update follows the Option-Critic arrival-state theorem. For the
+option vector executed at time `t`, the critic evaluates each of robot `i`'s six
+replacement options at `s_t+1` while the other robots' options stay fixed:
+
+```text
+V_i(s_t+1, omega_-i) =
+  sum_omega_i pi_O(omega_i | h_i,t+1)
+    Q_Omega(s_t+1, (omega_-i, omega_i))
+
+A_i^term(s_t+1, omega_vector) =
+  Q_Omega(s_t+1, omega_vector) - V_i(s_t+1, omega_-i)
+```
+
+The termination loss uses `A_i^term + xi`, where `xi` is configured as
+`termination_penalty`. A small positive value encourages temporally extended
+options. The six-way replacement calculation is linear in robots and options;
+it does not enumerate the collective joint-option space. Option selection
+remains a recurrent PPO policy trained at option boundaries, which is an
+SMDP-level policy-over-options implementation.
 
 ## Sensor Suite
 
@@ -267,7 +299,10 @@ behaviors:
     hyperparameters:
       learning_rate: 0.0003
       termination_penalty: 0.01
+      termination_coef: 0.1
       termination_entropy_coef: 0.001
+      option_value_coef: 0.5
+      baseline_coef: 0.25
     network_settings:
       hidden_units: 128
       num_layers: 1

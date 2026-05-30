@@ -555,6 +555,69 @@ class POCACritic(nn.Module):
         entities = self.obs_entity_enc(all_agent_states)   # (B, N, h)
         return self._encode_and_value(entities, N)
 
+    def joint_action_pass(
+        self,
+        all_agent_states: torch.Tensor,
+        all_agent_actions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Collective value Q(s, a) for one joint action.
+
+        Every interchangeable agent contributes a state-action entity. The
+        shared RSA tail keeps this centralized training signal permutation
+        invariant while allowing decentralized execution.
+
+        Args:
+            all_agent_states: (B, N, state_dim)
+            all_agent_actions: (B, N, act_dim)
+        Returns:
+            (B, 1)
+        """
+        _, N, _ = all_agent_states.shape
+        state_act = torch.cat([all_agent_states, all_agent_actions], dim=-1)
+        entities = self.obs_act_entity_enc(state_act)
+        return self._encode_and_value(entities, N)
+
+    def all_discrete_counterfactual_values(
+        self,
+        all_agent_states: torch.Tensor,
+        action_indices: torch.Tensor,
+        num_actions: int,
+    ) -> torch.Tensor:
+        """Evaluate each agent's discrete alternatives while peers stay fixed.
+
+        This is O(N * A), rather than an enumeration of the joint action
+        space. It is intended for detached targets such as the fixed-option
+        termination theorem.
+
+        Args:
+            all_agent_states: (B, N, state_dim)
+            action_indices: (B, N)
+            num_actions: number of discrete alternatives
+        Returns:
+            Q-values with shape (B, N, A)
+        """
+        B, N, _ = all_agent_states.shape
+        device = all_agent_states.device
+        alternatives = torch.arange(num_actions, device=device)
+        values = []
+
+        for agent_id in range(N):
+            replaced = action_indices.unsqueeze(1).expand(B, num_actions, N).clone()
+            replaced[:, :, agent_id] = alternatives.unsqueeze(0)
+            encoded = torch.nn.functional.one_hot(
+                replaced.reshape(B * num_actions, N).long(),
+                num_classes=num_actions,
+            ).to(all_agent_states.dtype)
+            states = (
+                all_agent_states.unsqueeze(1)
+                .expand(B, num_actions, N, self.state_dim)
+                .reshape(B * num_actions, N, self.state_dim)
+            )
+            q_values = self.joint_action_pass(states, encoded).reshape(B, num_actions)
+            values.append(q_values)
+
+        return torch.stack(values, dim=1)
+
     def baseline(
         self,
         agent_i_state: torch.Tensor,    # (B, state_dim)
