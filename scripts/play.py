@@ -268,6 +268,12 @@ def main():
 
     print(f"[Play] Evaluating {args.num_episodes} episodes "
           f"({'deterministic' if args.deterministic else 'stochastic'})...")
+    if trainer_type == "option_critic" and args.deterministic:
+        print(
+            "[Play] Warning: deterministic Option-Critic playback thresholds "
+            "termination probabilities at 0.5. Use stochastic playback to "
+            "evaluate the learned call-and-return policy."
+        )
 
     eval_start = time.perf_counter()
 

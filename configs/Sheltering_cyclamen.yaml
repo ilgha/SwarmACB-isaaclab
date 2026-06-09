@@ -33,10 +33,10 @@ behaviors:
         gamma: 0.99
         strength: 1.0
 
-    max_steps: 120000000
+    max_steps: 180000000
     time_horizon: 1000
-    summary_freq: 120000
-    checkpoint_interval: 120000
+    summary_freq: 180000
+    checkpoint_interval: 180000
     keep_checkpoints: 5
 
     environment:

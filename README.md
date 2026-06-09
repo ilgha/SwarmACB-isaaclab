@@ -197,8 +197,13 @@ Evaluate an IsaacLab environment exactly:
 
 ```bash
 python scripts/play.py --config configs/DirGate_cyclamen.yaml --checkpoint checkpoints/DirGate_cyclamen/poca_final.pt --num_envs 1 --num_episodes 10 --deterministic
-python scripts/play.py --config configs/OC_DirGate_cyclamen.yaml --checkpoint checkpoints/OC_DirGate_cyclamen/option_critic_final.pt --num_envs 1 --num_episodes 10 --deterministic
+python scripts/play.py --config configs/OC_DirGate_cyclamen.yaml --checkpoint checkpoints/OC_DirGate_cyclamen/option_critic_final.pt --num_envs 1 --num_episodes 10
 ```
+
+Use stochastic playback for the primary Option-Critic evaluation. Its learned
+termination probability is Bernoulli-sampled during training. Passing
+`--deterministic` thresholds termination at `0.5`, which is useful only as a
+diagnostic.
 
 The play script can also use a fast Isaac viewport viewer for smoother POCA
 inspection:
@@ -279,7 +284,7 @@ behaviors:
       memory:
         memory_size: 128
         sequence_length: 64
-    max_steps: 120000000
+    max_steps: 180000000
     time_horizon: 1000
     environment:
       num_envs: 5
