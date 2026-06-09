@@ -11,5 +11,6 @@
 #SBATCH --error=logs/%x_%A_%a_master.err
 
 set -euo pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="${PROJECT_DIR:-/home/ulb/iridia_robo/igharbi/SwarmACB-isaaclab}"
+SCRIPT_DIR="$PROJECT_DIR/scripts/hpc"
 bash "$SCRIPT_DIR/run_training_common.sh" "configs/Homing_dandelion.yaml" "Homing_dandelion"

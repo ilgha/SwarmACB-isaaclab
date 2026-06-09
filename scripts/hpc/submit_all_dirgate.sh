@@ -7,8 +7,11 @@ set -euo pipefail
 #   cd /home/ulb/iridia_robo/igharbi/SwarmACB-isaaclab
 #   bash scripts/hpc/submit_all_dirgate.sh
 
-sbatch scripts/hpc/train_dirgate_dandelion.slurm
-sbatch scripts/hpc/train_dirgate_daisy.slurm
-sbatch scripts/hpc/train_dirgate_lily.slurm
-sbatch scripts/hpc/train_dirgate_tulip.slurm
-sbatch scripts/hpc/train_dirgate_cyclamen.slurm
+PROJECT_DIR="${PROJECT_DIR:-/home/ulb/iridia_robo/igharbi/SwarmACB-isaaclab}"
+SCRIPT_DIR="$PROJECT_DIR/scripts/hpc"
+
+sbatch "$SCRIPT_DIR/train_dirgate_dandelion.slurm"
+sbatch "$SCRIPT_DIR/train_dirgate_daisy.slurm"
+sbatch "$SCRIPT_DIR/train_dirgate_lily.slurm"
+sbatch "$SCRIPT_DIR/train_dirgate_tulip.slurm"
+sbatch "$SCRIPT_DIR/train_dirgate_cyclamen.slurm"
