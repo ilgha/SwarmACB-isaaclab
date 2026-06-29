@@ -7,6 +7,8 @@
 
 behaviors:
   DirGate_cyclamen:
+    task: SwarmACB-DirectionalGate-v0
+
     variant: cyclamen
     trainer_type: poca
 
