@@ -176,10 +176,13 @@ def main():
     env_cfg = _resolve_env_cfg(task_id)
     if hasattr(env_cfg, "update_variant"):
         env_cfg.update_variant(variant)
-    if "num_envs" in env_overrides:
-        env_cfg.scene.num_envs = env_overrides["num_envs"]
-    if "episode_length_s" in env_overrides:
-        env_cfg.episode_length_s = env_overrides["episode_length_s"]
+    for key, value in env_overrides.items():
+        if key == "num_envs":
+            env_cfg.scene.num_envs = value
+        elif hasattr(env_cfg, key):
+            setattr(env_cfg, key, value)
+        else:
+            print(f"[Play] Warning: ignored unknown environment override {key!r}")
     decision_dt = env_cfg.sim.dt * env_cfg.decimation
     if not getattr(args, "headless", False):
         visual_hz = max(args.visual_hz, 1.0)
@@ -211,7 +214,7 @@ def main():
     num_actions = ckpt.get("num_actions", 6)
     num_options = ckpt.get("num_options", num_actions)
     recurrent = bool(ckpt.get("recurrent", False))
-    memory_size = ckpt.get("memory_size", 128)
+    memory_size = ckpt.get("memory_size", 64)
     if trainer_type != "option_critic" and recurrent and not discrete:
         raise ValueError("Recurrent playback is only implemented for discrete actors")
 

@@ -132,10 +132,10 @@ def load_config(path: str | Path) -> tuple[str, str, Any, dict[str, Any]]:
     env_overrides: dict[str, Any] = {}
     if task_id is not None:
         env_overrides["task"] = task_id
-    if "num_envs" in environment:
-        env_overrides["num_envs"] = environment["num_envs"]
-    if "episode_length_s" in environment:
-        env_overrides["episode_length_s"] = environment["episode_length_s"]
+    reserved_env_keys = {"task", "decision_period"}
+    for key, value in environment.items():
+        if key not in reserved_env_keys:
+            env_overrides[key] = value
 
     return run_name, variant, cfg, env_overrides
 

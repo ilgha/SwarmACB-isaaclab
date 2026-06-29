@@ -4,12 +4,12 @@
 """Vectorized behaviour modules for the ACB (Actor-Critic with Behavior modules) variants.
 
 Implements the 6 predefined behaviour modules used by daisy, lily, tulip, and cyclamen:
-  0 — Exploration  (ballistic + obstacle avoidance state machine)
-  1 — Stop         (halt both wheels)
-  2 — Phototaxis   (drive toward light, obstacle avoidance state machine)
-  3 — Anti-phototaxis (drive away from light, obstacle avoidance state machine)
-  4 — Attraction   (drive toward neighbors, vector obstacle avoidance)
-  5 — Repulsion    (drive away from neighbors, vector obstacle avoidance)
+  0 — Stop         (halt both wheels)
+  1 — Exploration  (ballistic + obstacle avoidance state machine)
+  2 — Attraction   (drive toward neighbors, vector obstacle avoidance)
+  3 — Repulsion    (drive away from neighbors, vector obstacle avoidance)
+  4 — Phototaxis   (drive toward light, obstacle avoidance state machine)
+  5 — Anti-phototaxis (drive away from light, obstacle avoidance state machine)
 
 All modules are reactive.  Exploration, phototaxis, and anti-phototaxis maintain
 per-robot state machines for obstacle avoidance turns.  Attraction and repulsion
@@ -34,13 +34,13 @@ from enum import IntEnum
 
 
 class BehaviorID(IntEnum):
-    """Identifiers for the 6 behaviour modules.  Matches the 6-way softmax output."""
-    EXPLORATION = 0
-    STOP = 1
-    PHOTOTAXIS = 2
-    ANTI_PHOTOTAXIS = 3
-    ATTRACTION = 4
-    REPULSION = 5
+    """Identifiers for the 6 behaviour modules.  Matches Unity Epuck.cs actions."""
+    STOP = 0
+    EXPLORATION = 1
+    ATTRACTION = 2
+    REPULSION = 3
+    PHOTOTAXIS = 4
+    ANTI_PHOTOTAXIS = 5
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -50,7 +50,7 @@ class BehaviorID(IntEnum):
 def compute_wheels_from_vector(
     dx: torch.Tensor,          # (E, N)  x component in body frame (forward)
     dy: torch.Tensor,          # (E, N)  y component in body frame (lateral)
-    max_speed: float = 0.12,   # m/s  (paper: [-0.12, 0.12])
+    max_speed: float = 0.16,   # m/s, Unity Epuck.cs maxWheelSpeed
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Convert a 2D direction in the robot body frame to wheel velocities.
 
@@ -111,7 +111,7 @@ class BehaviorModules:
 
     def __init__(
         self,
-        max_speed: float = 0.12,       # paper: wheel velocity in [-0.12, 0.12] m/s
+        max_speed: float = 0.16,       # Unity Epuck.cs maxWheelSpeed
         alpha_parameter: float = 5.0,  # alphaParameter for repulsion (and inside GetAttraction)
         prox_threshold: float = 0.1,   # m_fProximityThreshold from ARGoS
         device: str | torch.device = "cuda",

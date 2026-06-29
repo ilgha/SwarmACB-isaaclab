@@ -9,24 +9,24 @@ You control robot #0 via keyboard; the remaining 19 robots run
 a selected behaviour module (default: stop).
 
 Controls:
-  Z / UP    : Forward
+  Z/W / UP  : Forward
   S / DOWN  : Backward
   Q / LEFT  : Turn left
   D / RIGHT : Turn right
-  A         : Stop
-  NUMPAD 0  : Others → Exploration
-  NUMPAD 1  : Others → Stop
-  NUMPAD 2  : Others → Phototaxis
-  NUMPAD 3  : Others → Anti-phototaxis
-  NUMPAD 4  : Others → Attraction
-  NUMPAD 5  : Others → Repulsion
+  A / SPACE : Stop
+  NUMPAD 0  : Others → Stop
+  NUMPAD 1  : Others → Exploration
+  NUMPAD 2  : Others → Attraction
+  NUMPAD 3  : Others → Repulsion
+  NUMPAD 4  : Others → Phototaxis
+  NUMPAD 5  : Others → Anti-phototaxis
   R         : Reset episode
   ESC       : Quit
 
 Usage:
   python scripts/manual_control_isaac.py
   python scripts/manual_control_isaac.py --num-agents 10
-  python scripts/manual_control_isaac.py --speed 0.10
+  python scripts/manual_control_isaac.py --speed 0.16
 """
 
 from __future__ import annotations
@@ -69,7 +69,7 @@ parser.add_argument("--task", type=str, default="SwarmACB-DirectionalGate-v0",
                     choices=TASK_CHOICES,
                     help="Mission layout to load in the manual viewer")
 parser.add_argument("--num-agents", type=int, default=20)
-parser.add_argument("--speed", type=float, default=0.08, help="Keyboard control speed (m/s)")
+parser.add_argument("--speed", type=float, default=0.16, help="Keyboard control speed (m/s)")
 parser.add_argument("--others-explore", action="store_true",
                     help="Start other robots in exploration mode instead of stop")
 parser.add_argument("--no-keyboard", action="store_true",
@@ -90,6 +90,17 @@ parser.add_argument("--variant", type=str, default=None,
                     help="CASA variant override for policy playback")
 parser.add_argument("--deterministic", action="store_true",
                     help="Use deterministic policy actions during checkpoint playback")
+parser.add_argument("--show-sensors", action="store_true",
+                    help="Draw live sensor range/debug markers in the Isaac viewport")
+parser.add_argument("--sensor-robot", type=int, default=0,
+                    help="Robot index to draw sensors for; -1 draws all robots")
+parser.add_argument("--sensor-ring-segments", type=int, default=48,
+                    help="Number of point markers used for each RAB range ring")
+parser.add_argument("--debug-keys", action="store_true",
+                    help="Print raw Isaac keyboard event names when keys are pressed")
+parser.add_argument("--keymap", type=str, default="azerty-physical",
+                    choices=["azerty-physical", "logical"],
+                    help="Keyboard mapping. azerty-physical handles Isaac's QWERTY-like raw key names on AZERTY hardware")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 apply_windows_kit_defaults(args, "ManualIsaac")
@@ -169,8 +180,8 @@ class StandaloneDGTEnv:
 
         # ── Robot params ────────────────────────────────────────
         self.robot_radius = 0.035
-        self.max_speed = 0.12
-        self.wheelbase = 0.053
+        self.max_speed = 0.16
+        self.wheelbase = 0.055
         self.dt = dt
         self.episode_length_s = _mission_length_s(self.mission)
         self.episode_steps = int(round(self.episode_length_s / self.dt))
@@ -239,7 +250,7 @@ class StandaloneDGTEnv:
 
         # ── Sensors ─────────────────────────────────────────────
         self.sensors = EpuckSensors(
-            prox_range=0.10, rab_range=0.20, light_threshold=0.2, device=device,
+            prox_range=0.10, rab_range=0.60, light_threshold=0.2, device=device,
         )
         self.behavior_modules = BehaviorModules(max_speed=self.max_speed, device=device)
         self.behavior_modules.init_state(self.E, self.N)
@@ -406,7 +417,9 @@ class StandaloneDGTEnv:
         )
         light_vals, light_value, light_angle = self._compute_light_readings()
         ground = self._ground_3ch(self.pos)
-        ztilde, rab_proj, _, _ = self.sensors.compute_rab(self.pos, self.yaw)
+        ztilde, rab_proj, _, _ = self.sensors.compute_rab(
+            self.pos, self.yaw, obstacle_segments=self.wall_segments,
+        )
         dx = self.pos[0, :, 0] - self.pos[0, 0, 0]
         dy = self.pos[0, :, 1] - self.pos[0, 0, 1]
         dist = torch.sqrt(dx ** 2 + dy ** 2 + 1e-8)
@@ -926,13 +939,245 @@ def _create_heading_markers(env: StandaloneDGTEnv) -> VisualizationMarkers:
     return VisualizationMarkers(cfg)
 
 
+def _create_sensor_line_markers() -> VisualizationMarkers:
+    """Create cylinder markers for live sensor debug lines."""
+    cfg = VisualizationMarkersCfg(
+        prim_path="/World/Visuals/ManualSensorLines",
+        markers={
+            "prox_clear": sim_utils.CylinderCfg(
+                radius=1.0,
+                height=1.0,
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.1, 0.9, 0.25)),
+            ),
+            "prox_hit": sim_utils.CylinderCfg(
+                radius=1.0,
+                height=1.0,
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.1, 0.05)),
+            ),
+            "light": sim_utils.CylinderCfg(
+                radius=1.0,
+                height=1.0,
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.85, 0.05)),
+            ),
+            "rab_link": sim_utils.CylinderCfg(
+                radius=1.0,
+                height=1.0,
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.85, 1.0)),
+            ),
+        },
+    )
+    return VisualizationMarkers(cfg)
+
+
+def _create_sensor_point_markers() -> VisualizationMarkers:
+    """Create point markers for sensor endpoints, RAB rings, and ground channels."""
+    cfg = VisualizationMarkersCfg(
+        prim_path="/World/Visuals/ManualSensorPoints",
+        markers={
+            "prox_clear": sim_utils.SphereCfg(
+                radius=0.006,
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.1, 0.9, 0.25)),
+            ),
+            "prox_hit": sim_utils.SphereCfg(
+                radius=0.008,
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.1, 0.05)),
+            ),
+            "light": sim_utils.SphereCfg(
+                radius=0.008,
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.85, 0.05)),
+            ),
+            "rab_ring": sim_utils.SphereCfg(
+                radius=0.005,
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.25, 1.0)),
+            ),
+            "rab_neighbor": sim_utils.SphereCfg(
+                radius=0.012,
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.85, 1.0)),
+            ),
+            "ground_black": sim_utils.SphereCfg(
+                radius=0.010,
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.0, 0.0)),
+            ),
+            "ground_grey": sim_utils.SphereCfg(
+                radius=0.010,
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.45, 0.45, 0.45)),
+            ),
+            "ground_white": sim_utils.SphereCfg(
+                radius=0.010,
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 1.0, 1.0)),
+            ),
+        },
+    )
+    return VisualizationMarkers(cfg)
+
+
+def _line_marker_arrays(
+    starts: np.ndarray,
+    ends: np.ndarray,
+    radius: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    vec = ends - starts
+    lengths = np.linalg.norm(vec, axis=1).clip(min=1e-6)
+    dirs = vec / lengths[:, None]
+    mid = 0.5 * (starts + ends)
+    q = np.zeros((len(starts), 4), dtype=np.float32)
+    q[:, 0] = math.sqrt(0.5)
+    q[:, 1] = -dirs[:, 1] * math.sqrt(0.5)
+    q[:, 2] = dirs[:, 0] * math.sqrt(0.5)
+    scales = np.column_stack([
+        np.full(len(starts), radius, dtype=np.float32),
+        np.full(len(starts), radius, dtype=np.float32),
+        lengths.astype(np.float32),
+    ])
+    return mid.astype(np.float32), q, scales
+
+
+def _selected_sensor_indices(env: StandaloneDGTEnv, robot_index: int) -> np.ndarray:
+    if robot_index >= 0:
+        return np.array([max(0, min(robot_index, env.N - 1))], dtype=np.int64)
+    return np.arange(env.N, dtype=np.int64)
+
+
+def _line_blocks_segment(env: StandaloneDGTEnv, start: np.ndarray, end: np.ndarray) -> bool:
+    ray = end - start
+    dist = float(np.linalg.norm(ray))
+    if dist <= 1e-6:
+        return False
+    rdx, rdy = ray[0] / dist, ray[1] / dist
+    ox, oy = float(start[0]), float(start[1])
+    for ax, ay, bx, by in env.wall_segments:
+        sx, sy = bx - ax, by - ay
+        denom = rdx * sy - rdy * sx
+        if abs(denom) <= 1e-8:
+            continue
+        t = ((ax - ox) * sy - (ay - oy) * sx) / denom
+        u = ((ax - ox) * rdy - (ay - oy) * rdx) / denom
+        if 1e-5 < t < dist - 1e-5 and 0.0 <= u <= 1.0:
+            return True
+    return False
+
+
+def _update_sensor_markers(
+    env: StandaloneDGTEnv,
+    line_markers: VisualizationMarkers,
+    point_markers: VisualizationMarkers,
+    robot_index: int,
+    ring_segments: int,
+):
+    selected = _selected_sensor_indices(env, robot_index)
+    prox_vals, _, _ = env.sensors.compute_proximity(
+        env.pos, env.yaw, env.wall_segments, env.pos, env.robot_radius,
+    )
+    light_vals, _, _ = env._compute_light_readings()
+    ground_vals = env._ground_3ch(env.pos)
+
+    pos_2d = env.pos[0].cpu().numpy()
+    yaws = env.yaw[0].cpu().numpy()
+    prox_np = prox_vals[0, selected].cpu().numpy()
+    light_np = light_vals[0, selected].cpu().numpy()
+    ground_np = ground_vals[0, selected].cpu().numpy()
+    local_x = env.sensors._cos_a.cpu().numpy()
+    local_y = env.sensors._sin_a.cpu().numpy()
+
+    starts: list[np.ndarray] = []
+    ends: list[np.ndarray] = []
+    line_idx: list[int] = []
+    points: list[np.ndarray] = []
+    point_idx: list[int] = []
+    z_ray = 0.08
+
+    for row, robot_i in enumerate(selected):
+        yaw = yaws[robot_i]
+        cos_y = math.cos(yaw)
+        sin_y = math.sin(yaw)
+        dirs_x = local_x * cos_y - local_y * sin_y
+        dirs_y = local_x * sin_y + local_y * cos_y
+        origin = np.array([pos_2d[robot_i, 0], pos_2d[robot_i, 1], z_ray], dtype=np.float32)
+
+        ground_val = float(ground_np[row, 0])
+        ground_marker = 5 if ground_val < 0.25 else (7 if ground_val > 0.75 else 6)
+        for off_forward, off_left in [(-0.010, -0.012), (-0.010, 0.0), (-0.010, 0.012)]:
+            gx = pos_2d[robot_i, 0] + off_forward * cos_y - off_left * sin_y
+            gy = pos_2d[robot_i, 1] + off_forward * sin_y + off_left * cos_y
+            points.append(np.array([gx, gy, z_ray + 0.018], dtype=np.float32))
+            point_idx.append(ground_marker)
+
+        for sensor_i in range(8):
+            hit = prox_np[row, sensor_i] > 1e-4
+            length = env.sensors.prox_range * (1.0 - prox_np[row, sensor_i] if hit else 1.0)
+            end = origin + np.array(
+                [dirs_x[sensor_i] * length, dirs_y[sensor_i] * length, 0.0],
+                dtype=np.float32,
+            )
+            starts.append(origin)
+            ends.append(end)
+            line_idx.append(1 if hit else 0)
+            points.append(end)
+            point_idx.append(1 if hit else 0)
+
+            light_len = float(np.clip(light_np[row, sensor_i], 0.0, 1.0)) * 0.5
+            if light_len > 1e-4:
+                light_end = origin + np.array(
+                    [dirs_x[sensor_i] * light_len, dirs_y[sensor_i] * light_len, 0.0],
+                    dtype=np.float32,
+                )
+                starts.append(origin)
+                ends.append(light_end)
+                line_idx.append(2)
+                points.append(light_end)
+                point_idx.append(2)
+
+        for k in range(max(8, ring_segments)):
+            a = 2.0 * math.pi * k / max(8, ring_segments)
+            points.append(np.array([
+                pos_2d[robot_i, 0] + env.sensors.rab_range * math.cos(a),
+                pos_2d[robot_i, 1] + env.sensors.rab_range * math.sin(a),
+                z_ray,
+            ], dtype=np.float32))
+            point_idx.append(3)
+
+        for other_i in range(env.N):
+            if other_i == robot_i:
+                continue
+            delta = pos_2d[other_i] - pos_2d[robot_i]
+            dist = float(np.linalg.norm(delta))
+            if dist >= env.sensors.rab_range or _line_blocks_segment(env, pos_2d[robot_i], pos_2d[other_i]):
+                continue
+            neighbor = np.array([pos_2d[other_i, 0], pos_2d[other_i, 1], z_ray], dtype=np.float32)
+            starts.append(origin)
+            ends.append(neighbor)
+            line_idx.append(3)
+            points.append(neighbor)
+            point_idx.append(4)
+
+    if not starts:
+        starts = [np.array([0.0, 0.0, -10.0], dtype=np.float32)]
+        ends = [np.array([0.0, 0.0, -10.0], dtype=np.float32)]
+        line_idx = [0]
+    translations, orientations, scales = _line_marker_arrays(np.stack(starts), np.stack(ends), 0.003)
+    line_markers.visualize(
+        translations=translations,
+        orientations=orientations,
+        scales=scales,
+        marker_indices=np.array(line_idx, dtype=np.int32),
+    )
+
+    if not points:
+        points = [np.array([0.0, 0.0, -10.0], dtype=np.float32)]
+        point_idx = [0]
+    point_markers.visualize(
+        translations=np.stack(points).astype(np.float32),
+        marker_indices=np.array(point_idx, dtype=np.int32),
+    )
+
+
 # =====================================================================
 #  Keyboard handler
 # =====================================================================
 
 MODULE_NAMES = [
-    "Exploration", "Stop", "Phototaxis",
-    "Anti-photo", "Attraction", "Repulsion",
+    "Stop", "Exploration", "Attraction",
+    "Repulsion", "Phototaxis", "Anti-photo",
 ]
 
 
@@ -973,7 +1218,9 @@ def _policy_observations(env: StandaloneDGTEnv, variant: str):
     )
     light_vals, light_value, light_angle = env._compute_light_readings()
     ground = env._ground_3ch(env.pos)
-    ztilde, rab_proj, rab_attr_x, rab_attr_y = env.sensors.compute_rab(env.pos, env.yaw)
+    ztilde, rab_proj, rab_attr_x, rab_attr_y = env.sensors.compute_rab(
+        env.pos, env.yaw, obstacle_segments=env.wall_segments,
+    )
 
     if variant in ("dandelion", "daisy"):
         obs_all = env.sensors.collect_obs_dandelion(
@@ -1009,7 +1256,7 @@ def _load_policy_actor(
     obs_dim = int(ckpt.get("obs_dim", _expected_obs_dim(variant)))
     num_actions = int(ckpt.get("num_actions", 6))
     act_dim = int(ckpt.get("act_dim", 2))
-    memory_size = int(ckpt.get("memory_size", 128))
+    memory_size = int(ckpt.get("memory_size", 64))
 
     if obs_dim != _expected_obs_dim(variant):
         print(
@@ -1048,12 +1295,13 @@ def _load_policy_actor(
 class KeyboardController:
     """Capture keyboard state via carb.input for manual robot control."""
 
-    def __init__(self):
+    def __init__(self, debug_keys: bool = False):
         self._appwindow = omni.appwindow.get_default_app_window()
         if self._appwindow is None:
             raise RuntimeError("No Isaac Sim app window is available for keyboard input.")
         self._input = carb.input.acquire_input_interface()
         self._keyboard = self._appwindow.get_keyboard()
+        self._debug_keys = debug_keys
 
         # Pressed-keys set
         self._pressed: set[str] = set()
@@ -1070,6 +1318,8 @@ class KeyboardController:
         if event.type == carb.input.KeyboardEventType.KEY_PRESS:
             self._pressed.add(name)
             self._events.append(name)
+            if self._debug_keys:
+                print(f"[KEY] press {name}", flush=True)
         elif event.type == carb.input.KeyboardEventType.KEY_RELEASE:
             self._pressed.discard(name)
         return True
@@ -1106,6 +1356,20 @@ def main():
         f"control interval={control_interval} frames",
         flush=True,
     )
+    if args.keymap == "azerty-physical":
+        # Isaac reports QWERTY-like raw key names on some AZERTY systems:
+        # physical AZERTY Z -> W, Q -> A, A -> Q.
+        forward_keys = ("W", "Z", "UP")
+        backward_keys = ("S", "DOWN")
+        left_keys = ("A", "LEFT")
+        right_keys = ("D", "RIGHT")
+        stop_keys = ("Q", "SPACE", "SPACEBAR")
+    else:
+        forward_keys = ("Z", "W", "UP")
+        backward_keys = ("S", "DOWN")
+        left_keys = ("Q", "LEFT")
+        right_keys = ("D", "RIGHT")
+        stop_keys = ("A", "SPACE", "SPACEBAR")
 
     # ── Simulation context ────────────────────────────────────────
     print("[ManualIsaac] Creating SimulationContext...", flush=True)
@@ -1144,11 +1408,13 @@ def main():
     _build_arena_visuals(env)
     robot_markers = _create_robot_markers(env)
     heading_markers = _create_heading_markers(env)
+    sensor_line_markers = _create_sensor_line_markers() if args.show_sensors else None
+    sensor_point_markers = _create_sensor_point_markers() if args.show_sensors else None
     print("[ManualIsaac] Visual scene ready.", flush=True)
 
     # ── Keyboard ──────────────────────────────────────────────────
-    kb = None if args.no_keyboard else KeyboardController()
-    others_module = 0 if args.others_explore else 1  # 0=explore, 1=stop
+    kb = None if args.no_keyboard else KeyboardController(debug_keys=args.debug_keys)
+    others_module = 1 if args.others_explore else 0  # 1=explore, 0=stop
 
     # ── Let the sim initialise ────────────────────────────────────
     print("[ManualIsaac] Resetting simulation...", flush=True)
@@ -1162,9 +1428,13 @@ def main():
     print("\n" + "=" * 60)
     print("  SwarmACB — Manual Control (Isaac Sim)")
     print("  Robot #0 = GREEN   |   Others = BLUE")
-    print("  Z/↑=fwd  S/↓=bwd  Q/←=left  D/→=right  A=stop")
+    print("  Z/W/↑=fwd  S/↓=bwd  Q/←=left  D/→=right  A/SPACE=stop")
+    print(f"  Keymap={args.keymap}")
     print("  Numpad 0-5: set others' behaviour module")
     print("  R=reset  ESC=quit")
+    if args.show_sensors:
+        robot_label = "all robots" if args.sensor_robot < 0 else f"robot #{args.sensor_robot}"
+        print(f"  Sensor overlay: {robot_label}")
     print("=" * 60 + "\n")
     if policy_mode:
         mode = "deterministic" if args.deterministic else "stochastic"
@@ -1228,17 +1498,17 @@ def main():
 
         # ── Keyboard → wheel velocities for robot 0 ──────────────
         lv0, rv0 = 0.0, 0.0
-        if kb is not None and kb.is_held("Z", "UP"):
+        if kb is not None and kb.is_held(*forward_keys):
             lv0, rv0 = speed, speed
-        if kb is not None and kb.is_held("S", "DOWN"):
+        if kb is not None and kb.is_held(*backward_keys):
             lv0, rv0 = -speed, -speed
-        if kb is not None and kb.is_held("Q", "LEFT"):
+        if kb is not None and kb.is_held(*left_keys):
             lv0 -= speed * 0.5
             rv0 += speed * 0.5
-        if kb is not None and kb.is_held("D", "RIGHT"):
+        if kb is not None and kb.is_held(*right_keys):
             lv0 += speed * 0.5
             rv0 -= speed * 0.5
-        if kb is not None and kb.is_held("A"):
+        if kb is not None and kb.is_held(*stop_keys):
             lv0, rv0 = 0.0, 0.0
 
         # Build velocity tensors
@@ -1255,7 +1525,9 @@ def main():
             module_ids = torch.full((1, N), others_module, dtype=torch.long)
             module_ids[0, 0] = 1  # robot 0 overridden by keyboard
             light_v, light_val, light_ang = env._compute_light_readings()
-            zt, rp, rab_ax, rab_ay = env.sensors.compute_rab(env.pos, env.yaw)
+            zt, rp, rab_ax, rab_ay = env.sensors.compute_rab(
+                env.pos, env.yaw, obstacle_segments=env.wall_segments,
+            )
             el, er = env.behavior_modules.dispatch(
                 module_ids, prox_val, prox_ang, light_val, light_ang, rab_ax, rab_ay,
             )
@@ -1348,6 +1620,15 @@ def main():
             translations=heading_pos_3d,
             marker_indices=heading_proto,
         )
+
+        if sensor_line_markers is not None and sensor_point_markers is not None:
+            _update_sensor_markers(
+                env,
+                sensor_line_markers,
+                sensor_point_markers,
+                args.sensor_robot,
+                args.sensor_ring_segments,
+            )
 
         # ── Periodic console readout ──────────────────────────────
         if step_counter % status_interval == 0:

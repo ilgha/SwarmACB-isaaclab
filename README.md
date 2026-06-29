@@ -68,7 +68,7 @@ The trainer supports the five CASA variants:
 The six discrete behavior modules are:
 
 ```text
-Exploration, Stop, Phototaxis, Anti-phototaxis, Attraction, Repulsion
+0 Stop, 1 Exploration, 2 Attraction, 3 Repulsion, 4 Phototaxis, 5 Anti-phototaxis
 ```
 
 ## Fixed-Option Option-Critic
@@ -125,10 +125,29 @@ SMDP-level policy-over-options implementation.
 
 Each e-puck has:
 
+- Differential-drive kinematics matching `Epuck.cs`: wheelbase 0.055 m and max wheel speed 0.16 m/s.
 - 8 IR proximity sensors, range 0.10 m
-- 8 directional light sensors, disabled in XOR and Homing
+- 8 directional light sensors using the Unity mission light intensity (1000), disabled in XOR and Homing
 - 3 ground sensors returning grey, white, or black
-- Range-and-bearing neighborhood sensing, range 0.20 m
+- Range-and-bearing neighborhood sensing, range 0.60 m with Unity-style line-of-sight and packet loss
+
+For GUI inspection, add these keys under a config `environment:` block:
+
+```yaml
+debug_visual_sensors: true
+sensor_visual_robot_index: -1   # -1 shows all env-0 robots
+sensor_visual_rab_ring_segments: 48
+```
+
+Then run `scripts/play.py` with `--exact-env` and without `--headless`. The live overlay draws proximity rays, light rays, RAB range rings, visible RAB neighbor links, and three ground-channel dots colored black, grey, or white.
+
+For manual IsaacSim inspection, run:
+
+```bash
+python scripts/manual_control_isaac.py --task SwarmACB-DirectionalGate-v0 --show-sensors --sensor-robot 0
+```
+
+Use `--sensor-robot -1` to draw the overlay for every robot.
 
 ## Installation
 
@@ -282,8 +301,8 @@ behaviors:
       hidden_units: 128
       num_layers: 1
       memory:
-        memory_size: 128
-        sequence_length: 64
+        memory_size: 64
+        sequence_length: 128
     max_steps: 180000000
     time_horizon: 1000
     environment:
@@ -313,8 +332,8 @@ behaviors:
       num_layers: 1
       num_options: 6
       memory:
-        memory_size: 128
-        sequence_length: 64
+        memory_size: 64
+        sequence_length: 128
 ```
 
 CLI arguments override YAML values, including `--task`, `--variant`,

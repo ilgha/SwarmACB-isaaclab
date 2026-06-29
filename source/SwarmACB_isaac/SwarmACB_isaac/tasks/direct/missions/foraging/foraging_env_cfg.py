@@ -17,6 +17,7 @@ class ForagingEnvCfg(DirectionalGateEnvCfg):
     episode_length_s: float = 180.0
     has_light: bool = True
     light_position: tuple = (0.0, -1.4, 0.0)
+    spawn_area_size: tuple = (1.8, 1.8)
 
     # Two black food sources and one white nest near the red light.
     food_radius: float = 0.15

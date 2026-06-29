@@ -28,8 +28,8 @@ behaviors:
       num_layers: 1
       num_options: 6
       memory:
-        memory_size: 128
-        sequence_length: 64
+        memory_size: 64
+        sequence_length: 128
 
     reward_signals:
       extrinsic:

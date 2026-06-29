@@ -3,8 +3,8 @@
 # ═══════════════════════════════════════════════════════════════════════
 #
 #  Daisy uses the same 24-dim observation as Dandelion but selects
-#  among 6 behaviour modules (exploration, stop, phototaxis,
-#  anti-phototaxis, attraction, repulsion) instead of raw wheel speeds.
+#  among 6 behaviour modules (stop, exploration, attraction,
+#  repulsion, phototaxis, anti-phototaxis) instead of raw wheel speeds.
 #
 #  python scripts/train.py --config configs/DirGate_daisy.yaml
 # ═══════════════════════════════════════════════════════════════════════

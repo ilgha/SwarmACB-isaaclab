@@ -93,21 +93,3 @@ class HomingEnv(DirectionalGateEnv):
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
         super()._reset_idx(env_ids)
-
-        if env_ids is None:
-            env_ids = list(range(self.num_envs))
-        if isinstance(env_ids, torch.Tensor):
-            idx = env_ids.to(device=self.device, dtype=torch.long)
-        else:
-            idx = torch.tensor(env_ids, device=self.device, dtype=torch.long)
-
-        n_reset = len(idx)
-        n_agents = self.cfg.num_agents
-        inradius = self.cfg.arena_circumradius * math.cos(math.pi / self.cfg.arena_num_sides)
-        safe_r = inradius - self.cfg.robot_radius * 2
-        r_rand = torch.sqrt(torch.rand(n_reset, n_agents, device=self.device)) * safe_r
-        theta = torch.rand(n_reset, n_agents, device=self.device) * math.pi
-        self.agent_pos[idx, :, 0] = r_rand * torch.cos(theta)
-        self.agent_pos[idx, :, 1] = r_rand * torch.sin(theta).abs()
-        self.agent_yaw[idx] = torch.rand(n_reset, n_agents, device=self.device) * 2 * math.pi - math.pi
-        self.prev_ground_color[idx] = self._ground_color(self.agent_pos[idx])[:, :, 0]

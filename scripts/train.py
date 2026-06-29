@@ -151,10 +151,13 @@ def main():
 
     if hasattr(env_cfg, "update_variant"):
         env_cfg.update_variant(variant)
-    if "num_envs" in env_overrides:
-        env_cfg.scene.num_envs = env_overrides["num_envs"]
-    if "episode_length_s" in env_overrides:
-        env_cfg.episode_length_s = env_overrides["episode_length_s"]
+    for key, value in env_overrides.items():
+        if key == "num_envs":
+            env_cfg.scene.num_envs = value
+        elif hasattr(env_cfg, key):
+            setattr(env_cfg, key, value)
+        else:
+            print(f"[Train] Warning: ignored unknown environment override {key!r}")
 
     # ── Create environment ────────────────────────────────────────
     env = gym.make(task_id, cfg=env_cfg)

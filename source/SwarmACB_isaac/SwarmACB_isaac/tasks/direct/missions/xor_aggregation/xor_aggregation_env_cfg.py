@@ -16,6 +16,8 @@ class XorAggregationEnvCfg(DirectionalGateEnvCfg):
 
     episode_length_s: float = 180.0
     has_light: bool = False
+    spawn_area_size: tuple = (2.4, 2.4)
+    spawn_circle_radius: float = 0.8
 
     # Two identical black circular aggregation areas from the mission diagram:
     # diameter 0.60 m, centers 0.50 m left/right of the arena center.

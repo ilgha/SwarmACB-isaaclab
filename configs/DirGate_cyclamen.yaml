@@ -26,8 +26,8 @@ behaviors:
       hidden_units: 128           # small net + LSTM
       num_layers: 1
       memory:
-        memory_size: 128          # LSTM hidden size
-        sequence_length: 64       # BPTT window
+        memory_size: 64           # LSTM hidden size
+        sequence_length: 128      # BPTT window
 
     reward_signals:
       extrinsic:

@@ -54,21 +54,27 @@ class EpuckSensors:
     def __init__(
         self,
         prox_range: float = 0.10,           # IR sensor range in meters
-        rab_range: float = 0.20,             # range-and-bearing detection radius
+        rab_range: float = 0.60,             # range-and-bearing detection radius
+        rab_loss_probability: float = 0.85,  # Epuck.cs packet loss probability
         light_threshold: float = 0.2,        # minimum reading to register light
+        light_intensity: float = 1000.0,      # Unity mission Light.intensity
         alpha_rab: float = 5.0,              # attraction/repulsion gain
+        unity_unit_scale_m: float = 0.1,      # one Unity scene unit equals 10 cm
         device: str | torch.device = "cuda",
     ):
         self.prox_range = prox_range
         self.rab_range = rab_range
+        self.rab_loss_probability = rab_loss_probability
         self.light_threshold = light_threshold
+        self.light_intensity = light_intensity
         self.alpha_rab = alpha_rab
+        self.unity_unit_scale_m = unity_unit_scale_m
         self.device = torch.device(device)
 
         # Pre-compute sensor geometry on device
         self._angles = _EPUCK_ANGLES_RAD.to(self.device)      # (8,)
-        self._cos_a = torch.cos(self._angles)                  # (8,)
-        self._sin_a = torch.sin(self._angles)                  # (8,)
+        self._cos_a = torch.cos(self._angles)                  # forward component
+        self._sin_a = -torch.sin(self._angles)                 # left-positive lateral component
         self._rab_cos = torch.cos(_RAB_PROJ_ANGLES_RAD.to(self.device))  # (4,)
         self._rab_sin = torch.sin(_RAB_PROJ_ANGLES_RAD.to(self.device))  # (4,)
 
@@ -254,27 +260,30 @@ class EpuckSensors:
         # Pairwise vectors: (E, N, N) — diff[i,j] = robot_j - robot_i
         diff_x = all_pos[:, :, 0].unsqueeze(1) - agent_pos[:, :, 0].unsqueeze(2)  # (E, N, N)
         diff_y = all_pos[:, :, 1].unsqueeze(1) - agent_pos[:, :, 1].unsqueeze(2)
-        dist = torch.sqrt(diff_x ** 2 + diff_y ** 2 + 1e-12)  # (E, N, N)
+        dist_sq = diff_x ** 2 + diff_y ** 2
 
         # Masks
-        is_self = dist < 1e-4                                    # (E, N, N)
-        in_range = dist < (self.prox_range + robot_radius)       # (E, N, N)
+        is_self = torch.eye(N, dtype=torch.bool, device=agent_pos.device).view(1, N, N)
 
         # Angular alignment with each of 8 sensors
         # dx: (E, N, 8), diff_x: (E, N, N)
         # We need dot product for each sensor with each target robot:
         # (E, N, 8, 1) * (E, N, 1, N) → (E, N, 8, N)
-        dot = (dx.unsqueeze(-1) * diff_x.unsqueeze(2)
-               + dy.unsqueeze(-1) * diff_y.unsqueeze(2))        # (E, N, 8, N)
-        cos_angle = dot / (dist.unsqueeze(2) + 1e-8)            # (E, N, 8, N)
+        proj = dx.unsqueeze(-1) * diff_x.unsqueeze(2) + dy.unsqueeze(-1) * diff_y.unsqueeze(2)
+        closest_sq = dist_sq.unsqueeze(2) - proj ** 2
+        half_chord = torch.sqrt((robot_radius ** 2 - closest_sq).clamp(min=0.0))
+        hit_dist = (proj - half_chord).clamp(min=0.0)
 
         # Hit: cos_angle > cos(15°), in range, not self
-        angular_hit = cos_angle > 0.9659                         # (E, N, 8, N)
-        hit_mask = (in_range.unsqueeze(2) & angular_hit
-                    & ~is_self.unsqueeze(2))                     # (E, N, 8, N)
+        hit_mask = (
+            (proj > 0.0)
+            & (closest_sq <= robot_radius ** 2)
+            & (hit_dist <= self.prox_range)
+            & ~is_self.unsqueeze(2)
+        )
 
         # Reading: 1 - dist/range, clamped
-        reading_val = (1.0 - dist.unsqueeze(2) / (self.prox_range + robot_radius)).clamp(0, 1)
+        reading_val = (1.0 - hit_dist / self.prox_range).clamp(0, 1)
         new_reading = torch.where(hit_mask, reading_val, torch.zeros_like(reading_val))
 
         # Max over all target robots → (E, N, 8)
@@ -310,7 +319,8 @@ class EpuckSensors:
         lx = light_pos[0] - agent_pos[:, :, 0]  # (E, N)
         ly = light_pos[1] - agent_pos[:, :, 1]
         dist = torch.sqrt(lx ** 2 + ly ** 2 + 1e-6)
-        intensity_base = 1.0 / dist  # inverse distance (light.intensity / dist with intensity=1)
+        dist_units = dist / self.unity_unit_scale_m
+        intensity_base = self.light_intensity / dist_units
 
         # Sensor world directions
         cos_y = torch.cos(agent_yaw)
@@ -326,17 +336,15 @@ class EpuckSensors:
         dot = world_dx * norm_lx.unsqueeze(-1) + world_dy * norm_ly.unsqueeze(-1)
         dot = dot.clamp(min=0.0)  # Only front-facing hemisphere
 
-        light_values = (intensity_base.unsqueeze(-1) * dot).clamp(0, 1)  # (E, N, 8)
+        raw_values = intensity_base.unsqueeze(-1) * dot
+        light_values = raw_values.clamp(0, 1)  # (E, N, 8)
 
         # Aggregation: max sensor → threshold check
-        max_val, _ = light_values.max(dim=-1)  # (E, N)
+        max_val, _ = raw_values.max(dim=-1)  # (E, N)
 
-        # Weighted sum in body frame for angle
-        # First convert light direction to body frame
-        body_lx = lx * cos_y + ly * sin_y
-        body_ly = -lx * sin_y + ly * cos_y
-        sum_x = (light_values * self._cos_a.view(1, 1, 8)).sum(dim=-1)
-        sum_y = (light_values * self._sin_a.view(1, 1, 8)).sum(dim=-1)
+        # Weighted sum in body frame for angle; Unity uses the unclamped reading.
+        sum_x = (raw_values * self._cos_a.view(1, 1, 8)).sum(dim=-1)
+        sum_y = (raw_values * self._sin_a.view(1, 1, 8)).sum(dim=-1)
 
         net_angle = torch.atan2(sum_y, sum_x)
 
@@ -375,6 +383,7 @@ class EpuckSensors:
         self,
         agent_pos: torch.Tensor,     # (E, N, 2)
         agent_yaw: torch.Tensor,     # (E, N)
+        obstacle_segments: list | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute range-and-bearing observations.
 
@@ -403,13 +412,22 @@ class EpuckSensors:
         ).unsqueeze(0)  # (1, N, N)
         in_range = (dist < self.rab_range) & not_self
 
+        if obstacle_segments is not None and len(obstacle_segments) > 0:
+            has_los = self._rab_line_of_sight(agent_pos, dx, dy, dist, obstacle_segments)
+            in_range = in_range & has_los
+
+        if self.rab_loss_probability > 0.0:
+            keep_packet = torch.rand(E, N, N, device=device) >= self.rab_loss_probability
+            in_range = in_range & keep_packet
+
         # Neighbor count
         n_neighbors = in_range.float().sum(dim=-1)  # (E, N)
         ztilde = 1.0 - 2.0 / (1.0 + torch.exp(n_neighbors))  # (E, N)
 
         # RAB sum vector in body frame
         # Direction to each neighbor in world frame
-        inv_dist = 1.0 / (dist + 1e-8)  # (E, N, N)
+        dist_units = dist / self.unity_unit_scale_m
+        inv_dist = 1.0 / (dist_units + 1e-8)  # (E, N, N)
 
         # Body-frame bearing to each neighbor
         # body_x = dx * cos_yaw + dy * sin_yaw (forward direction)
@@ -435,11 +453,52 @@ class EpuckSensors:
 
         # Alpha-weighted attraction vector: alpha/(1+dist) weighting
         # Matches Unity GetAttractionVectorToNeighbors(alphaParameter)
-        alpha_weight = self.alpha_rab / (1.0 + dist)  # (E, N, N)
+        alpha_weight = self.alpha_rab / (1.0 + dist_units)  # (E, N, N)
         rab_attr_x = (alpha_weight * cos_bearing * in_range_f).sum(dim=-1)  # (E, N)
         rab_attr_y = (alpha_weight * sin_bearing * in_range_f).sum(dim=-1)  # (E, N)
 
         return ztilde, rab_proj, rab_attr_x, rab_attr_y
+
+    def _rab_line_of_sight(
+        self,
+        origins: torch.Tensor,
+        dx: torch.Tensor,
+        dy: torch.Tensor,
+        dist: torch.Tensor,
+        segments: list[tuple[float, float, float, float]],
+    ) -> torch.Tensor:
+        """Return true when no wall segment blocks a robot-to-robot RAB ray."""
+        if len(segments) == 0:
+            return torch.ones_like(dist, dtype=torch.bool)
+
+        seg_t = torch.tensor(segments, dtype=torch.float32, device=origins.device)
+        ax = seg_t[:, 0].view(1, 1, 1, -1)
+        ay = seg_t[:, 1].view(1, 1, 1, -1)
+        bx = seg_t[:, 2].view(1, 1, 1, -1)
+        by = seg_t[:, 3].view(1, 1, 1, -1)
+        sx = bx - ax
+        sy = by - ay
+
+        ray_dx = dx / (dist + 1e-8)
+        ray_dy = dy / (dist + 1e-8)
+        ox = origins[:, :, 0].unsqueeze(2).unsqueeze(-1)
+        oy = origins[:, :, 1].unsqueeze(2).unsqueeze(-1)
+        rdx = ray_dx.unsqueeze(-1)
+        rdy = ray_dy.unsqueeze(-1)
+
+        denom = rdx * sy - rdy * sx
+        valid = denom.abs() > 1e-8
+        t = ((ax - ox) * sy - (ay - oy) * sx) / (denom + 1e-12)
+        u = ((ax - ox) * rdy - (ay - oy) * rdx) / (denom + 1e-12)
+
+        blocked = (
+            valid
+            & (t > 1e-5)
+            & (t < dist.unsqueeze(-1) - 1e-5)
+            & (u >= 0.0)
+            & (u <= 1.0)
+        )
+        return ~blocked.any(dim=-1)
 
     # ──────────────────────────────────────────────────────────────
     #  Full observation assembly

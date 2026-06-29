@@ -54,7 +54,7 @@ _ACT_DIM = {
     "tulip":     1,
     "cyclamen":  1,
 }
-_NUM_BEHAVIOR_MODULES = 6  # exploration, stop, phototaxis, anti-phototaxis, attraction, repulsion
+_NUM_BEHAVIOR_MODULES = 6  # Unity order: stop, exploration, attraction, repulsion, phototaxis, anti-phototaxis
 
 
 def _agent_names(n: int = _NUM_AGENTS) -> list[str]:
@@ -118,13 +118,27 @@ class DirectionalGateEnvCfg(DirectMARLEnvCfg):
     robot_radius: float = 0.035     # m (e-puck body radius)
     robot_height: float = 0.05      # m (visual cylinder height)
     robot_mass: float = 0.190       # kg (~190 g with battery)
-    max_wheel_speed: float = 0.12   # m/s  (paper: [-0.12, 0.12])
-    wheelbase: float = 0.053        # m  (e-puck inter-wheel distance)
+    max_wheel_speed: float = 0.16   # m/s (Unity Epuck.cs maxWheelSpeed)
+    wheelbase: float = 0.055        # m (Unity Epuck.cs wheelBase after 10x model scaling)
 
     # ── Sensor parameters ─────────────────────────────────────────
     prox_range: float = 0.10        # IR proximity sensor range (m)
-    rab_range: float = 0.20         # range-and-bearing detection radius (m)
+    rab_range: float = 0.60         # range-and-bearing detection radius (m)
+    rab_loss_probability: float = 0.85
+    unity_unit_scale_m: float = 0.10
     light_threshold: float = 0.2    # min reading to register light
+    light_intensity: float = 1000.0   # Unity mission light prefab intensity
+
+    # Unity-style spawning rectangle, scaled by 0.1 from scene units.
+    spawn_area_center: tuple = (0.0, 0.0)
+    spawn_area_size: tuple = (2.4, 2.4)
+    spawn_circle_radius: float = 0.0
+    spawn_max_attempts: int = 100
+
+    # Optional GUI sensor visualization for manual IsaacSim inspection.
+    debug_visual_sensors: bool = False
+    sensor_visual_robot_index: int = -1  # -1 = all env-0 robots
+    sensor_visual_rab_ring_segments: int = 48
 
     # ── Ground zones (Directional Gate) ───────────────────────────
     #  Arena coordinates: origin at arena center, +Y = north.

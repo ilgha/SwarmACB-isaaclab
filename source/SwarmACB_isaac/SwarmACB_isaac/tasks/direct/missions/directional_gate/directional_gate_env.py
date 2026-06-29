@@ -80,7 +80,11 @@ class DirectionalGateEnv(DirectMARLEnv):
         self.sensors = EpuckSensors(
             prox_range=cfg.prox_range,
             rab_range=cfg.rab_range,
+            rab_loss_probability=cfg.rab_loss_probability,
             light_threshold=cfg.light_threshold,
+            light_intensity=cfg.light_intensity,
+            alpha_rab=cfg.alpha_parameter,
+            unity_unit_scale_m=cfg.unity_unit_scale_m,
             device=dev,
         )
         self.light_pos = torch.tensor(
@@ -129,6 +133,12 @@ class DirectionalGateEnv(DirectMARLEnv):
         # ── Robot instanced markers ───────────────────────────────
         self._robot_markers = self._create_robot_markers()
         self._heading_markers = self._create_heading_markers()
+        if getattr(self.cfg, "debug_visual_sensors", False):
+            self._sensor_line_markers = self._create_sensor_line_markers()
+            self._sensor_point_markers = self._create_sensor_point_markers()
+        else:
+            self._sensor_line_markers = None
+            self._sensor_point_markers = None
 
         # Pre-build marker index arrays
         N = self.cfg.num_agents
@@ -263,6 +273,76 @@ class DirectionalGateEnv(DirectMARLEnv):
         )
         return VisualizationMarkers(marker_cfg)
 
+    def _create_sensor_line_markers(self) -> VisualizationMarkers:
+        """Create line-like cylinder markers for live sensor debugging."""
+        marker_cfg = VisualizationMarkersCfg(
+            prim_path="/World/Visuals/SensorLines",
+            markers={
+                "prox_clear": sim_utils.CylinderCfg(
+                    radius=1.0,
+                    height=1.0,
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.1, 0.9, 0.25)),
+                ),
+                "prox_hit": sim_utils.CylinderCfg(
+                    radius=1.0,
+                    height=1.0,
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.1, 0.05)),
+                ),
+                "light": sim_utils.CylinderCfg(
+                    radius=1.0,
+                    height=1.0,
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.85, 0.05)),
+                ),
+                "rab_link": sim_utils.CylinderCfg(
+                    radius=1.0,
+                    height=1.0,
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.85, 1.0)),
+                ),
+            },
+        )
+        return VisualizationMarkers(marker_cfg)
+
+    def _create_sensor_point_markers(self) -> VisualizationMarkers:
+        """Create point markers for sensor ray endpoints and RAB range rings."""
+        marker_cfg = VisualizationMarkersCfg(
+            prim_path="/World/Visuals/SensorPoints",
+            markers={
+                "prox_clear": sim_utils.SphereCfg(
+                    radius=0.006,
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.1, 0.9, 0.25)),
+                ),
+                "prox_hit": sim_utils.SphereCfg(
+                    radius=0.008,
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.1, 0.05)),
+                ),
+                "light": sim_utils.SphereCfg(
+                    radius=0.008,
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.85, 0.05)),
+                ),
+                "rab_ring": sim_utils.SphereCfg(
+                    radius=0.005,
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.25, 1.0)),
+                ),
+                "rab_neighbor": sim_utils.SphereCfg(
+                    radius=0.012,
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.85, 1.0)),
+                ),
+                "ground_black": sim_utils.SphereCfg(
+                    radius=0.010,
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.0, 0.0)),
+                ),
+                "ground_grey": sim_utils.SphereCfg(
+                    radius=0.010,
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.45, 0.45, 0.45)),
+                ),
+                "ground_white": sim_utils.SphereCfg(
+                    radius=0.010,
+                    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 1.0, 1.0)),
+                ),
+            },
+        )
+        return VisualizationMarkers(marker_cfg)
+
     def _compute_light_readings(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return light sensor readings, or zeros for missions without a light cue."""
         if getattr(self.cfg, "has_light", True):
@@ -327,6 +407,173 @@ class DirectionalGateEnv(DirectMARLEnv):
             marker_indices=self._heading_proto_idx,
         )
 
+        if getattr(self.cfg, "debug_visual_sensors", False):
+            self._update_sensor_visual_markers(pos_2d, yaws)
+
+    @staticmethod
+    def _line_marker_arrays(
+        starts: np.ndarray,
+        ends: np.ndarray,
+        radius: float,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        vec = ends - starts
+        lengths = np.linalg.norm(vec, axis=1).clip(min=1e-6)
+        dirs = vec / lengths[:, None]
+        mid = 0.5 * (starts + ends)
+        q = np.zeros((len(starts), 4), dtype=np.float32)
+        q[:, 0] = math.sqrt(0.5)
+        q[:, 1] = -dirs[:, 1] * math.sqrt(0.5)
+        q[:, 2] = dirs[:, 0] * math.sqrt(0.5)
+        scales = np.column_stack([
+            np.full(len(starts), radius, dtype=np.float32),
+            np.full(len(starts), radius, dtype=np.float32),
+            lengths.astype(np.float32),
+        ])
+        return mid.astype(np.float32), q, scales
+
+    def _selected_sensor_robot_indices(self) -> np.ndarray:
+        N = self.cfg.num_agents
+        idx = int(getattr(self.cfg, "sensor_visual_robot_index", -1))
+        if idx >= 0:
+            return np.array([max(0, min(idx, N - 1))], dtype=np.int64)
+        return np.arange(N, dtype=np.int64)
+
+    def _line_blocks_segment_np(self, start: np.ndarray, end: np.ndarray) -> bool:
+        ray = end - start
+        dist = float(np.linalg.norm(ray))
+        if dist <= 1e-6:
+            return False
+        rdx, rdy = ray[0] / dist, ray[1] / dist
+        ox, oy = float(start[0]), float(start[1])
+        for ax, ay, bx, by in self.wall_segments:
+            sx, sy = bx - ax, by - ay
+            denom = rdx * sy - rdy * sx
+            if abs(denom) <= 1e-8:
+                continue
+            t = ((ax - ox) * sy - (ay - oy) * sx) / denom
+            u = ((ax - ox) * rdy - (ay - oy) * rdx) / denom
+            if 1e-5 < t < dist - 1e-5 and 0.0 <= u <= 1.0:
+                return True
+        return False
+
+    def _update_sensor_visual_markers(self, pos_2d: np.ndarray, yaws: np.ndarray):
+        if self._sensor_line_markers is None or self._sensor_point_markers is None:
+            return
+
+        selected = self._selected_sensor_robot_indices()
+        prox_vals, _, _ = self.sensors.compute_proximity(
+            self.agent_pos[:1],
+            self.agent_yaw[:1],
+            obstacle_segments=self.wall_segments,
+            all_agent_pos=self.agent_pos[:1],
+            robot_radius=self.cfg.robot_radius,
+        )
+        light_vals, _, _ = self._compute_light_readings()
+        ground_vals = self._ground_color(self.agent_pos[:1])
+        prox_np = prox_vals[0, selected].detach().cpu().numpy()
+        light_np = light_vals[0, selected].detach().cpu().numpy()
+        ground_np = ground_vals[0, selected].detach().cpu().numpy()
+
+        local_x = self.sensors._cos_a.detach().cpu().numpy()
+        local_y = self.sensors._sin_a.detach().cpu().numpy()
+        starts: list[np.ndarray] = []
+        ends: list[np.ndarray] = []
+        line_idx: list[int] = []
+        points: list[np.ndarray] = []
+        point_idx: list[int] = []
+        z_ray = self.cfg.robot_height + 0.012
+
+        for row, robot_i in enumerate(selected):
+            yaw = yaws[robot_i]
+            cos_y = math.cos(yaw)
+            sin_y = math.sin(yaw)
+            dirs_x = local_x * cos_y - local_y * sin_y
+            dirs_y = local_x * sin_y + local_y * cos_y
+            origin = np.array([pos_2d[robot_i, 0], pos_2d[robot_i, 1], z_ray], dtype=np.float32)
+
+            ground_val = float(ground_np[row, 0])
+            ground_marker = 5 if ground_val < 0.25 else (7 if ground_val > 0.75 else 6)
+            # Epuck.cs uses one downward tag ray and copies it into all three
+            # ground channels; draw three clustered channel dots with that value.
+            for off_forward, off_left in [(-0.010, -0.012), (-0.010, 0.0), (-0.010, 0.012)]:
+                gx = pos_2d[robot_i, 0] + off_forward * cos_y - off_left * sin_y
+                gy = pos_2d[robot_i, 1] + off_forward * sin_y + off_left * cos_y
+                points.append(np.array([gx, gy, z_ray + 0.018], dtype=np.float32))
+                point_idx.append(ground_marker)
+
+            for sensor_i in range(8):
+                hit = prox_np[row, sensor_i] > 1e-4
+                length = self.cfg.prox_range * (1.0 - prox_np[row, sensor_i] if hit else 1.0)
+                end = origin + np.array(
+                    [dirs_x[sensor_i] * length, dirs_y[sensor_i] * length, 0.0],
+                    dtype=np.float32,
+                )
+                starts.append(origin)
+                ends.append(end)
+                line_idx.append(1 if hit else 0)
+                points.append(end)
+                point_idx.append(1 if hit else 0)
+
+                light_len = float(np.clip(light_np[row, sensor_i], 0.0, 1.0)) * 0.5
+                if light_len > 1e-4:
+                    light_end = origin + np.array(
+                        [dirs_x[sensor_i] * light_len, dirs_y[sensor_i] * light_len, 0.0],
+                        dtype=np.float32,
+                    )
+                    starts.append(origin)
+                    ends.append(light_end)
+                    line_idx.append(2)
+                    points.append(light_end)
+                    point_idx.append(2)
+
+            ring_segments = max(8, int(getattr(self.cfg, "sensor_visual_rab_ring_segments", 48)))
+            for k in range(ring_segments):
+                a = 2.0 * math.pi * k / ring_segments
+                points.append(np.array([
+                    pos_2d[robot_i, 0] + self.cfg.rab_range * math.cos(a),
+                    pos_2d[robot_i, 1] + self.cfg.rab_range * math.sin(a),
+                    z_ray,
+                ], dtype=np.float32))
+                point_idx.append(3)
+
+            for other_i in range(self.cfg.num_agents):
+                if other_i == robot_i:
+                    continue
+                delta = pos_2d[other_i] - pos_2d[robot_i]
+                dist = float(np.linalg.norm(delta))
+                if dist >= self.cfg.rab_range or self._line_blocks_segment_np(pos_2d[robot_i], pos_2d[other_i]):
+                    continue
+                neighbor = np.array([pos_2d[other_i, 0], pos_2d[other_i, 1], z_ray], dtype=np.float32)
+                starts.append(origin)
+                ends.append(neighbor)
+                line_idx.append(3)
+                points.append(neighbor)
+                point_idx.append(4)
+
+        if not starts:
+            starts = [np.array([0.0, 0.0, -10.0], dtype=np.float32)]
+            ends = [np.array([0.0, 0.0, -10.0], dtype=np.float32)]
+            line_idx = [0]
+        translations, orientations, scales = self._line_marker_arrays(
+            np.stack(starts),
+            np.stack(ends),
+            0.003,
+        )
+        self._sensor_line_markers.visualize(
+            translations=translations,
+            orientations=orientations,
+            scales=scales,
+            marker_indices=np.array(line_idx, dtype=np.int32),
+        )
+
+        if not points:
+            points = [np.array([0.0, 0.0, -10.0], dtype=np.float32)]
+            point_idx = [0]
+        self._sensor_point_markers.visualize(
+            translations=np.stack(points).astype(np.float32),
+            marker_indices=np.array(point_idx, dtype=np.int32),
+        )
+
     # ──────────────────────────────────────────────────────────────
     #  Arena geometry helpers
     # ──────────────────────────────────────────────────────────────
@@ -366,7 +613,6 @@ class DirectionalGateEnv(DirectMARLEnv):
     # ── Derived Y-coordinate helpers ───────────────────────────
 
     def _north_inradius(self) -> float:
-        R = self.cfg.arena_circumradius
         return R * math.cos(math.pi / self.cfg.arena_num_sides)
 
     def _corridor_south_y(self) -> float:
@@ -509,6 +755,7 @@ class DirectionalGateEnv(DirectMARLEnv):
             light_vals, light_value, light_angle = self._compute_light_readings()
             ztilde, rab_proj, rab_attr_x, rab_attr_y = self.sensors.compute_rab(
                 self.agent_pos, self.agent_yaw,
+                obstacle_segments=self.wall_segments,
             )
 
             # Cache sensor results so _get_observations can reuse them
@@ -695,6 +942,7 @@ class DirectionalGateEnv(DirectMARLEnv):
             light_vals, _, _ = self._compute_light_readings()
             ztilde, rab_proj, _, _ = self.sensors.compute_rab(
                 self.agent_pos, self.agent_yaw,
+                obstacle_segments=self.wall_segments,
             )
 
         ground = self._ground_color(self.agent_pos)  # (E, N, 3)
@@ -776,6 +1024,33 @@ class DirectionalGateEnv(DirectMARLEnv):
     #  Reset
     # ──────────────────────────────────────────────────────────────
 
+    def _sample_spawn_positions(self, n_reset: int, n_agents: int) -> torch.Tensor:
+        """Sample Unity-style spawn positions, scaled into Isaac meters."""
+        cfg = self.cfg
+        cx, cy = cfg.spawn_area_center
+        sx, sy = cfg.spawn_area_size
+        center = torch.tensor((cx, cy), dtype=torch.float32, device=self.device)
+
+        def sample_rect(shape: tuple[int, int]) -> torch.Tensor:
+            rand = torch.rand(*shape, 2, device=self.device) - 0.5
+            scale = torch.tensor((sx, sy), dtype=torch.float32, device=self.device)
+            return center.view(1, 1, 2) + rand * scale.view(1, 1, 2)
+
+        pos = sample_rect((n_reset, n_agents))
+        radius = float(getattr(cfg, "spawn_circle_radius", 0.0))
+        if radius <= 0.0:
+            return pos
+
+        max_attempts = int(getattr(cfg, "spawn_max_attempts", 100))
+        for _ in range(max_attempts):
+            rel = pos - center.view(1, 1, 2)
+            invalid = torch.linalg.norm(rel, dim=-1) > radius
+            if not invalid.any():
+                break
+            replacement = sample_rect((n_reset, n_agents))
+            pos = torch.where(invalid.unsqueeze(-1), replacement, pos)
+        return pos
+
     def _reset_idx(self, env_ids: Sequence[int] | None):
         if env_ids is None:
             env_ids = list(range(self.num_envs))
@@ -786,24 +1061,19 @@ class DirectionalGateEnv(DirectMARLEnv):
         else:
             idx = torch.tensor(env_ids, device=self.device, dtype=torch.long)
         N = self.cfg.num_agents
-        R = self.cfg.arena_circumradius
 
         # Snapshot completed reward before resetting
         self.completed_group_reward[idx] = self._episode_group_reward[idx]
         self._episode_group_reward[idx] = 0.0
 
-        # Random positions inside arena (rejection-sample inside the dodecagon
-        # approximated by a circle of radius R * cos(π/n) — the inradius)
-        inradius = R * math.cos(math.pi / self.cfg.arena_num_sides)
-        safe_r = inradius - self.cfg.robot_radius * 2
-
-        # Vectorized: generate all positions at once for len(env_ids) envs × N agents
+        # Vectorized Unity-style spawn rectangle for len(env_ids) envs x N agents.
         n_reset = len(env_ids)
-        r_rand = torch.sqrt(torch.rand(n_reset, N, device=self.device)) * safe_r
-        theta = torch.rand(n_reset, N, device=self.device) * 2 * math.pi
-        self.agent_pos[idx, :, 0] = r_rand * torch.cos(theta)
-        self.agent_pos[idx, :, 1] = r_rand * torch.sin(theta)
+        self.agent_pos[idx] = self._sample_spawn_positions(n_reset, N)
         self.agent_yaw[idx] = torch.rand(n_reset, N, device=self.device) * 2 * math.pi - math.pi
+
+        self._resolve_wall_collisions()
+        self._resolve_gate_wall_collisions()
+        self._resolve_robot_collisions()
 
         # Reset ground-color tracking for crossing detection
         reset_color = self._ground_color(self.agent_pos[idx])[:, :, 0]  # (len(idx), N)

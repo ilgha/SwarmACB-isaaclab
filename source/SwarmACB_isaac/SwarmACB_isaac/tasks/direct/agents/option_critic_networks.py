@@ -34,7 +34,7 @@ class FixedOptionManager(nn.Module):
         num_options: int,
         hidden: int = 128,
         num_layers: int = 1,
-        memory_size: int = 128,
+        memory_size: int = 64,
     ):
         super().__init__()
         self.obs_dim = obs_dim

@@ -84,8 +84,8 @@ class POCAConfig:
     num_layers: int = 2
     critic_num_heads: int = 4
     recurrent: bool = False
-    memory_size: int = 128
-    sequence_length: int = 64
+    memory_size: int = 64
+    sequence_length: int = 128
 
     # TensorBoard
     log_dir: str = "runs/poca"

@@ -14,6 +14,8 @@
 
 behaviors:
   DirGate_dandelion:
+    task: SwarmACB-DirectionalGate-v0
+
     # ── CASA variant ────────────────────────────────────────────
     #  dandelion  → continuous 2D wheels  (obs=24)
     #  daisy      → discrete 6 modules    (obs=24)

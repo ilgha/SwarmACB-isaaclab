@@ -9,17 +9,17 @@ You control robot #0 via keyboard; the remaining 19 robots stand still
 (or run the exploration behaviour module if --others-explore is set).
 
 Controls (AZERTY):
-  Z / ↑    : Forward
+  Z/W / ↑  : Forward
   S / ↓    : Backward
   Q / ←    : Turn left
   D / →    : Turn right
   A        : Stop
-  Numpad 0 : Others → Exploration
-  Numpad 1 : Others → Stop
-  Numpad 2 : Others → Phototaxis
-  Numpad 3 : Others → Anti-phototaxis
-  Numpad 4 : Others → Attraction
-  Numpad 5 : Others → Repulsion
+  Numpad 0 : Others → Stop
+  Numpad 1 : Others → Exploration
+  Numpad 2 : Others → Attraction
+  Numpad 3 : Others → Repulsion
+  Numpad 4 : Others → Phototaxis
+  Numpad 5 : Others → Anti-phototaxis
   R        : Reset episode
   ESC      : Quit
 
@@ -116,8 +116,8 @@ class StandaloneDGTEnv:
 
         # ── Robot params ──────────────────────────────────────────
         self.robot_radius = 0.035
-        self.max_speed = 0.12
-        self.wheelbase = 0.053
+        self.max_speed = 0.16
+        self.wheelbase = 0.055
         self.dt = 0.1
         self.episode_length_s = _mission_length_s(self.mission)
         self.episode_steps = int(round(self.episode_length_s / self.dt))
@@ -183,7 +183,7 @@ class StandaloneDGTEnv:
 
         # ── Sensors ───────────────────────────────────────────────
         self.sensors = EpuckSensors(
-            prox_range=0.10, rab_range=0.20, light_threshold=0.2, device=device,
+            prox_range=0.10, rab_range=0.60, light_threshold=0.2, device=device,
         )
         self.behavior_modules = BehaviorModules(
             max_speed=self.max_speed, device=device,
@@ -433,7 +433,7 @@ class StandaloneDGTEnv:
         light_vals, light_value, light_angle = self._compute_light_readings()
         ground = self._ground_3ch(self.pos)  # (1, N, 3)
         ztilde, rab_proj, _, _ = self.sensors.compute_rab(
-            self.pos, self.yaw,
+            self.pos, self.yaw, obstacle_segments=self.wall_segments,
         )
         obs24 = self.sensors.collect_obs_dandelion(
             prox_vals, light_vals, ground, ztilde, rab_proj,
@@ -617,7 +617,7 @@ def main():
         "--num-agents", type=int, default=20,
     )
     parser.add_argument(
-        "--speed", type=float, default=0.08,
+        "--speed", type=float, default=0.16,
         help="Keyboard control speed (m/s)",
     )
     args = parser.parse_args()
@@ -672,20 +672,20 @@ def main():
 
     # Behavior module names for HUD display
     MODULE_NAMES = [
-        "Exploration", "Stop", "Phototaxis",
-        "Anti-photo", "Attraction", "Repulsion",
+        "Stop", "Exploration", "Attraction",
+        "Repulsion", "Phototaxis", "Anti-photo",
     ]
     # Numpad key → module id mapping
     NUMPAD_MODULE = {
-        pygame.K_KP0: 0,  # Exploration
-        pygame.K_KP1: 1,  # Stop
-        pygame.K_KP2: 2,  # Phototaxis
-        pygame.K_KP3: 3,  # Anti-phototaxis
-        pygame.K_KP4: 4,  # Attraction
-        pygame.K_KP5: 5,  # Repulsion
+        pygame.K_KP0: 0,  # Stop
+        pygame.K_KP1: 1,  # Exploration
+        pygame.K_KP2: 2,  # Attraction
+        pygame.K_KP3: 3,  # Repulsion
+        pygame.K_KP4: 4,  # Phototaxis
+        pygame.K_KP5: 5,  # Anti-phototaxis
     }
 
-    others_module = 1  # default: Stop (stationary)
+    others_module = 0  # default: Stop (stationary)
     running = True
     speed = args.speed
 
@@ -705,7 +705,7 @@ def main():
         # ── Keyboard → wheel velocities for robot 0 ──────────────
         keys = pygame.key.get_pressed()
         lv0, rv0 = 0.0, 0.0
-        if keys[pygame.K_z] or keys[pygame.K_UP]:
+        if keys[pygame.K_z] or keys[pygame.K_w] or keys[pygame.K_UP]:
             lv0, rv0 = speed, speed
         if keys[pygame.K_s] or keys[pygame.K_DOWN]:
             lv0, rv0 = -speed, -speed
@@ -739,7 +739,7 @@ def main():
             module_ids[0, 0] = 1  # robot 0 = stop (overridden)
             light_v, light_val, light_ang = env._compute_light_readings()
             zt, rp, rab_ax, rab_ay = env.sensors.compute_rab(
-                env.pos, env.yaw,
+                env.pos, env.yaw, obstacle_segments=env.wall_segments,
             )
             el, er = env.behavior_modules.dispatch(
                 module_ids, prox_val, prox_ang,

@@ -82,8 +82,8 @@ class FixedOptionCriticConfig:
     num_layers: int = 1
     critic_num_heads: int = 4
     recurrent: bool = True
-    memory_size: int = 128
-    sequence_length: int = 64
+    memory_size: int = 64
+    sequence_length: int = 128
     num_options: int = 6
 
     # TensorBoard
@@ -768,8 +768,8 @@ class FixedOptionCriticTrainer:
             "hidden_dim": getattr(self.cfg, "hidden_dim", 128),
             "num_layers": getattr(self.cfg, "num_layers", 1),
             "recurrent": True,
-            "memory_size": getattr(self.cfg, "memory_size", 128),
-            "sequence_length": getattr(self.cfg, "sequence_length", 64),
+            "memory_size": getattr(self.cfg, "memory_size", 64),
+            "sequence_length": getattr(self.cfg, "sequence_length", 128),
             "discrete": True,
             "num_actions": self.cfg.num_options,
             "num_options": self.cfg.num_options,
