@@ -613,7 +613,7 @@ class DirectionalGateEnv(DirectMARLEnv):
     # ── Derived Y-coordinate helpers ───────────────────────────
 
     def _north_inradius(self) -> float:
-        return R * math.cos(math.pi / self.cfg.arena_num_sides)
+        return self.cfg.arena_circumradius * math.cos(math.pi / self.cfg.arena_num_sides)
 
     def _corridor_south_y(self) -> float:
         return self._north_inradius() - self.cfg.corridor_length
