@@ -11,6 +11,7 @@
 
 behaviors:
   DirGate_daisy:
+    task: SwarmACB-DirectionalGate-v0
     variant: daisy
     trainer_type: poca
 

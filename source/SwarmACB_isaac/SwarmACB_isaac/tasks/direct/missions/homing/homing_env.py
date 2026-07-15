@@ -85,7 +85,7 @@ class HomingEnv(DirectionalGateEnv):
         return color.unsqueeze(-1).expand(-1, -1, 3)
 
     def _get_rewards(self) -> dict[str, torch.Tensor]:
-        is_final = self.episode_length_buf >= self.max_episode_length - 1
+        is_final = self.episode_length_buf >= self.max_episode_length
         counts = self._goal_membership(self.agent_pos).float().sum(dim=1)
         reward = torch.where(is_final, counts, torch.zeros_like(counts))
         self._episode_group_reward += reward

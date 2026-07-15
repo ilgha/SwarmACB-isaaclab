@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 from torch.distributions import Bernoulli, Categorical
 
-from .poca_networks import LinearEncoder
+from .poca_networks import LinearEncoder, _linear_layer, _mlagents_lstm
 
 
 class FixedOptionManager(nn.Module):
@@ -34,7 +34,7 @@ class FixedOptionManager(nn.Module):
         num_options: int,
         hidden: int = 128,
         num_layers: int = 1,
-        memory_size: int = 64,
+        memory_size: int = 128,
     ):
         super().__init__()
         self.obs_dim = obs_dim
@@ -47,32 +47,32 @@ class FixedOptionManager(nn.Module):
             hidden,
             kernel_init="kaiming_normal",
         )
-        self.lstm = nn.LSTM(hidden, memory_size, batch_first=True)
-        self.option_head = nn.Linear(memory_size, num_options)
-        self.termination_head = nn.Linear(memory_size, num_options)
-
-        nn.init.kaiming_normal_(self.option_head.weight, nonlinearity="linear")
-        self.option_head.weight.data *= 0.2
-        nn.init.zeros_(self.option_head.bias)
-        nn.init.kaiming_normal_(self.termination_head.weight, nonlinearity="linear")
-        self.termination_head.weight.data *= 0.2
+        self.lstm, self.hidden_size = _mlagents_lstm(hidden, memory_size)
+        # The option policy is a single categorical branch, so it uses the
+        # ML-Agents MultiCategoricalDistribution gain. Termination is a custom
+        # Bernoulli head and deliberately keeps the wider 0.2 gain.
+        self.option_head = _linear_layer(
+            self.hidden_size,
+            num_options,
+            kernel_init="kaiming_normal",
+            kernel_gain=0.1,
+        )
+        self.termination_head = _linear_layer(
+            self.hidden_size,
+            num_options,
+            kernel_init="kaiming_normal",
+            kernel_gain=0.2,
+        )
         # Slightly negative bias encourages options to persist at the start.
         nn.init.constant_(self.termination_head.bias, -1.0)
-        for name, param in self.lstm.named_parameters():
-            if "weight_ih" in name:
-                nn.init.xavier_uniform_(param)
-            elif "weight_hh" in name:
-                nn.init.orthogonal_(param)
-            elif "bias" in name:
-                nn.init.zeros_(param)
 
     def initial_state(
         self,
         batch_size: int,
         device: torch.device | str,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        h = torch.zeros(1, batch_size, self.memory_size, device=device)
-        c = torch.zeros(1, batch_size, self.memory_size, device=device)
+        h = torch.zeros(1, batch_size, self.hidden_size, device=device)
+        c = torch.zeros(1, batch_size, self.hidden_size, device=device)
         return h, c
 
     def forward_sequence(

@@ -72,6 +72,7 @@ class FixedOptionCriticConfig:
     summary_freq: int = 120_000
     keep_checkpoints: int = 5
     checkpoint_dir: str = "checkpoints/option_critic"
+    seed: int = 0
 
     # Environment stepping
     decision_period: int = 1
@@ -80,9 +81,11 @@ class FixedOptionCriticConfig:
     # Network
     hidden_dim: int = 128
     num_layers: int = 1
+    critic_hidden_dim: int = 128
+    critic_num_layers: int = 2
     critic_num_heads: int = 4
     recurrent: bool = True
-    memory_size: int = 64
+    memory_size: int = 128
     sequence_length: int = 128
     num_options: int = 6
 
@@ -138,7 +141,10 @@ class FixedOptionCriticTrainer:
         )
         print("[FixedOC] Options are fixed ACB modules; learning shared local selector + termination")
         print("[FixedOC] Centralized RSA critic: collective Q_Omega + CASA counterfactual baselines")
-        print(f"[FixedOC] Recurrent manager: LSTM memory={c.memory_size}  sequence_length={c.sequence_length}")
+        print(f"[FixedOC] Recurrent manager: LSTM units={c.memory_size // 2}  "
+              f"memory_vector={c.memory_size}  sequence_length={c.sequence_length}")
+        print(f"[FixedOC] Recurrent RSA critic: hidden={c.critic_hidden_dim}  "
+              f"layers={c.critic_num_layers}  heads={c.critic_num_heads}")
 
         self.manager = FixedOptionManager(
             self.obs_dim,
@@ -151,9 +157,10 @@ class FixedOptionCriticTrainer:
             self.state_dim,
             c.num_options,
             self.num_agents,
-            c.hidden_dim,
+            c.critic_hidden_dim,
             c.critic_num_heads,
-            c.num_layers,
+            c.critic_num_layers,
+            memory_size=c.memory_size,
         ).to(self.device)
         self.optimizer = optim.Adam(
             list(self.manager.parameters()) + list(self.critic.parameters()),
@@ -165,6 +172,15 @@ class FixedOptionCriticTrainer:
         self.manager_memory_h, self.manager_memory_c = self.manager.initial_state(
             memory_batch,
             self.device,
+        )
+        self.value_memory_h, self.value_memory_c = self.critic.initial_state(
+            self.num_envs, self.device,
+        )
+        self.joint_memory_h, self.joint_memory_c = self.critic.initial_state(
+            self.num_envs, self.device,
+        )
+        self.baseline_memory_h, self.baseline_memory_c = self.critic.initial_state(
+            self.num_envs * self.num_agents, self.device,
         )
         self.current_options = torch.full(
             (self.num_envs, self.num_agents),
@@ -186,13 +202,18 @@ class FixedOptionCriticTrainer:
         self._next_checkpoint_step = c.checkpoint_interval
         self._next_summary_step = c.summary_freq
 
+        steps_to_buffer_target = (
+            c.buffer_size_hint + self.num_envs * self.num_agents - 1
+        ) // (self.num_envs * self.num_agents)
+        buffer_capacity = c.horizon + steps_to_buffer_target + 1
         self.buffer = FixedOptionRolloutBuffer(
-            horizon=c.horizon,
+            horizon=buffer_capacity,
             num_envs=self.num_envs,
             num_agents=self.num_agents,
             obs_dim=self.obs_dim,
             state_dim=self.state_dim,
-            memory_size=c.memory_size,
+            memory_size=self.manager.hidden_size,
+            critic_memory_size=self.critic.hidden_size,
             gamma=c.gamma,
             lam=c.lam,
             device=self.device,
@@ -235,8 +256,14 @@ class FixedOptionCriticTrainer:
         ).float()
 
     @torch.no_grad()
-    def collect_rollout(self, obs_dict: dict, rollout_steps: int | None = None) -> dict:
-        self.buffer.reset()
+    def collect_rollout(
+        self,
+        obs_dict: dict,
+        rollout_steps: int | None = None,
+        reset_buffer: bool = True,
+    ) -> dict:
+        if reset_buffer:
+            self.buffer.reset()
         agents = self.unwrapped.cfg.possible_agents
         dp = self.decision_period
         steps = self.cfg.horizon if rollout_steps is None else int(rollout_steps)
@@ -288,23 +315,62 @@ class FixedOptionCriticTrainer:
 
             critic_state = self.unwrapped.get_critic_state()
             critic_options = self._encode_options_for_critic(self.current_options)
-            team_value = self.critic.critic_pass(critic_state).squeeze(-1)
-            joint_option_value = self.critic.joint_action_pass(
+            value_memory_h = self.value_memory_h.squeeze(0).clone()
+            value_memory_c = self.value_memory_c.squeeze(0).clone()
+            joint_memory_h = self.joint_memory_h.squeeze(0).clone()
+            joint_memory_c = self.joint_memory_c.squeeze(0).clone()
+            baseline_memory_h = self.baseline_memory_h.squeeze(0).view(
+                self.num_envs, self.num_agents, -1,
+            ).clone()
+            baseline_memory_c = self.baseline_memory_c.squeeze(0).view(
+                self.num_envs, self.num_agents, -1,
+            ).clone()
+            team_value, next_value_memory = self.critic.critic_pass(
+                critic_state,
+                (self.value_memory_h, self.value_memory_c),
+                return_memory=True,
+            )
+            joint_option_value, next_joint_memory = self.critic.joint_action_pass(
                 critic_state,
                 critic_options,
-            ).squeeze(-1)
-            baselines = self.critic.all_baselines(critic_state, critic_options)
+                (self.joint_memory_h, self.joint_memory_c),
+                return_memory=True,
+            )
+            baselines, next_baseline_memory = self.critic.all_baselines(
+                critic_state,
+                critic_options,
+                (self.baseline_memory_h, self.baseline_memory_c),
+                return_memory=True,
+            )
+            self.value_memory_h = next_value_memory[0].detach()
+            self.value_memory_c = next_value_memory[1].detach()
+            self.joint_memory_h = next_joint_memory[0].detach()
+            self.joint_memory_c = next_joint_memory[1].detach()
+            self.baseline_memory_h = next_baseline_memory[0].detach()
+            self.baseline_memory_c = next_baseline_memory[1].detach()
+            team_value = team_value.squeeze(-1)
+            joint_option_value = joint_option_value.squeeze(-1)
 
             env_actions = self.current_options.unsqueeze(-1)
             action_dict = {a: env_actions[:, i] for i, a in enumerate(agents)}
             accumulated_reward = torch.zeros(self.num_envs, device=self.device)
             last_done = torch.zeros(self.num_envs, device=self.device)
+            last_timeout = torch.zeros(self.num_envs, device=self.device)
 
             for _dp in range(dp):
                 obs_dict, rewards_dict, terminated_dict, truncated_dict, _info = self.env.step(action_dict)
                 accumulated_reward += rewards_dict[agents[0]]
                 step_done = (terminated_dict[agents[0]] | truncated_dict[agents[0]]).float()
                 last_done = torch.max(last_done, step_done)
+                last_timeout = torch.max(
+                    last_timeout, truncated_dict[agents[0]].float(),
+                )
+
+            terminal_state = self.unwrapped.completed_terminal_critic_state
+            timeout_value = self.critic.critic_pass(
+                terminal_state,
+                (self.value_memory_h, self.value_memory_c),
+            ).squeeze(-1) * last_timeout
 
             next_obs_stacked = torch.stack([obs_dict[a] for a in agents], dim=1)
             if next_obs_stacked.ndim == 5:
@@ -336,6 +402,8 @@ class FixedOptionCriticTrainer:
                 beta_probs=beta_probs,
                 reward=accumulated_reward * self.reward_strength,
                 done=last_done,
+                timeout=last_timeout,
+                timeout_value=timeout_value,
                 team_value=team_value,
                 joint_option_value=joint_option_value,
                 baselines=baselines,
@@ -343,6 +411,14 @@ class FixedOptionCriticTrainer:
                 memory_c=memory_c,
                 next_memory_h=next_memory_h,
                 next_memory_c=next_memory_c,
+                value_memory_h=value_memory_h,
+                value_memory_c=value_memory_c,
+                joint_memory_h=joint_memory_h,
+                joint_memory_c=joint_memory_c,
+                next_joint_memory_h=self.joint_memory_h.squeeze(0).clone(),
+                next_joint_memory_c=self.joint_memory_c.squeeze(0).clone(),
+                baseline_memory_h=baseline_memory_h,
+                baseline_memory_c=baseline_memory_c,
             )
 
             self._episode_reward_acc += accumulated_reward
@@ -361,11 +437,20 @@ class FixedOptionCriticTrainer:
                 done_agents = done_mask[:, None].expand(self.num_envs, self.num_agents).reshape(-1)
                 self.manager_memory_h[:, done_agents, :] = 0.0
                 self.manager_memory_c[:, done_agents, :] = 0.0
+                self.value_memory_h[:, done_mask, :] = 0.0
+                self.value_memory_c[:, done_mask, :] = 0.0
+                self.joint_memory_h[:, done_mask, :] = 0.0
+                self.joint_memory_c[:, done_mask, :] = 0.0
+                self.baseline_memory_h[:, done_agents, :] = 0.0
+                self.baseline_memory_c[:, done_agents, :] = 0.0
 
             self.global_step += self.num_envs * self.num_agents
 
         last_state = self.unwrapped.get_critic_state()
-        last_value = self.critic.critic_pass(last_state).squeeze(-1)
+        last_value = self.critic.critic_pass(
+            last_state,
+            (self.value_memory_h, self.value_memory_c),
+        ).squeeze(-1)
         self.buffer.compute_returns_and_advantages(last_value)
         return obs_dict
 
@@ -389,6 +474,7 @@ class FixedOptionCriticTrainer:
         critic_states = batch["critic_states"]
         next_critic_states = batch["next_critic_states"]
         options = batch["options"]
+        critic_options_ids = batch["critic_options"]
         old_logp = batch["old_option_log_probs"]
         masks = batch["option_masks"]
         advantages = batch["advantages"]
@@ -397,35 +483,37 @@ class FixedOptionCriticTrainer:
         old_joint_option_values = batch["old_joint_option_values"]
         old_baselines = batch["old_baselines"]
         dones = batch["dones"]
+        loss_mask = batch["loss_mask"].bool()
 
-        B, L, N = obs.shape[:3]
-        obs_seq = obs.permute(0, 2, 1, 3).reshape(B * N, L, obs.shape[-1])
-        opt_seq = options.permute(0, 2, 1).reshape(B * N, L)
-        h0 = batch["memory_h"].reshape(B * N, -1).unsqueeze(0).detach()
-        c0 = batch["memory_c"].reshape(B * N, -1).unsqueeze(0).detach()
+        B, L = obs.shape[:2]
+        N = critic_states.shape[2]
+        h0 = batch["memory_h"].unsqueeze(0).detach()
+        c0 = batch["memory_c"].unsqueeze(0).detach()
         state = (h0, c0)
 
         option_logits = []
         for t in range(L):
             opt_logits_t, _term_logits_t, state = self.manager.step(
-                obs_seq[:, t],
+                obs[:, t],
                 state,
             )
             option_logits.append(opt_logits_t)
             if t < L - 1:
-                keep = (1.0 - dones[:, t]).repeat_interleave(N).view(1, B * N, 1)
+                keep = (1.0 - dones[:, t]).view(1, B, 1)
                 state = (state[0] * keep, state[1] * keep)
 
         option_logits = torch.stack(option_logits, dim=1)
-        opt_dist = Categorical(logits=option_logits.reshape(B * N * L, self.cfg.num_options))
-        flat_options = opt_seq.reshape(-1)
-        new_logp = opt_dist.log_prob(flat_options).view(B, N, L).permute(0, 2, 1)
-        option_entropy = opt_dist.entropy().mean()
+        opt_dist = Categorical(logits=option_logits.reshape(B * L, self.cfg.num_options))
+        new_logp = opt_dist.log_prob(options.reshape(-1)).view(B, L)
+        option_entropy_values = opt_dist.entropy().view(B, L)
+        option_entropy = (
+            option_entropy_values * loss_mask
+        ).sum() / loss_mask.sum().clamp_min(1)
 
         new_logp_flat = new_logp.reshape(-1)
         old_logp_flat = old_logp.reshape(-1)
         adv_flat = advantages.reshape(-1).detach()
-        mask_flat = masks.reshape(-1) > 0.5
+        mask_flat = (masks.reshape(-1) > 0.5) & loss_mask.reshape(-1)
         if mask_flat.any():
             ratio = (new_logp_flat[mask_flat] - old_logp_flat[mask_flat]).exp()
             pg_a = ratio * adv_flat[mask_flat]
@@ -434,9 +522,9 @@ class FixedOptionCriticTrainer:
         else:
             policy_loss = new_logp_flat.sum() * 0.0
 
-        next_obs_seq = next_obs.permute(0, 2, 1, 3).reshape(B * N * L, next_obs.shape[-1])
-        next_h = batch["next_memory_h"].permute(0, 2, 1, 3).reshape(B * N * L, -1)
-        next_c = batch["next_memory_c"].permute(0, 2, 1, 3).reshape(B * N * L, -1)
+        next_obs_seq = next_obs.reshape(B * L, next_obs.shape[-1])
+        next_h = batch["next_memory_h"].reshape(B * L, -1)
+        next_c = batch["next_memory_c"].reshape(B * L, -1)
         (
             next_option_logits,
             next_termination_logits,
@@ -445,25 +533,15 @@ class FixedOptionCriticTrainer:
             next_obs_seq,
             (next_h.unsqueeze(0).detach(), next_c.unsqueeze(0).detach()),
         )
-        next_option_logits = next_option_logits.view(
-            B,
-            N,
-            L,
-            self.cfg.num_options,
-        ).permute(0, 2, 1, 3)
-        next_termination_logits = next_termination_logits.view(
-            B,
-            N,
-            L,
-            self.cfg.num_options,
-        ).permute(0, 2, 1, 3)
+        next_option_logits = next_option_logits.view(B, L, self.cfg.num_options)
+        next_termination_logits = next_termination_logits.view(B, L, self.cfg.num_options)
 
         next_beta_logits = next_termination_logits.gather(
             -1,
             options.unsqueeze(-1),
         ).squeeze(-1)
         next_beta = torch.sigmoid(next_beta_logits)
-        nonterminal = (1.0 - dones).unsqueeze(-1).expand_as(next_beta)
+        nonterminal = 1.0 - dones
 
         flat_states = critic_states.reshape(B * L, N, critic_states.shape[-1])
         flat_next_states = next_critic_states.reshape(
@@ -471,63 +549,95 @@ class FixedOptionCriticTrainer:
             N,
             next_critic_states.shape[-1],
         )
-        critic_options = self._encode_options_for_critic(options.reshape(B * L, N))
+        flat_critic_option_ids = critic_options_ids.reshape(B * L, N)
+        critic_options = self._encode_options_for_critic(flat_critic_option_ids)
         flat_returns = returns.reshape(B * L)
-        new_team_values = self.critic.critic_pass(flat_states).squeeze(-1)
+        new_team_values = self.critic.critic_pass(
+            flat_states,
+            (
+                batch["value_memory_h"].unsqueeze(0).detach(),
+                batch["value_memory_c"].unsqueeze(0).detach(),
+            ),
+            sequence_length=L,
+        ).squeeze(-1)
         new_joint_option_values = self.critic.joint_action_pass(
             flat_states,
             critic_options,
+            (
+                batch["joint_memory_h"].unsqueeze(0).detach(),
+                batch["joint_memory_c"].unsqueeze(0).detach(),
+            ),
+            sequence_length=L,
         ).squeeze(-1)
-        new_baselines = self.critic.all_baselines(flat_states, critic_options)
+        focal_ids = batch["focal_agent_ids"].unsqueeze(1).expand(B, L).reshape(-1)
+        new_baselines = self.critic.focal_baselines(
+            flat_states,
+            critic_options,
+            focal_ids,
+            (
+                batch["baseline_memory_h"].unsqueeze(0).detach(),
+                batch["baseline_memory_c"].unsqueeze(0).detach(),
+            ),
+            sequence_length=L,
+        ).squeeze(-1)
+
+        flat_loss_mask = loss_mask.reshape(B * L)
 
         value_loss = trust_region_value_loss(
             new_team_values,
             old_team_values.reshape(B * L),
             flat_returns,
             current_eps,
+            flat_loss_mask,
         )
         joint_option_value_loss = trust_region_value_loss(
             new_joint_option_values,
             old_joint_option_values.reshape(B * L),
             flat_returns,
             current_eps,
+            flat_loss_mask,
         )
-        baseline_returns = flat_returns.unsqueeze(-1).expand(B * L, N)
         baseline_loss = trust_region_value_loss(
-            new_baselines.reshape(-1),
+            new_baselines,
             old_baselines.reshape(-1),
-            baseline_returns.reshape(-1),
+            flat_returns,
             current_eps,
+            flat_loss_mask,
         )
 
         # The termination theorem is evaluated after entering s'. For robot i,
         # continuation uses the current collective joint-option value while
         # reselection marginalizes only i's alternatives and holds peers fixed.
         with torch.no_grad():
-            flat_option_ids = options.reshape(B * L, N)
+            next_joint_memory = (
+                batch["next_joint_memory_h"].reshape(B * L, -1).unsqueeze(0),
+                batch["next_joint_memory_c"].reshape(B * L, -1).unsqueeze(0),
+            )
             next_q_current = self.critic.joint_action_pass(
                 flat_next_states,
                 critic_options,
+                memory=next_joint_memory,
             ).squeeze(-1)
-            next_counterfactual_values = self.critic.all_discrete_counterfactual_values(
+            next_counterfactual_values = self.critic.focal_discrete_counterfactual_values(
                 flat_next_states,
-                flat_option_ids,
+                flat_critic_option_ids,
+                focal_ids,
                 self.cfg.num_options,
+                memory=next_joint_memory,
             )
             next_selector_probs = torch.softmax(next_option_logits, dim=-1).reshape(
                 B * L,
-                N,
                 self.cfg.num_options,
             )
             next_reselection_values = (
                 next_counterfactual_values * next_selector_probs
             ).sum(dim=-1)
             option_advantage = (
-                next_q_current.unsqueeze(-1) - next_reselection_values
-            ).reshape(B, L, N)
+                next_q_current - next_reselection_values
+            ).reshape(B, L)
 
         term_signal = option_advantage + self.cfg.termination_penalty
-        term_mask = nonterminal
+        term_mask = nonterminal * loss_mask
         term_count = term_mask.sum()
         if term_count.item() > 0:
             termination_loss = (next_beta * term_signal * term_mask).sum() / term_count
@@ -565,13 +675,6 @@ class FixedOptionCriticTrainer:
             all_adv - all_adv.mean()
         ) / (all_adv.std(unbiased=False) + 1e-10)
 
-        T_E = active * self.buffer.num_envs
-        if cfg.buffer_size_hint > 0 and cfg.mini_batch_size > 0:
-            bpe = max(1, cfg.buffer_size_hint // cfg.mini_batch_size)
-            group_mb = max(1, T_E // bpe)
-        else:
-            group_mb = cfg.mini_batch_size
-
         totals = {
             "policy_loss": 0.0,
             "value_loss": 0.0,
@@ -586,7 +689,10 @@ class FixedOptionCriticTrainer:
         n_updates = 0
 
         for _epoch in range(cfg.num_epochs):
-            for batch in self.buffer.get_sequence_batches(cfg.sequence_length, group_mb):
+            for batch in self.buffer.get_sequence_batches(
+                cfg.sequence_length,
+                cfg.mini_batch_size,
+            ):
                 (
                     policy_loss,
                     value_loss,
@@ -654,6 +760,12 @@ class FixedOptionCriticTrainer:
         self.current_options.fill_(-1)
         self.manager_memory_h.zero_()
         self.manager_memory_c.zero_()
+        self.value_memory_h.zero_()
+        self.value_memory_c.zero_()
+        self.joint_memory_h.zero_()
+        self.joint_memory_c.zero_()
+        self.baseline_memory_h.zero_()
+        self.baseline_memory_c.zero_()
 
         ckpt_dir = Path(self.cfg.checkpoint_dir)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -671,13 +783,33 @@ class FixedOptionCriticTrainer:
 
         while self.global_step < self.cfg.total_timesteps:
             prev_step = self.global_step
-            remaining = self.cfg.total_timesteps - self.global_step
-            agent_steps_per_env_step = self.num_envs * self.num_agents
-            rollout_steps = min(
-                self.cfg.horizon,
-                max(1, (remaining + agent_steps_per_env_step - 1) // agent_steps_per_env_step),
-            )
-            obs_dict = self.collect_rollout(obs_dict, rollout_steps)
+            self.buffer.reset()
+            while self.global_step < self.cfg.total_timesteps:
+                remaining = self.cfg.total_timesteps - self.global_step
+                agent_steps_per_env_step = self.num_envs * self.num_agents
+                remaining_steps = max(
+                    1,
+                    (remaining + agent_steps_per_env_step - 1) // agent_steps_per_env_step,
+                )
+                episode_step = int(self.unwrapped.episode_length_buf.max().item())
+                episode_steps_left = max(
+                    1,
+                    (self.unwrapped.max_episode_length - episode_step + self.decision_period - 1)
+                    // self.decision_period,
+                )
+                rollout_steps = min(
+                    self.cfg.horizon,
+                    remaining_steps,
+                    episode_steps_left,
+                )
+                obs_dict = self.collect_rollout(
+                    obs_dict,
+                    rollout_steps,
+                    reset_buffer=False,
+                )
+                experiences = self.buffer.ptr * agent_steps_per_env_step
+                if experiences > self.cfg.buffer_size_hint:
+                    break
             metrics = self.update()
 
             step_delta = self.global_step - prev_step
@@ -756,7 +888,8 @@ class FixedOptionCriticTrainer:
     def save_checkpoint(self, path):
         torch.save({
             "trainer_type": "option_critic",
-            "option_critic_version": 3,
+            "option_critic_version": 6,
+            "paper_parity_version": 3,
             "fixed_options": True,
             "collective_counterfactual": True,
             "variant": self.variant,
@@ -765,11 +898,18 @@ class FixedOptionCriticTrainer:
             "optimizer": self.optimizer.state_dict(),
             "global_step": self.global_step,
             "update_count": self.update_count,
+            "seed": self.cfg.seed,
             "hidden_dim": getattr(self.cfg, "hidden_dim", 128),
             "num_layers": getattr(self.cfg, "num_layers", 1),
             "recurrent": True,
-            "memory_size": getattr(self.cfg, "memory_size", 64),
+            "memory_size": getattr(self.cfg, "memory_size", 128),
+            "memory_size_semantics": "mlagents_total",
+            "lstm_hidden_size": self.manager.hidden_size,
             "sequence_length": getattr(self.cfg, "sequence_length", 128),
+            "critic_hidden_dim": self.cfg.critic_hidden_dim,
+            "critic_num_layers": self.cfg.critic_num_layers,
+            "critic_num_heads": self.cfg.critic_num_heads,
+            "decision_period": self.decision_period,
             "discrete": True,
             "num_actions": self.cfg.num_options,
             "num_options": self.cfg.num_options,
@@ -781,9 +921,22 @@ class FixedOptionCriticTrainer:
 
     def load_checkpoint(self, path):
         ckpt = torch.load(path, map_location=self.device)
-        self.manager.load_state_dict(ckpt["manager"])
-        self.critic.load_state_dict(ckpt["critic"])
-        self.optimizer.load_state_dict(ckpt["optimizer"])
+        parity_version = int(ckpt.get("paper_parity_version", 0))
+        if parity_version != 3:
+            raise RuntimeError(
+                "Refusing to resume a pre-parity Option-Critic checkpoint. "
+                "Use it only for legacy evaluation and start parity-v3 training fresh."
+            )
+        try:
+            self.manager.load_state_dict(ckpt["manager"])
+            self.critic.load_state_dict(ckpt["critic"])
+            self.optimizer.load_state_dict(ckpt["optimizer"])
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "Checkpoint architecture does not match Option-Critic parity v6. "
+                "Legacy checkpoints remain available for evaluation; retraining "
+                "must start fresh."
+            ) from exc
         self.global_step = ckpt["global_step"]
         self.update_count = ckpt["update_count"]
         print(f"[FixedOC] Loaded <- {path}  (step {self.global_step})")

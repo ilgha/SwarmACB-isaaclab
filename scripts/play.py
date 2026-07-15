@@ -23,7 +23,12 @@ import sys
 import time
 
 from isaaclab.app import AppLauncher
-from _isaac_launch import apply_windows_kit_defaults
+from _isaac_launch import (
+    add_gui_performance_args,
+    apply_gui_performance_defaults,
+    apply_runtime_gui_performance_settings,
+    apply_windows_kit_defaults,
+)
 
 parser = argparse.ArgumentParser(description="SwarmACB Evaluation")
 
@@ -43,27 +48,28 @@ parser.add_argument("--num_episodes", type=int, default=10,
                     help="Number of episodes to evaluate")
 parser.add_argument("--deterministic", action="store_true",
                     help="Use deterministic (mean) actions instead of sampling")
+parser.add_argument("--seed", type=int, default=0,
+                    help="Environment and policy sampling seed")
 parser.add_argument("--fast-viewer", action="store_true",
-                    help="Use the lightweight visual playback loop instead of the exact IsaacLab env")
+                    help="Use the lightweight visual playback loop. This is the GUI default.")
 parser.add_argument("--exact-env", action="store_true",
-                    help=argparse.SUPPRESS)
+                    help="Use the full IsaacLab environment in GUI instead of the smooth fast viewer")
 parser.add_argument("--sim-hz", type=float, default=60.0,
                     help="Fast viewer render / kinematic update rate")
 parser.add_argument("--control-hz", type=float, default=10.0,
                     help="Fast viewer policy decision rate")
 parser.add_argument("--visual-hz", type=float, default=60.0,
                     help="GUI simulation/render substep rate; 10 Hz stays closest to real time")
+parser.add_argument("--status-interval", type=float, default=1.0,
+                    help="Seconds between live score/time updates; <=0 disables live status")
+parser.add_argument("--no-editor-hud", action="store_true",
+                    help="Disable the small Isaac editor playback status window")
 
+add_gui_performance_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 apply_windows_kit_defaults(args, "Play")
-if (
-    not getattr(args, "headless", False)
-    and "--rendering_mode" not in sys.argv
-    and getattr(args, "rendering_mode", None) == "balanced"
-):
-    args.rendering_mode = "performance"
-    print("[Play] GUI rendering mode defaulted to performance.", flush=True)
+apply_gui_performance_defaults(args, "Play")
 
 
 def _launch_fast_viewer_from_play():
@@ -71,13 +77,22 @@ def _launch_fast_viewer_from_play():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     viewer_script = os.path.join(script_dir, "manual_control_isaac.py")
     task_id = args.task or _task_from_config(args.config) or "SwarmACB-DirectionalGate-v0"
+    control_hz = args.control_hz
+    if "--control-hz" not in sys.argv:
+        control_hz = 10.0 / max(1, _decision_period_from_config(args.config) or 1)
     cmd = [
         sys.executable,
         viewer_script,
         "--task", task_id,
         "--checkpoint", args.checkpoint,
         "--sim-hz", str(args.sim_hz),
-        "--control-hz", str(args.control_hz),
+        "--control-hz", str(control_hz),
+        "--status-interval", str(args.status_interval),
+        "--seed", str(args.seed),
+        "--gui-performance-preset", args.gui_performance_preset,
+        "--gui-resolution", args.gui_resolution,
+        "--gui-texture-budget", str(args.gui_texture_budget),
+        "--gui-cpu-threads", str(args.gui_cpu_threads),
     ]
     if args.config:
         cmd += ["--config", args.config]
@@ -85,8 +100,19 @@ def _launch_fast_viewer_from_play():
         cmd += ["--variant", args.variant]
     if args.deterministic:
         cmd.append("--deterministic")
+    if args.no_editor_hud:
+        cmd.append("--no-editor-hud")
+    if args.gui_keep_materials:
+        cmd.append("--gui-keep-materials")
+    if getattr(args, "gui_disable_materials", False):
+        cmd.append("--gui-disable-materials")
+    if getattr(args, "device", None):
+        cmd += ["--device", str(args.device)]
+    if getattr(args, "rendering_mode", None):
+        cmd += ["--rendering_mode", str(args.rendering_mode)]
     print(
-        "[Play] GUI mode uses fast 60 Hz visual playback. "
+        f"[Play] GUI mode uses fast {args.sim_hz:g} Hz visual playback "
+        f"with policy_hz={control_hz:g}. "
         "Use --exact-env for the slower exact IsaacLab viewer.",
         flush=True,
     )
@@ -110,27 +136,81 @@ def _task_from_config(config_path: str | None) -> str | None:
         return None
 
 
-if not getattr(args, "headless", False) and args.fast_viewer and not args.exact_env:
+def _decision_period_from_config(config_path: str | None) -> int | None:
+    if not config_path:
+        return None
+    try:
+        import yaml
+        with open(config_path, "r", encoding="utf-8") as f:
+            raw = yaml.safe_load(f)
+        behaviors = raw.get("behaviors", raw)
+        if not behaviors:
+            return None
+        block = behaviors[next(iter(behaviors))]
+        environment = block.get("environment", {})
+        value = environment.get("decision_period", None)
+        return int(value) if value is not None else None
+    except Exception:
+        return None
+
+
+if not getattr(args, "headless", False) and not args.exact_env:
     _launch_fast_viewer_from_play()
 
 app_launcher = AppLauncher(args)
 simulation_app = app_launcher.app
+apply_runtime_gui_performance_settings(args, "Play")
 
 # ── Post-launch imports ───────────────────────────────────────────
 
 import importlib
+import random
 
 import gymnasium as gym
+import numpy as np
 import torch
 
 import SwarmACB_isaac.tasks  # noqa: F401
 
 from SwarmACB_isaac.tasks.direct.agents.poca_networks import (
-    Actor, DiscreteActor, RecurrentDiscreteActor,
+    Actor, DiscreteActor, RecurrentDiscreteActor, checkpoint_memory_size,
 )
 from SwarmACB_isaac.tasks.direct.agents.option_critic_networks import (
     FixedOptionManager,
 )
+
+
+def _format_duration(seconds: float) -> str:
+    seconds = max(0, int(math.ceil(seconds)))
+    minutes, sec = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{sec:02d}"
+    return f"{minutes:02d}:{sec:02d}"
+
+
+class _PlaybackStatusHud:
+    """Small Isaac editor window for live playback status."""
+
+    def __init__(self, enabled: bool):
+        self._label = None
+        self._window = None
+        if not enabled:
+            return
+        try:
+            import omni.ui as ui
+
+            self._window = ui.Window("SwarmACB Playback", width=360, height=132)
+            with self._window.frame:
+                with ui.VStack(spacing=4):
+                    ui.Label("SwarmACB Playback", height=22)
+                    self._label = ui.Label("", word_wrap=True)
+        except Exception as exc:
+            print(f"[Play] Warning: could not create editor HUD: {exc}", flush=True)
+
+    def update(self, text: str):
+        if self._label is not None:
+            self._label.text = text
 
 
 def _resolve_env_cfg(task_id: str):
@@ -147,13 +227,22 @@ def _resolve_env_cfg(task_id: str):
 
 
 def main():
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
     # ── Resolve variant from config / CLI / checkpoint ────────────
     variant = args.variant  # may be None
     env_overrides = {}
+    decision_period = 1
 
     if args.config:
         from SwarmACB_isaac.tasks.direct.agents.config_loader import load_config, print_config
         run_name, cfg_variant, cfg, env_overrides = load_config(args.config)
+        cfg.seed = args.seed
+        decision_period = max(1, int(getattr(cfg, "decision_period", decision_period)))
         if variant is None:
             variant = cfg_variant
 
@@ -174,6 +263,7 @@ def main():
 
     # ── Build env config and apply variant BEFORE gym.make ────────
     env_cfg = _resolve_env_cfg(task_id)
+    env_cfg.seed = args.seed
     if hasattr(env_cfg, "update_variant"):
         env_cfg.update_variant(variant)
     for key, value in env_overrides.items():
@@ -183,15 +273,18 @@ def main():
             setattr(env_cfg, key, value)
         else:
             print(f"[Play] Warning: ignored unknown environment override {key!r}")
-    decision_dt = env_cfg.sim.dt * env_cfg.decimation
+    env_step_dt = env_cfg.sim.dt * env_cfg.decimation
+    policy_dt = env_step_dt * decision_period
     if not getattr(args, "headless", False):
         visual_hz = max(args.visual_hz, 1.0)
-        env_cfg.decimation = max(1, round(decision_dt * visual_hz))
-        env_cfg.sim.dt = decision_dt / env_cfg.decimation
+        env_cfg.decimation = max(1, round(env_step_dt * visual_hz))
+        env_cfg.sim.dt = env_step_dt / env_cfg.decimation
         env_cfg.sim.render_interval = 1
         mode = "smooth" if env_cfg.decimation > 1 else "real-time"
         print(
-            f"[Play] Exact {mode} GUI playback: policy_hz={1.0 / decision_dt:.1f}, "
+            f"[Play] Exact {mode} GUI playback: policy_hz={1.0 / policy_dt:.1f}, "
+            f"decision_period={decision_period}, "
+            f"env_step_hz={1.0 / env_step_dt:.1f}, "
             f"sim_hz={1.0 / env_cfg.sim.dt:.1f}, "
             f"render_hz={1.0 / env_cfg.sim.dt:.1f}, "
             f"decimation={env_cfg.decimation}.",
@@ -214,7 +307,7 @@ def main():
     num_actions = ckpt.get("num_actions", 6)
     num_options = ckpt.get("num_options", num_actions)
     recurrent = bool(ckpt.get("recurrent", False))
-    memory_size = ckpt.get("memory_size", 64)
+    memory_size = checkpoint_memory_size(ckpt)
     if trainer_type != "option_critic" and recurrent and not discrete:
         raise ValueError("Recurrent playback is only implemented for discrete actors")
 
@@ -279,6 +372,55 @@ def main():
         )
 
     eval_start = time.perf_counter()
+    episode_steps = int(getattr(
+        unwrapped,
+        "max_episode_length",
+        round(unwrapped.cfg.episode_length_s / env_step_dt),
+    ))
+    editor_hud = _PlaybackStatusHud(
+        not getattr(args, "headless", False)
+        and not args.no_editor_hud
+        and args.status_interval > 0.0
+    )
+    last_status_wall = 0.0
+
+    def _episode_step_zero() -> int:
+        step_buf = getattr(unwrapped, "episode_length_buf", None)
+        if step_buf is None:
+            return 0
+        return int(step_buf[0].item())
+
+    def _emit_status(now: float):
+        step0 = min(max(_episode_step_zero(), 0), episode_steps)
+        elapsed_s = step0 * env_step_dt
+        total_s = episode_steps * env_step_dt
+        remaining_s = max(0.0, total_s - elapsed_s)
+        score0 = float(ep_reward[0].item())
+        mean_score = float(ep_reward.mean().item())
+        last_score = episode_rewards[-1] if episode_rewards else None
+        last_text = f" | last={last_score:.2f}" if last_score is not None else ""
+        terminal_text = (
+            f"[Play] ep={episode_count}/{args.num_episodes} "
+            f"| env0={_format_duration(elapsed_s)}/{_format_duration(total_s)} "
+            f"remaining={_format_duration(remaining_s)} "
+            f"| score={score0:.2f} mean={mean_score:.2f}"
+            f"{last_text} | wall={now - eval_start:.1f}s"
+        )
+        print(terminal_text, flush=True)
+
+        hud_lines = [
+            f"Episodes: {episode_count}/{args.num_episodes}",
+            f"Env 0 time: {_format_duration(elapsed_s)} / {_format_duration(total_s)}",
+            f"Remaining: {_format_duration(remaining_s)}",
+            f"Score: {score0:.2f}   Mean live: {mean_score:.2f}",
+        ]
+        if last_score is not None:
+            hud_lines.append(f"Last completed: {last_score:.2f}")
+        editor_hud.update("\n".join(hud_lines))
+
+    if args.status_interval > 0.0:
+        last_status_wall = time.perf_counter()
+        _emit_status(last_status_wall)
 
     while episode_count < args.num_episodes:
         with torch.no_grad():
@@ -344,30 +486,41 @@ def main():
                         # ML-Agents preprocessing: clamp(-3,3)/3 before env
                         action_dict[agent] = act.clamp(-3, 3) / 3
 
-        obs_dict, reward_dict, terminated_dict, truncated_dict, info = env.step(action_dict)
+        substep_active = torch.ones(num_envs, dtype=torch.bool, device=device)
+        for _ in range(decision_period):
+            obs_dict, reward_dict, terminated_dict, truncated_dict, info = env.step(action_dict)
 
-        ep_reward += reward_dict[agents[0]]
+            ep_reward += reward_dict[agents[0]] * substep_active.float()
 
-        # Check for done envs
-        for ei in range(num_envs):
-            done = (terminated_dict[agents[0]][ei] | truncated_dict[agents[0]][ei]).item()
-            if done:
-                episode_rewards.append(ep_reward[ei].item())
-                ep_reward[ei] = 0.0
-                if trainer_type == "option_critic":
-                    current_options[ei] = -1
-                    start = ei * len(agents)
-                    end = start + len(agents)
-                    memory_h[:, start:end, :] = 0.0
-                    memory_c[:, start:end, :] = 0.0
-                elif recurrent:
-                    start = ei * len(agents)
-                    end = start + len(agents)
-                    memory_h[:, start:end, :] = 0.0
-                    memory_c[:, start:end, :] = 0.0
-                episode_count += 1
-                if episode_count >= args.num_episodes:
+            done_tensor = terminated_dict[agents[0]] | truncated_dict[agents[0]]
+            newly_done = substep_active & done_tensor
+            if newly_done.any():
+                for ei in newly_done.nonzero(as_tuple=False).flatten().tolist():
+                    episode_rewards.append(ep_reward[ei].item())
+                    ep_reward[ei] = 0.0
+                    if trainer_type == "option_critic":
+                        current_options[ei] = -1
+                        start = ei * len(agents)
+                        end = start + len(agents)
+                        memory_h[:, start:end, :] = 0.0
+                        memory_c[:, start:end, :] = 0.0
+                    elif recurrent:
+                        start = ei * len(agents)
+                        end = start + len(agents)
+                        memory_h[:, start:end, :] = 0.0
+                        memory_c[:, start:end, :] = 0.0
+                    episode_count += 1
+                    if episode_count >= args.num_episodes:
+                        break
+                for agent in agents:
+                    action_dict[agent][newly_done] = 0
+                substep_active = substep_active & ~done_tensor
+                if episode_count >= args.num_episodes or not substep_active.any():
                     break
+        now = time.perf_counter()
+        if args.status_interval > 0.0 and now - last_status_wall >= args.status_interval:
+            last_status_wall = now
+            _emit_status(now)
 
     # ── Print results ─────────────────────────────────────────────
     import statistics

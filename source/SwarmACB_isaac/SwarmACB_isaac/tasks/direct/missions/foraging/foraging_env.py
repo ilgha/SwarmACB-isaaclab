@@ -101,16 +101,23 @@ class ForagingEnv(DirectionalGateEnv):
         )
         li_cfg.func("/World/Arena/LightIndicator", li_cfg, translation=(lx, ly, 0.04))
 
-    def _food_membership(self, pos: torch.Tensor) -> torch.Tensor:
+    def _food_ground_membership(self, pos: torch.Tensor) -> torch.Tensor:
+        """Circular black floor patches seen by the Unity ground sensor."""
         centers = torch.tensor(self.cfg.food_centers, dtype=pos.dtype, device=pos.device)
         diff = pos.unsqueeze(2) - centers.view(1, 1, 2, 2)
         return (diff * diff).sum(dim=-1) <= self.cfg.food_radius ** 2
+
+    def _food_reward_membership(self, pos: torch.Tensor) -> torch.Tensor:
+        """Unity ForagingEnvController's axis-aligned pickup test."""
+        centers = torch.tensor(self.cfg.food_centers, dtype=pos.dtype, device=pos.device)
+        diff = (pos.unsqueeze(2) - centers.view(1, 1, 2, 2)).abs()
+        return (diff <= self.cfg.food_radius).all(dim=-1)
 
     def _nest_membership(self, pos: torch.Tensor) -> torch.Tensor:
         return pos[:, :, 1] <= self.cfg.nest_top_y
 
     def _ground_color(self, pos: torch.Tensor) -> torch.Tensor:
-        in_food = self._food_membership(pos).any(dim=-1)
+        in_food = self._food_ground_membership(pos).any(dim=-1)
         in_nest = self._nest_membership(pos)
         grey = torch.full(pos.shape[:2], 0.5, dtype=pos.dtype, device=pos.device)
         color = torch.where(in_food, torch.zeros_like(grey), grey)
@@ -118,11 +125,11 @@ class ForagingEnv(DirectionalGateEnv):
         return color.unsqueeze(-1).expand(-1, -1, 3)
 
     def _get_rewards(self) -> dict[str, torch.Tensor]:
-        in_food = self._food_membership(self.agent_pos).any(dim=-1)
+        in_food = self._food_reward_membership(self.agent_pos).any(dim=-1)
         in_nest = self._nest_membership(self.agent_pos)
 
         self._has_food = self._has_food | in_food
-        arrived = in_nest & (~self._prev_in_nest) & self._has_food
+        arrived = in_nest & self._has_food
         reward = arrived.float().sum(dim=1)
         self._has_food = torch.where(arrived, torch.zeros_like(self._has_food), self._has_food)
         self._prev_in_nest = in_nest.clone()

@@ -274,7 +274,7 @@ class EpuckSensors:
         half_chord = torch.sqrt((robot_radius ** 2 - closest_sq).clamp(min=0.0))
         hit_dist = (proj - half_chord).clamp(min=0.0)
 
-        # Hit: cos_angle > cos(15°), in range, not self
+        # Exact ray-circle hit against the finite robot body, in range and not self.
         hit_mask = (
             (proj > 0.0)
             & (closest_sq <= robot_radius ** 2)
@@ -548,13 +548,13 @@ class EpuckSensors:
         agent_yaw: torch.Tensor,     # (E, N) heading
         arena_center: torch.Tensor,  # (2,) world XY of arena center
         arena_radius: float,         # normalization radius
-        light_dir: torch.Tensor,     # (2,) unit vector from arena center toward light
+        reference_dir: torch.Tensor, # (2,) Unity world +Z mapped to Isaac +Y
     ) -> torch.Tensor:
         """Compute 5D critic state per robot: (rho, cos_alpha, sin_alpha, cos_beta, sin_beta).
 
-        Matches the paper's state encoding (Fig. state):
+        Matches Unity ``PerAgentState5DSensor.cs``:
           rho   = distance from arena center, normalized to [0, 1]
-          alpha = angle from arena-center-to-light-source axis to arena-center-to-robot
+          alpha = angle from the fixed Unity world +Z axis to center-to-robot
           beta  = robot heading relative to arena-center-to-robot axis
 
         Returns:
@@ -568,10 +568,15 @@ class EpuckSensors:
         # Unit vector from center to robot
         rhat = rel / norm  # (E, N, 2)
 
-        # alpha = angle from light_dir to rhat
-        # cos_alpha = dot(light_dir, rhat), sin_alpha = cross(light_dir, rhat)
-        cos_alpha = rhat[:, :, 0] * light_dir[0] + rhat[:, :, 1] * light_dir[1]
-        sin_alpha = rhat[:, :, 0] * light_dir[1] - rhat[:, :, 1] * light_dir[0]
+        # alpha = angle from the fixed world reference to rhat.
+        cos_alpha = (
+            rhat[:, :, 0] * reference_dir[0]
+            + rhat[:, :, 1] * reference_dir[1]
+        )
+        sin_alpha = (
+            rhat[:, :, 0] * reference_dir[1]
+            - rhat[:, :, 1] * reference_dir[0]
+        )
 
         # beta = robot heading relative to center-to-robot axis
         heading = torch.stack([torch.cos(agent_yaw), torch.sin(agent_yaw)], dim=-1)  # (E, N, 2)

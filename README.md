@@ -231,6 +231,50 @@ inspection:
 python scripts/play.py --config configs/Sheltering_cyclamen.yaml --checkpoint checkpoints/Sheltering_cyclamen/poca_final.pt --fast-viewer --deterministic
 ```
 
+Compare behavior-module usage for the 10 classical Cyclamen controllers and
+the 10 fixed-option OC-Cyclamen controllers in headless mode:
+
+```bash
+python scripts/evaluate_behavior_time.py --mission dirgate --checkpoint-root checkpoints
+python scripts/evaluate_behavior_time.py --mission xor --checkpoint-root checkpoints
+python scripts/evaluate_behavior_time.py --mission homing --checkpoint-root checkpoints
+python scripts/evaluate_behavior_time.py --mission foraging --checkpoint-root checkpoints
+python scripts/evaluate_behavior_time.py --mission sheltering --checkpoint-root checkpoints
+```
+
+This writes CSV summaries and plots under `analysis/<mission>_behavior_time/`.
+If `poca_final.pt` or `option_critic_final.pt` is missing for a run, the script
+falls back to the latest numbered checkpoint in that run directory.
+For speed, all available controllers for a method are evaluated concurrently in
+one vectorized IsaacLab environment by default. The script reuses that single
+IsaacLab environment for Cyclamen and OC-Cyclamen to avoid slow or fragile
+stage teardown/recreation between methods. Use `--batch-size N` to limit
+concurrency, or `--sequential` for one checkpoint at a time while still reusing
+the same IsaacLab environment.
+Use `--deterministic` for argmax actions and thresholded OC terminations;
+the default is stochastic playback, matching `scripts/play.py`.
+
+GUI playback keeps the normal viewport features by default: native resolution,
+60 Hz visual stepping, scene materials, the live terminal/HUD status, and sensor
+overlays when enabled. Under the hood the default `--gui-performance-preset same`
+loads Isaac's loop runner and disables Kit run-loop rate limits so the GUI can
+use more CPU/GPU time without changing rendering fidelity. Pass
+`--gui-performance-preset off` for stock Isaac loop behavior, or
+`--gui-performance-preset fast` to also enable rendering-side speed tweaks.
+
+Use these flags when you need a more aggressive speed profile:
+
+```bash
+# Faster GUI if the viewport is still lagging
+python scripts/play.py --config configs/DirGate_dandelion.yaml --checkpoint checkpoints/DirGate_dandelion/poca_final.pt --fast-viewer --gui-performance-preset fast --gui-resolution 640x360 --gui-texture-budget 0.25 --sim-hz 20 --deterministic
+
+# Maximum viewport speed, at the cost of material/color fidelity
+python scripts/play.py --config configs/DirGate_dandelion.yaml --checkpoint checkpoints/DirGate_dandelion/poca_final.pt --fast-viewer --gui-performance-preset fast --gui-disable-materials --gui-resolution 640x360 --sim-hz 20 --deterministic
+```
+
+The same GUI flags work with `scripts/manual_control_isaac.py`. If Isaac Sim
+over-subscribes a many-core CPU, try `--gui-cpu-threads 16`.
+
 ## Manual Mission Checks
 
 Pygame viewer, without Isaac Sim:
@@ -301,7 +345,7 @@ behaviors:
       hidden_units: 128
       num_layers: 1
       memory:
-        memory_size: 64
+        memory_size: 128
         sequence_length: 128
     max_steps: 180000000
     time_horizon: 1000
@@ -310,6 +354,18 @@ behaviors:
       decision_period: 1
       episode_length_s: 180.0
 ```
+
+The paper-parity clock is 10 Hz: Isaac runs with `dt: 0.1`, `decimation: 1`,
+and `decision_period: 1`. This gives 1200 decisions in a 120 s episode and
+1800 in a 180 s episode. It also makes Cyclamen's 128-sample recurrent window
+span 12.8 s, as reported in the paper. The `DecisionPeriod: 5` serialized in
+the available Unity prefab conflicts with all three paper constraints and is
+therefore treated as stale scene metadata.
+
+`max_steps` counts individual robot decisions, as ML-Agents does. With 20
+robots, five parallel environments, and 5000 total episodes, use 120,000,000
+for 120 s missions (Directional Gate and Homing) and 180,000,000 for 180 s
+missions (XOR, Foraging, and Sheltering).
 
 Fixed-option Option-Critic configs use the same layout with
 `trainer_type: option_critic`:
@@ -332,12 +388,32 @@ behaviors:
       num_layers: 1
       num_options: 6
       memory:
-        memory_size: 64
+        memory_size: 128
         sequence_length: 128
 ```
 
+Cyclamen and fixed Option-Critic checkpoints produced before paper-parity
+version 3 use incompatible recurrent/critic/training-cadence semantics. They remain usable for
+historical evaluation, but parity experiments must start from fresh weights.
+
+Before submitting the full HPC matrix, run the dependency-light parity audit:
+
+```bash
+python scripts/validate_paper_parity.py
+```
+
+It validates all 30 YAML files, experiment budgets, network sizes, recurrent
+semantics, and the mission geometry/constants that are most sensitive to Unity
+scene overrides.
+
+The HPC array launcher passes `SLURM_ARRAY_TASK_ID` as `--seed`, so the ten
+controllers use reproducible seeds 0 through 9. Training also follows the
+ML-Agents update-buffer rule: complete `time_horizon` or terminal trajectories
+are accumulated until `buffer_size` is exceeded before each update.
+
 CLI arguments override YAML values, including `--task`, `--variant`,
-`--num_envs`, `--total_timesteps`, `--log_dir`, and `--checkpoint_dir`.
+`--num_envs`, `--total_timesteps`, `--seed`, `--log_dir`, and
+`--checkpoint_dir`.
 
 ## License
 

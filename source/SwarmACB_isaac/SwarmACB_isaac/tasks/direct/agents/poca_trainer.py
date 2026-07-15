@@ -72,6 +72,7 @@ class POCAConfig:
     summary_freq: int = 120_000         # TensorBoard log every N agent-decisions
     keep_checkpoints: int = 5
     checkpoint_dir: str = "checkpoints/poca"
+    seed: int = 0
 
     # Decision period
     decision_period: int = 1
@@ -82,9 +83,11 @@ class POCAConfig:
     # Network
     hidden_dim: int = 512
     num_layers: int = 2
+    critic_hidden_dim: int = 128
+    critic_num_layers: int = 2
     critic_num_heads: int = 4
     recurrent: bool = False
-    memory_size: int = 64
+    memory_size: int = 128
     sequence_length: int = 128
 
     # TensorBoard
@@ -141,6 +144,7 @@ def trust_region_value_loss(
     old_values: torch.Tensor,
     returns: torch.Tensor,
     epsilon: float,
+    mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Clipped value loss matching ML-Agents trust_region_value_loss.
 
@@ -149,7 +153,11 @@ def trust_region_value_loss(
     clipped = old_values + (values - old_values).clamp(-epsilon, epsilon)
     loss_a = (returns - values) ** 2
     loss_b = (returns - clipped) ** 2
-    return torch.max(loss_a, loss_b).mean()
+    loss = torch.max(loss_a, loss_b)
+    if mask is not None:
+        active = mask.to(dtype=loss.dtype)
+        return (loss * active).sum() / active.sum().clamp_min(1.0)
+    return loss.mean()
 
 
 def trust_region_policy_loss(
@@ -157,6 +165,7 @@ def trust_region_policy_loss(
     log_probs: torch.Tensor,     # (MB, act_dim) — per-dim
     old_log_probs: torch.Tensor, # (MB, act_dim) — per-dim
     epsilon: float,
+    mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Clipped policy loss matching ML-Agents trust_region_policy_loss.
 
@@ -170,7 +179,14 @@ def trust_region_policy_loss(
     r_theta = (log_probs - old_log_probs).exp()
     p_opt_a = r_theta * advantages
     p_opt_b = r_theta.clamp(1.0 - epsilon, 1.0 + epsilon) * advantages
-    return -torch.min(p_opt_a, p_opt_b).mean()
+    loss = -torch.min(p_opt_a, p_opt_b)
+    if mask is not None:
+        active = mask.to(dtype=loss.dtype)
+        while active.ndim < loss.ndim:
+            active = active.unsqueeze(-1)
+        active = active.expand_as(loss)
+        return (loss * active).sum() / active.sum().clamp_min(1.0)
+    return loss.mean()
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -232,8 +248,11 @@ class POCATrainer:
               f"decision_period={self.decision_period}")
         print("[POCA] Actor uses local obs only; Critic uses 5D polar state")
         if self.recurrent:
-            print(f"[POCA] Recurrent actor: LSTM memory={c.memory_size}  "
+            print(f"[POCA] Recurrent actor + critic: LSTM units={c.memory_size // 2}  "
+                  f"memory_vector={c.memory_size}  "
                   f"sequence_length={c.sequence_length}")
+        print(f"[POCA] Centralized RSA critic: hidden={c.critic_hidden_dim}  "
+              f"layers={c.critic_num_layers}  heads={c.critic_num_heads}")
 
         if self.discrete:
             if self.recurrent:
@@ -264,8 +283,20 @@ class POCATrainer:
 
         self.critic = POCACritic(
             self.state_dim, self.act_dim_critic, self.num_agents,
-            c.hidden_dim, c.critic_num_heads, c.num_layers,
+            c.critic_hidden_dim, c.critic_num_heads, c.critic_num_layers,
+            memory_size=c.memory_size if self.recurrent else 0,
         ).to(self.device)
+
+        if self.recurrent:
+            self.critic_memory_h, self.critic_memory_c = self.critic.initial_state(
+                self.num_envs, self.device,
+            )
+            self.baseline_memory_h, self.baseline_memory_c = self.critic.initial_state(
+                self.num_envs * self.num_agents, self.device,
+            )
+        else:
+            self.critic_memory_h = self.critic_memory_c = None
+            self.baseline_memory_h = self.baseline_memory_c = None
 
         # ── single optimiser (actor + critic) — matches ML-Agents ─
         self.optimizer = optim.Adam(
@@ -298,14 +329,22 @@ class POCATrainer:
         self._next_summary_step = c.summary_freq
 
         # ── rollout buffer ────────────────────────────────────────
+        # ML-Agents only updates after complete per-agent trajectories have
+        # pushed the update buffer strictly past buffer_size. A short terminal
+        # trajectory can therefore be followed by another horizon trajectory.
+        steps_to_buffer_target = (
+            c.buffer_size_hint + self.num_envs * self.num_agents - 1
+        ) // (self.num_envs * self.num_agents)
+        buffer_capacity = c.horizon + steps_to_buffer_target + 1
         self.buffer = POCARolloutBuffer(
-            horizon=c.horizon,
+            horizon=buffer_capacity,
             num_envs=self.num_envs,
             num_agents=self.num_agents,
             obs_dim=self.obs_dim,
             act_dim=self.act_dim,
             state_dim=self.state_dim,
-            memory_size=c.memory_size if self.recurrent else 0,
+            memory_size=self.actor.hidden_size if self.recurrent else 0,
+            critic_memory_size=self.critic.hidden_size if self.recurrent else 0,
             gamma=c.gamma,
             lam=c.lam,
             device=self.device,
@@ -331,20 +370,14 @@ class POCATrainer:
         # Print param count & batch info
         actor_params = sum(p.numel() for p in self.actor.parameters())
         critic_params = sum(p.numel() for p in self.critic.parameters())
-        T_E = c.horizon * self.num_envs
-        if c.buffer_size_hint > 0 and c.mini_batch_size > 0:
-            bpe = max(1, c.buffer_size_hint // c.mini_batch_size)
-            group_mb = max(1, T_E // bpe)
-        else:
-            group_mb = c.mini_batch_size
-        n_batches = (T_E + group_mb - 1) // group_mb
+        rollout_experiences = c.horizon * self.num_envs * self.num_agents
+        n_batches = (rollout_experiences + c.mini_batch_size - 1) // c.mini_batch_size
         print(f"[POCA] Actor params: {actor_params:,}  "
               f"Critic params: {critic_params:,}")
-        print(f"[POCA] Mini-batch: {group_mb} group entries "
-              f"({group_mb * self.num_agents} agent-transitions)  "
-              f"[{n_batches} batches/epoch × {c.num_epochs} epochs "
+        print(f"[POCA] Mini-batch: {c.mini_batch_size} focal-agent transitions  "
+              f"[{n_batches} batches/epoch x {c.num_epochs} epochs "
               f"= {n_batches * c.num_epochs} updates/rollout]")
-        print(f"[POCA] TensorBoard → {c.log_dir}")
+        print(f"[POCA] TensorBoard -> {c.log_dir}")
 
     # ──────────────────────────────────────────────────────────────
     #  Action encoding helper
@@ -386,7 +419,12 @@ class POCATrainer:
     # ──────────────────────────────────────────────────────────────
 
     @torch.no_grad()
-    def collect_rollout(self, obs_dict: dict) -> dict:
+    def collect_rollout(
+        self,
+        obs_dict: dict,
+        rollout_steps: int | None = None,
+        reset_buffer: bool = True,
+    ) -> dict:
         """Run *horizon* decisions, each stepping the env *decision_period* times.
 
         This matches ML-Agents' DecisionRequester behaviour:
@@ -400,11 +438,13 @@ class POCATrainer:
         the env never executed (it was using cached actions from 5 steps ago),
         breaking the action↔reward correspondence that PPO requires.
         """
-        self.buffer.reset()
+        if reset_buffer:
+            self.buffer.reset()
         agents = self.unwrapped.cfg.possible_agents
         dp = self.decision_period
 
-        for _ in range(self.cfg.horizon):
+        steps = self.cfg.horizon if rollout_steps is None else int(rollout_steps)
+        for _ in range(steps):
             # ── stack observations (taken BEFORE the decision) ────
             obs_stacked = torch.stack(
                 [obs_dict[a] for a in agents], dim=1
@@ -448,11 +488,39 @@ class POCATrainer:
 
             # ── critic: team value V(s) — uses 5D polar STATE ─────
             critic_state = self.unwrapped.get_critic_state()           # (E, N, 5)
-            team_val = self.critic.critic_pass(critic_state).squeeze(-1)  # (E,)
+            critic_memory_h = critic_memory_c = None
+            baseline_memory_h = baseline_memory_c = None
 
             # ── baselines: counterfactual b_i — also uses STATE ───
             critic_actions = self._encode_actions_for_critic(all_actions)
-            baselines = self.critic.all_baselines(critic_state, critic_actions)  # (E, N)
+            if self.recurrent:
+                critic_memory_h = self.critic_memory_h.squeeze(0).clone()
+                critic_memory_c = self.critic_memory_c.squeeze(0).clone()
+                baseline_memory_h = self.baseline_memory_h.squeeze(0).view(
+                    self.num_envs, self.num_agents, -1,
+                ).clone()
+                baseline_memory_c = self.baseline_memory_c.squeeze(0).view(
+                    self.num_envs, self.num_agents, -1,
+                ).clone()
+                team_val, next_critic_memory = self.critic.critic_pass(
+                    critic_state,
+                    (self.critic_memory_h, self.critic_memory_c),
+                    return_memory=True,
+                )
+                baselines, next_baseline_memory = self.critic.all_baselines(
+                    critic_state,
+                    critic_actions,
+                    (self.baseline_memory_h, self.baseline_memory_c),
+                    return_memory=True,
+                )
+                self.critic_memory_h = next_critic_memory[0].detach()
+                self.critic_memory_c = next_critic_memory[1].detach()
+                self.baseline_memory_h = next_baseline_memory[0].detach()
+                self.baseline_memory_c = next_baseline_memory[1].detach()
+                team_val = team_val.squeeze(-1)
+            else:
+                team_val = self.critic.critic_pass(critic_state).squeeze(-1)
+                baselines = self.critic.all_baselines(critic_state, critic_actions)
 
             # ── ML-Agents action preprocessing ──────────────────
             # ML-Agents clips continuous actions to [-3, 3] then divides by 3
@@ -472,6 +540,7 @@ class POCATrainer:
             action_dict = {a: env_actions[:, i] for i, a in enumerate(agents)}
             accumulated_reward = torch.zeros(self.num_envs, device=self.device)
             last_done = torch.zeros(self.num_envs, device=self.device)
+            last_timeout = torch.zeros(self.num_envs, device=self.device)
 
             for _dp in range(dp):
                 obs_dict, rewards_dict, terminated_dict, truncated_dict, info = (
@@ -480,6 +549,19 @@ class POCATrainer:
                 accumulated_reward += rewards_dict[agents[0]]
                 step_done = (terminated_dict[agents[0]] | truncated_dict[agents[0]]).float()
                 last_done = torch.max(last_done, step_done)
+                last_timeout = torch.max(
+                    last_timeout, truncated_dict[agents[0]].float(),
+                )
+
+            terminal_state = self.unwrapped.completed_terminal_critic_state
+            if self.recurrent:
+                timeout_value = self.critic.critic_pass(
+                    terminal_state,
+                    (self.critic_memory_h, self.critic_memory_c),
+                ).squeeze(-1)
+            else:
+                timeout_value = self.critic.critic_pass(terminal_state).squeeze(-1)
+            timeout_value = timeout_value * last_timeout
 
             # ── store ONE transition per decision ─────────────────
             self.buffer.add(
@@ -489,10 +571,16 @@ class POCATrainer:
                 log_probs=all_log_probs,  # per-dim!
                 reward=accumulated_reward * self.reward_strength,
                 done=last_done,
+                timeout=last_timeout,
+                timeout_value=timeout_value,
                 team_value=team_val,
                 baselines=baselines,
                 memory_h=memory_h,
                 memory_c=memory_c,
+                critic_memory_h=critic_memory_h,
+                critic_memory_c=critic_memory_c,
+                baseline_memory_h=baseline_memory_h,
+                baseline_memory_c=baseline_memory_c,
             )
 
             # ── episode reward tracking ───────────────────────────
@@ -520,13 +608,23 @@ class POCATrainer:
                 ).reshape(-1)
                 self.actor_memory_h[:, done_agents, :] = 0.0
                 self.actor_memory_c[:, done_agents, :] = 0.0
+                self.critic_memory_h[:, done_mask, :] = 0.0
+                self.critic_memory_c[:, done_mask, :] = 0.0
+                self.baseline_memory_h[:, done_agents, :] = 0.0
+                self.baseline_memory_c[:, done_agents, :] = 0.0
 
             # Count agent-decisions (matching ML-Agents max_steps)
             self.global_step += self.num_envs * self.num_agents
 
         # ── bootstrap V for lambda-return (uses 5D STATE) ─────────
         last_state = self.unwrapped.get_critic_state()                # (E, N, 5)
-        last_tv = self.critic.critic_pass(last_state).squeeze(-1)
+        if self.recurrent:
+            last_tv = self.critic.critic_pass(
+                last_state,
+                (self.critic_memory_h, self.critic_memory_c),
+            ).squeeze(-1)
+        else:
+            last_tv = self.critic.critic_pass(last_state).squeeze(-1)
         self.buffer.compute_returns_and_advantages(last_tv)
 
         return obs_dict
@@ -539,37 +637,33 @@ class POCATrainer:
         obs = batch["obs"]
         critic_states = batch["critic_states"]
         actions = batch["actions"]
+        critic_actions = batch["critic_actions"]
         old_logp = batch["old_log_probs"]
         advantages = batch["advantages"]
         returns = batch["returns"]
         old_tv = batch["old_team_values"]
         old_bl = batch["old_baselines"]
 
-        MB, N = obs.shape[:2]
-        flat_obs = obs.reshape(-1, obs.shape[-1])
-        flat_act = actions.reshape(-1, actions.shape[-1])
-        flat_logp, flat_ent = self.actor.evaluate(flat_obs, flat_act)
-
-        new_logp_all = flat_logp.view(MB, N, -1)
-        ent_all = flat_ent.view(MB, N)
+        new_logp, entropy = self.actor.evaluate(obs, actions)
         policy_loss = trust_region_policy_loss(
-            advantages.unsqueeze(-1).reshape(-1, 1),
-            new_logp_all.reshape(-1, new_logp_all.shape[-1]),
-            old_logp.reshape(-1, old_logp.shape[-1]),
+            advantages.unsqueeze(-1),
+            new_logp,
+            old_logp,
             current_eps,
         )
-        mean_entropy = ent_all.mean()
+        mean_entropy = entropy.mean()
 
         new_tv = self.critic.critic_pass(critic_states).squeeze(-1)
-        critic_act = self._encode_actions_for_critic(actions)
-        new_bl = self.critic.all_baselines(critic_states, critic_act)
+        critic_act = self._encode_actions_for_critic(critic_actions)
+        all_baselines = self.critic.all_baselines(critic_states, critic_act)
+        batch_ids = torch.arange(obs.shape[0], device=obs.device)
+        new_bl = all_baselines[batch_ids, batch["focal_agent_ids"]]
 
         value_loss = trust_region_value_loss(new_tv, old_tv, returns, current_eps)
-        ret_expanded = returns.unsqueeze(-1).expand_as(new_bl)
         baseline_loss = trust_region_value_loss(
-            new_bl.reshape(-1),
-            old_bl.reshape(-1),
-            ret_expanded.reshape(-1),
+            new_bl,
+            old_bl,
+            returns,
             current_eps,
         )
         return policy_loss, value_loss, baseline_loss, mean_entropy
@@ -582,62 +676,82 @@ class POCATrainer:
         obs = batch["obs"]
         critic_states = batch["critic_states"]
         actions = batch["actions"]
+        critic_actions = batch["critic_actions"]
         old_logp = batch["old_log_probs"]
         advantages = batch["advantages"]
         returns = batch["returns"]
         old_tv = batch["old_team_values"]
         old_bl = batch["old_baselines"]
+        loss_mask = batch["loss_mask"].bool()
 
-        B, L, N = obs.shape[:3]
-        obs_seq = obs.permute(0, 2, 1, 3).reshape(B * N, L, obs.shape[-1])
-        act_seq = actions.permute(0, 2, 1, 3).reshape(B * N, L, actions.shape[-1])
-        h0 = batch["memory_h"].reshape(B * N, -1).unsqueeze(0).detach()
-        c0 = batch["memory_c"].reshape(B * N, -1).unsqueeze(0).detach()
+        B, L = obs.shape[:2]
+        N = critic_states.shape[2]
+        h0 = batch["memory_h"].unsqueeze(0).detach()
+        c0 = batch["memory_c"].unsqueeze(0).detach()
         state = (h0, c0)
         logps = []
         ents = []
         for t in range(L):
-            logits, state = self.actor.step(obs_seq[:, t], state)
+            logits, state = self.actor.step(obs[:, t], state)
             dist = torch.distributions.Categorical(logits=logits)
-            act_t = act_seq[:, t].squeeze(-1).long()
+            act_t = actions[:, t].squeeze(-1).long()
             logps.append(dist.log_prob(act_t).unsqueeze(-1))
             ents.append(dist.entropy())
             if t < L - 1:
-                keep = (1.0 - batch["dones"][:, t]).repeat_interleave(N)
-                keep = keep.view(1, B * N, 1)
+                keep = (1.0 - batch["dones"][:, t]).view(1, B, 1)
                 state = (state[0] * keep, state[1] * keep)
         logp_seq = torch.stack(logps, dim=1)
         ent_seq = torch.stack(ents, dim=1)
 
-        new_logp_all = logp_seq.view(B, N, L, -1).permute(0, 2, 1, 3)
-        ent_all = ent_seq.view(B, N, L).permute(0, 2, 1)
         policy_loss = trust_region_policy_loss(
             advantages.unsqueeze(-1).reshape(-1, 1),
-            new_logp_all.reshape(-1, new_logp_all.shape[-1]),
+            logp_seq.reshape(-1, logp_seq.shape[-1]),
             old_logp.reshape(-1, old_logp.shape[-1]),
             current_eps,
+            loss_mask.reshape(-1),
         )
-        mean_entropy = ent_all.mean()
+        mean_entropy = (
+            ent_seq * loss_mask
+        ).sum() / loss_mask.sum().clamp_min(1)
 
         flat_states = critic_states.reshape(B * L, N, critic_states.shape[-1])
-        flat_actions = actions.reshape(B * L, N, actions.shape[-1])
+        flat_actions = critic_actions.reshape(B * L, N, critic_actions.shape[-1])
         flat_returns = returns.reshape(B * L)
         flat_old_tv = old_tv.reshape(B * L)
-        flat_old_bl = old_bl.reshape(B * L, N)
+        flat_old_bl = old_bl.reshape(B * L)
 
-        new_tv = self.critic.critic_pass(flat_states).squeeze(-1)
         critic_act = self._encode_actions_for_critic(flat_actions)
-        new_bl = self.critic.all_baselines(flat_states, critic_act)
+        focal_ids = batch["focal_agent_ids"].unsqueeze(1).expand(B, L).reshape(-1)
+        new_tv = self.critic.critic_pass(
+            flat_states,
+            (
+                batch["critic_memory_h"].unsqueeze(0).detach(),
+                batch["critic_memory_c"].unsqueeze(0).detach(),
+            ),
+            sequence_length=L,
+        ).squeeze(-1)
+        new_bl = self.critic.focal_baselines(
+            flat_states,
+            critic_act,
+            focal_ids,
+            (
+                batch["baseline_memory_h"].unsqueeze(0).detach(),
+                batch["baseline_memory_c"].unsqueeze(0).detach(),
+            ),
+            sequence_length=L,
+        ).squeeze(-1)
+
+        flat_mask = loss_mask.reshape(B * L)
 
         value_loss = trust_region_value_loss(
-            new_tv, flat_old_tv, flat_returns, current_eps,
+            new_tv, flat_old_tv, flat_returns, current_eps, flat_mask,
         )
-        ret_expanded = flat_returns.unsqueeze(-1).expand_as(new_bl)
         baseline_loss = trust_region_value_loss(
-            new_bl.reshape(-1),
-            flat_old_bl.reshape(-1),
-            ret_expanded.reshape(-1),
+            new_bl,
+            flat_old_bl,
+            flat_returns,
             current_eps,
+            flat_mask,
         )
         return policy_loss, value_loss, baseline_loss, mean_entropy
 
@@ -660,35 +774,24 @@ class POCATrainer:
         total_ent = 0.0
         n_updates = 0
 
-        # Compute group mini-batch size to match ML-Agents' batches-per-epoch.
-        # ML-Agents: batches_per_epoch = buffer_size / batch_size = 20480/2048 = 10.
-        # Our buffer has T*E group entries (each containing N agents).
-        # We derive group_mb so get_batches yields the same number of
-        # batches per epoch as ML-Agents, giving identical gradient-update count.
-        T_E = self.buffer.horizon * self.buffer.num_envs
-        if cfg.buffer_size_hint > 0 and cfg.mini_batch_size > 0:
-            bpe = max(1, cfg.buffer_size_hint // cfg.mini_batch_size)
-            group_mb = max(1, T_E // bpe)
-        else:
-            # Fallback: treat mini_batch_size as group entries directly
-            group_mb = cfg.mini_batch_size
-
         # ── Normalize advantages (matching ML-Agents on_policy_trainer._update_policy) ──
         # ML-Agents normalizes advantages to mean=0, std=1 BEFORE the epoch loop.
         # Without this, raw advantage magnitudes vary wildly, destabilizing
         # the policy gradient and causing premature convergence.
-        all_adv = self.buffer.advantages
+        all_adv = self.buffer.advantages[:self.buffer.ptr]
         adv_mean = all_adv.mean()
-        adv_std = all_adv.std()
-        self.buffer.advantages = (all_adv - adv_mean) / (adv_std + 1e-10)
+        adv_std = all_adv.std(unbiased=False)
+        self.buffer.advantages[:self.buffer.ptr] = (
+            all_adv - adv_mean
+        ) / (adv_std + 1e-10)
 
         for _epoch in range(cfg.num_epochs):
             if self.recurrent:
                 batch_iter = self.buffer.get_sequence_batches(
-                    cfg.sequence_length, group_mb,
+                    cfg.sequence_length, cfg.mini_batch_size,
                 )
             else:
-                batch_iter = self.buffer.get_batches(group_mb)
+                batch_iter = self.buffer.get_batches(cfg.mini_batch_size)
 
             for batch in batch_iter:
                 if self.recurrent:
@@ -700,81 +803,6 @@ class POCATrainer:
                         self._compute_feedforward_losses(batch, current_eps)
                     )
 
-                loss = (
-                    policy_loss
-                    + 0.5 * (value_loss + 0.5 * baseline_loss)
-                    - current_beta * mean_entropy
-                )
-
-                self.optimizer.zero_grad()
-                loss.backward()
-                # NOTE: ML-Agents does NOT clip gradients for POCA
-                self.optimizer.step()
-
-                total_pol += policy_loss.item()
-                total_val += value_loss.item()
-                total_bl += baseline_loss.item()
-                total_ent += mean_entropy.item()
-                n_updates += 1
-                continue
-
-                obs = batch["obs"]                  # (MB, N, obs)
-                critic_states = batch["critic_states"]  # (MB, N, 5)
-                actions = batch["actions"]          # (MB, N, act)
-                old_logp = batch["old_log_probs"]   # (MB, N, act_dim) per-dim!
-                advantages = batch["advantages"]    # (MB, N)
-                returns = batch["returns"]          # (MB,)
-                old_tv = batch["old_team_values"]   # (MB,)
-                old_bl = batch["old_baselines"]     # (MB, N)
-
-                MB, N = obs.shape[:2]
-
-                # ── policy loss (batched over all agents, shared actor) ─
-                # Actor uses LOCAL obs only (no global state)
-                flat_obs = obs.reshape(-1, obs.shape[-1])              # (MB*N, obs)
-                flat_act = actions.reshape(-1, actions.shape[-1])      # (MB*N, act_dim)
-                flat_logp, flat_ent = self.actor.evaluate(flat_obs, flat_act)
-                # flat_logp: (MB*N, act_dim), flat_ent: (MB*N,)
-
-                # Reshape back to (MB, N, act_dim) and (MB, N)
-                new_logp_all = flat_logp.view(MB, N, -1)              # (MB, N, act_dim)
-                ent_all = flat_ent.view(MB, N)                        # (MB, N)
-
-                # Per-dim advantage broadcast: (MB, N) → (MB, N, 1)
-                adv_expanded = advantages.unsqueeze(-1)               # (MB, N, 1)
-
-                # Per-dim trust-region policy loss (vectorized over agents)
-                # Flatten agent dim into batch: (MB*N, act_dim)
-                flat_adv = adv_expanded.reshape(-1, 1)
-                flat_new_logp = new_logp_all.reshape(-1, new_logp_all.shape[-1])
-                flat_old_logp = old_logp.reshape(-1, old_logp.shape[-1])
-                policy_loss = trust_region_policy_loss(
-                    flat_adv, flat_new_logp, flat_old_logp, current_eps,
-                )
-                mean_entropy = ent_all.mean()
-
-                # ── critic: recompute V and baselines (use 5D STATE) ─
-                new_tv = self.critic.critic_pass(critic_states).squeeze(-1)  # (MB,)
-                critic_act = self._encode_actions_for_critic(actions)
-                new_bl = self.critic.all_baselines(critic_states, critic_act)  # (MB, N)
-
-                # ── value loss (trust-region clipped) ─────────────
-                value_loss = trust_region_value_loss(
-                    new_tv, old_tv, returns, current_eps,
-                )
-
-                # ── baseline loss (trust-region clipped) ──────────
-                # Returns are broadcast to per-agent
-                ret_expanded = returns.unsqueeze(-1).expand_as(new_bl)
-                old_bl_flat = old_bl.reshape(-1)
-                new_bl_flat = new_bl.reshape(-1)
-                ret_flat = ret_expanded.reshape(-1)
-                baseline_loss = trust_region_value_loss(
-                    new_bl_flat, old_bl_flat, ret_flat, current_eps,
-                )
-
-                # ── total loss  (matches ML-Agents exactly) ──────
-                # loss = policy + 0.5*(value + 0.5*baseline) − β*entropy
                 loss = (
                     policy_loss
                     + 0.5 * (value_loss + 0.5 * baseline_loss)
@@ -829,8 +857,36 @@ class POCATrainer:
         while self.global_step < self.cfg.total_timesteps:
             prev_step = self.global_step
 
-            # 1. collect rollout
-            obs_dict = self.collect_rollout(obs_dict)
+            # Collect complete ML-Agents-style trajectories. Trajectories end
+            # at time_horizon or at the synchronous episode boundary; updates
+            # begin only once their focal-agent experiences exceed buffer_size.
+            self.buffer.reset()
+            while self.global_step < self.cfg.total_timesteps:
+                remaining = self.cfg.total_timesteps - self.global_step
+                agent_steps_per_env_step = self.num_envs * self.num_agents
+                remaining_steps = max(
+                    1,
+                    (remaining + agent_steps_per_env_step - 1) // agent_steps_per_env_step,
+                )
+                episode_step = int(self.unwrapped.episode_length_buf.max().item())
+                episode_steps_left = max(
+                    1,
+                    (self.unwrapped.max_episode_length - episode_step + self.decision_period - 1)
+                    // self.decision_period,
+                )
+                rollout_steps = min(
+                    self.cfg.horizon,
+                    remaining_steps,
+                    episode_steps_left,
+                )
+                obs_dict = self.collect_rollout(
+                    obs_dict,
+                    rollout_steps,
+                    reset_buffer=False,
+                )
+                experiences = self.buffer.ptr * agent_steps_per_env_step
+                if experiences > self.cfg.buffer_size_hint:
+                    break
 
             # 2. update
             metrics = self.update()
@@ -840,7 +896,7 @@ class POCATrainer:
             elapsed = time.time() - start_time
             sps = self.global_step / elapsed if elapsed > 0 else 0
 
-            pbar.update(step_delta)
+            pbar.update(min(step_delta, max(0, self.cfg.total_timesteps - pbar.n)))
             pbar.set_postfix(
                 upd=self.update_count,
                 pg=f"{metrics['policy_loss']:.3f}",
@@ -852,7 +908,7 @@ class POCATrainer:
 
             # 4. Accumulate rollout reward history (always, for rolling avg)
             mean_rollout_reward = (
-                self.buffer.rewards.sum(dim=0).mean().item()
+                self.buffer.rewards[:self.buffer.ptr].sum(dim=0).mean().item()
             )
             self._rollout_reward_history.append(mean_rollout_reward)
             if len(self._rollout_reward_history) > self._max_history:
@@ -903,7 +959,7 @@ class POCATrainer:
                 # rollout (ML-Agents logs this as the mean reward
                 # received per agent-decision across the buffer)
                 mean_step_reward = (
-                    self.buffer.rewards.mean().item()
+                    self.buffer.rewards[:self.buffer.ptr].mean().item()
                 )
                 self.writer.add_scalar(
                     "Policy/Extrinsic Reward",
@@ -912,7 +968,7 @@ class POCATrainer:
                 # Extrinsic Value Estimate = mean V(s) prediction
                 self.writer.add_scalar(
                     "Policy/Extrinsic Value Estimate",
-                    self.buffer.team_values.mean().item(), s)
+                    self.buffer.team_values[:self.buffer.ptr].mean().item(), s)
 
                 # ── Environment (ML-Agents: Environment/*) ────────
                 if self._completed_episode_returns:
@@ -947,7 +1003,7 @@ class POCATrainer:
                     rolling_avg, s)
                 self.writer.add_scalar(
                     "Extra/Mean Abs Advantage",
-                    self.buffer.advantages.abs().mean().item(), s)
+                    self.buffer.advantages[:self.buffer.ptr].abs().mean().item(), s)
 
                 # Group reward (gate crossings — mission-specific)
                 if self._completed_group_rewards:
@@ -971,7 +1027,7 @@ class POCATrainer:
         self.writer.close()
         self.save_checkpoint(ckpt_dir / "poca_final.pt")
         elapsed = time.time() - start_time
-        print(f"[POCA] Done — {self.global_step:,} steps in {elapsed:.0f}s "
+        print(f"[POCA] Done - {self.global_step:,} steps in {elapsed:.0f}s "
               f"({self.global_step / elapsed:.0f} SPS)")
 
     # ──────────────────────────────────────────────────────────────
@@ -980,33 +1036,55 @@ class POCATrainer:
 
     def save_checkpoint(self, path):
         torch.save({
+            "paper_parity_version": 3,
             "actor": self.actor.state_dict(),
             "critic": self.critic.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "global_step": self.global_step,
             "update_count": self.update_count,
+            "seed": self.cfg.seed,
             # Save architecture for correct restoration in play
             "hidden_dim": getattr(self.cfg, "hidden_dim", 256),
             "num_layers": getattr(self.cfg, "num_layers", 2),
             "recurrent": self.recurrent,
             "memory_size": getattr(self.cfg, "memory_size", 0),
+            "memory_size_semantics": "mlagents_total",
+            "lstm_hidden_size": self.actor.hidden_size if self.recurrent else 0,
             "sequence_length": getattr(self.cfg, "sequence_length", 0),
+            "critic_hidden_dim": self.cfg.critic_hidden_dim,
+            "critic_num_layers": self.cfg.critic_num_layers,
+            "critic_num_heads": self.cfg.critic_num_heads,
+            "decision_period": self.decision_period,
             "discrete": self.discrete,
             "num_actions": self.num_actions if self.discrete else 0,
             "act_dim": self.act_dim,
             "state_dim": self.state_dim,
             "obs_dim": self.obs_dim,
         }, path)
-        print(f"[POCA] Saved → {path}")
+        print(f"[POCA] Saved -> {path}")
 
     def load_checkpoint(self, path):
         ckpt = torch.load(path, map_location=self.device)
-        self.actor.load_state_dict(ckpt["actor"])
-        self.critic.load_state_dict(ckpt["critic"])
-        self.optimizer.load_state_dict(ckpt["optimizer"])
+        parity_version = int(ckpt.get("paper_parity_version", 0))
+        if parity_version != 3:
+            raise RuntimeError(
+                "Refusing to resume a pre-parity checkpoint. Its rollout cadence, "
+                "entropy objective, critic state, or recurrent layout may differ. "
+                "Use it only for legacy evaluation and start paper-parity training fresh."
+            )
+        try:
+            self.actor.load_state_dict(ckpt["actor"])
+            self.critic.load_state_dict(ckpt["critic"])
+            self.optimizer.load_state_dict(ckpt["optimizer"])
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "Checkpoint architecture does not match the paper-parity trainer. "
+                "Legacy checkpoints can still be evaluated, but training must start "
+                "fresh after the fixed-critic revision."
+            ) from exc
         self.global_step = ckpt["global_step"]
         self.update_count = ckpt["update_count"]
-        print(f"[POCA] Loaded ← {path}  (step {self.global_step})")
+        print(f"[POCA] Loaded <- {path}  (step {self.global_step})")
 
     def _manage_checkpoints(self, ckpt_dir: Path):
         """Keep only the *keep_checkpoints* most recent numbered checkpoints."""
@@ -1022,4 +1100,4 @@ class POCATrainer:
         while len(numbered) > keep:
             old = numbered.pop(0)
             old.unlink()
-            print(f"[POCA] Removed old checkpoint → {old.name}")
+            print(f"[POCA] Removed old checkpoint -> {old.name}")

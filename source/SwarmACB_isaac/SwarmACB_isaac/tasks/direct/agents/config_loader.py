@@ -58,6 +58,7 @@ def load_config(path: str | Path) -> tuple[str, str, Any, dict[str, Any]]:
     trainer_type = block.get("trainer_type", "poca").lower()
     hypers = block.get("hyperparameters", {})
     network = block.get("network_settings", {})
+    critic = block.get("critic_settings", {})
     reward = block.get("reward_signals", {})
     environment = block.get("environment", {})
     task_id = block.get("task", environment.get("task", None))
@@ -98,6 +99,9 @@ def load_config(path: str | Path) -> tuple[str, str, Any, dict[str, Any]]:
     # Network
     cfg.hidden_dim = network.get("hidden_units", cfg.hidden_dim)
     cfg.num_layers = network.get("num_layers", cfg.num_layers)
+    cfg.critic_hidden_dim = critic.get("hidden_units", cfg.critic_hidden_dim)
+    cfg.critic_num_layers = critic.get("num_layers", cfg.critic_num_layers)
+    cfg.critic_num_heads = critic.get("num_heads", cfg.critic_num_heads)
     if hasattr(cfg, "num_options"):
         cfg.num_options = network.get("num_options", block.get("num_options", cfg.num_options))
     memory = network.get("memory", {})
@@ -118,7 +122,7 @@ def load_config(path: str | Path) -> tuple[str, str, Any, dict[str, Any]]:
     cfg.checkpoint_interval = block.get("checkpoint_interval", 120000)
     cfg.keep_checkpoints = block.get("keep_checkpoints", 5)
 
-    # buffer_size hint  (for reference / validation logging only)
+    # ML-Agents update-buffer threshold.
     cfg.buffer_size_hint = hypers.get("buffer_size", 0)
 
     # Environment
@@ -174,13 +178,19 @@ def print_config(run_name: str, variant: str, cfg: Any, env_ov: dict):
     print(f"  Network")
     print(f"    hidden_units        : {cfg.hidden_dim}")
     print(f"    num_layers          : {cfg.num_layers}")
+    print(f"    critic_hidden       : {cfg.critic_hidden_dim}")
+    print(f"    critic_layers       : {cfg.critic_num_layers}")
+    print(f"    critic_heads        : {cfg.critic_num_heads}")
     if hasattr(cfg, "num_options"):
         print(f"    fixed_options       : {cfg.num_options}")
     if cfg.recurrent:
-        print(f"    memory_size         : {cfg.memory_size}")
+        print(f"    memory_size         : {cfg.memory_size} ({cfg.memory_size // 2} LSTM units)")
         print(f"    sequence_length     : {cfg.sequence_length}")
     print(f"  Training")
+    print(f"    seed                 : {cfg.seed}")
     print(f"    max_steps           : {cfg.total_timesteps:,}")
+    if cfg.buffer_size_hint:
+        print(f"    buffer_size         : {cfg.buffer_size_hint:,} (ML-Agents reference target)")
     print(f"    time_horizon        : {cfg.horizon}")
     print(f"    decision_period     : {cfg.decision_period}")
     print(f"    checkpoint_interval : {cfg.checkpoint_interval:,}")

@@ -55,6 +55,8 @@ parser.add_argument("--log_dir", type=str, default=None,
                     help="TensorBoard log directory override")
 parser.add_argument("--checkpoint_dir", type=str, default=None,
                     help="Checkpoint save directory override")
+parser.add_argument("--seed", type=int, default=None,
+                    help="Random seed; HPC arrays use their task index")
 
 # AppLauncher adds its own args (--headless, --device, etc.)
 AppLauncher.add_app_launcher_args(parser)
@@ -68,8 +70,11 @@ simulation_app = app_launcher.app
 # ── Now safe to import Isaac Lab packages ─────────────────────────
 
 import importlib
+import random
 
 import gymnasium as gym
+import numpy as np
+import torch
 
 # Trigger task registration
 import SwarmACB_isaac.tasks  # noqa: F401
@@ -139,15 +144,24 @@ def main():
         cfg.log_dir = args.log_dir
     if args.checkpoint_dir is not None:
         cfg.checkpoint_dir = args.checkpoint_dir
+    if args.seed is not None:
+        cfg.seed = args.seed
     if args.num_envs is not None:
         env_overrides["num_envs"] = args.num_envs
     task_id = args.task or env_overrides.pop("task", None) or "SwarmACB-DirectionalGate-v0"
+
+    random.seed(cfg.seed)
+    np.random.seed(cfg.seed)
+    torch.manual_seed(cfg.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(cfg.seed)
 
     # ── Print resolved config ─────────────────────────────────────
     print_config(run_name, variant, cfg, env_overrides)
 
     # ── Build env config and apply overrides BEFORE gym.make ─────
     env_cfg = _resolve_env_cfg(task_id)
+    env_cfg.seed = cfg.seed
 
     if hasattr(env_cfg, "update_variant"):
         env_cfg.update_variant(variant)

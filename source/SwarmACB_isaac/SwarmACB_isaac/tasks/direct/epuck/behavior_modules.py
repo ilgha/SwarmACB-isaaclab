@@ -183,6 +183,8 @@ class BehaviorModules:
         light_angle: torch.Tensor,         # (E, N)  aggregated light angle (body frame)
         rab_vec_x: torch.Tensor,           # (E, N)  alpha-weighted RAB vector x (body frame)
         rab_vec_y: torch.Tensor,           # (E, N)  alpha-weighted RAB vector y (body frame)
+        previous_left: torch.Tensor | None = None,
+        previous_right: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Execute the selected behaviour module for each agent (vectorized dispatch).
 
@@ -198,6 +200,10 @@ class BehaviorModules:
 
         left = torch.zeros(E, N, device=device)
         right = torch.zeros(E, N, device=device)
+        if previous_left is None:
+            previous_left = left
+        if previous_right is None:
+            previous_right = right
 
         # Compute wheel velocities for all modules, then scatter by mask
         for mod_id in range(6):
@@ -213,10 +219,12 @@ class BehaviorModules:
             elif mod_id == BehaviorID.PHOTOTAXIS:
                 lv, rv = self._phototaxis(
                     light_value, light_angle, prox_value, prox_angle, mask,
+                    previous_left, previous_right,
                 )
             elif mod_id == BehaviorID.ANTI_PHOTOTAXIS:
                 lv, rv = self._anti_phototaxis(
                     light_value, light_angle, prox_value, prox_angle, mask,
+                    previous_left, previous_right,
                 )
             elif mod_id == BehaviorID.ATTRACTION:
                 lv, rv = self._attraction(
@@ -283,8 +291,9 @@ class BehaviorModules:
         steps = self._explore_steps
         adir = self._explore_dir
 
-        # --- RANDOM_WALK agents: check for obstacles ---
+        # Outputs are determined by the state at entry, matching the C# switch.
         walking = (state == 0) & active_mask
+        was_avoiding = (state == 1) & active_mask
         trigger = walking & self._is_obstacle_in_front(prox_value, prox_angle)
 
         if trigger.any():
@@ -301,10 +310,9 @@ class BehaviorModules:
                 state,
             )
 
-        # --- OBSTACLE_AVOIDANCE agents: rotate in place ---
-        avoiding = (state == 1) & active_mask
-        steps = torch.where(avoiding, steps - 1, steps)
-        done_avoiding = avoiding & (steps <= 0)
+        # Existing avoidance turns decrement after producing this tick's turn.
+        steps = torch.where(was_avoiding, steps - 1, steps)
+        done_avoiding = was_avoiding & (steps <= 0)
         state = torch.where(
             done_avoiding,
             torch.zeros(E, N, device=device, dtype=torch.long),
@@ -322,9 +330,8 @@ class BehaviorModules:
         lv_avoid = adir * ms
         rv_avoid = -adir * ms
 
-        is_avoiding = (state == 1) & active_mask
-        lv = torch.where(is_avoiding, lv_avoid, lv_walk)
-        rv = torch.where(is_avoiding, rv_avoid, rv_walk)
+        lv = torch.where(was_avoiding, lv_avoid, lv_walk)
+        rv = torch.where(was_avoiding, rv_avoid, rv_walk)
 
         # Save state
         self._explore_state = state
@@ -341,7 +348,13 @@ class BehaviorModules:
         avoiding: torch.Tensor,      # (E, N) bool — current avoidance state
         turn_steps: torch.Tensor,    # (E, N) long — remaining turn steps
         turn_dir: torch.Tensor,      # (E, N) float — +1 or -1
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         """State-machine obstacle avoidance used by phototaxis & anti-phototaxis.
 
         Matches Unity BehaviorState pattern (m_sPhototaxisState, m_sAntiPhotoState).
@@ -350,19 +363,20 @@ class BehaviorModules:
             avoiding:   updated bool mask
             turn_steps: updated step counter
             turn_dir:   updated direction
-            is_turning: (E, N) bool — True if this agent is currently doing avoidance turn
+            was_turning: (E, N) bool — turn output for this control cycle
+            triggered:   (E, N) bool — entered avoidance without changing wheels
         """
         E, N = prox_value.shape
         device = prox_value.device
 
         # --- Currently avoiding: decrement steps ---
-        currently_avoiding = avoiding & active_mask
-        turn_steps = torch.where(currently_avoiding, turn_steps - 1, turn_steps)
-        done = currently_avoiding & (turn_steps <= 0)
+        was_avoiding = avoiding & active_mask
+        turn_steps = torch.where(was_avoiding, turn_steps - 1, turn_steps)
+        done = was_avoiding & (turn_steps <= 0)
         avoiding = torch.where(done, torch.zeros_like(avoiding), avoiding)
 
-        # --- Not avoiding: check for new obstacle ---
-        not_avoiding = ~avoiding & active_mask
+        # C# executes this branch only if avoidance was false on function entry.
+        not_avoiding = ~was_avoiding & ~avoiding & active_mask
         obstacle = self._is_obstacle_in_front(prox_value, prox_angle)
         trigger = not_avoiding & obstacle
 
@@ -376,8 +390,7 @@ class BehaviorModules:
             turn_steps = torch.where(trigger, dur, turn_steps)
             avoiding = torch.where(trigger, torch.ones_like(avoiding), avoiding)
 
-        is_turning = avoiding & active_mask
-        return avoiding, turn_steps, turn_dir, is_turning
+        return avoiding, turn_steps, turn_dir, was_avoiding, trigger
 
     def _phototaxis(
         self,
@@ -386,6 +399,8 @@ class BehaviorModules:
         prox_value: torch.Tensor,
         prox_angle: torch.Tensor,
         active_mask: torch.Tensor,
+        previous_left: torch.Tensor,
+        previous_right: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Move toward light, with state-machine obstacle avoidance.
 
@@ -399,7 +414,13 @@ class BehaviorModules:
         ms = self.max_speed
 
         # Update phototaxis avoidance state machine
-        self._photo_avoiding, self._photo_steps, self._photo_dir, is_turning = \
+        (
+            self._photo_avoiding,
+            self._photo_steps,
+            self._photo_dir,
+            was_turning,
+            triggered,
+        ) = \
             self._behavior_state_avoidance(
                 prox_value, prox_angle, active_mask,
                 self._photo_avoiding, self._photo_steps, self._photo_dir,
@@ -429,8 +450,10 @@ class BehaviorModules:
         lv_steer, rv_steer = compute_wheels_from_vector(rx, ry, ms)
 
         # Select: turning agents use turn wheels, others use steering
-        lv = torch.where(is_turning, lv_turn, lv_steer)
-        rv = torch.where(is_turning, rv_turn, rv_steer)
+        lv = torch.where(was_turning, lv_turn, lv_steer)
+        rv = torch.where(was_turning, rv_turn, rv_steer)
+        lv = torch.where(triggered, previous_left, lv)
+        rv = torch.where(triggered, previous_right, rv)
         return lv, rv
 
     def _anti_phototaxis(
@@ -440,6 +463,8 @@ class BehaviorModules:
         prox_value: torch.Tensor,
         prox_angle: torch.Tensor,
         active_mask: torch.Tensor,
+        previous_left: torch.Tensor,
+        previous_right: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Move away from light, with state-machine obstacle avoidance.
 
@@ -451,7 +476,13 @@ class BehaviorModules:
         ms = self.max_speed
 
         # Update anti-phototaxis avoidance state machine
-        self._antiphoto_avoiding, self._antiphoto_steps, self._antiphoto_dir, is_turning = \
+        (
+            self._antiphoto_avoiding,
+            self._antiphoto_steps,
+            self._antiphoto_dir,
+            was_turning,
+            triggered,
+        ) = \
             self._behavior_state_avoidance(
                 prox_value, prox_angle, active_mask,
                 self._antiphoto_avoiding, self._antiphoto_steps, self._antiphoto_dir,
@@ -478,8 +509,10 @@ class BehaviorModules:
 
         lv_steer, rv_steer = compute_wheels_from_vector(rx, ry, ms)
 
-        lv = torch.where(is_turning, lv_turn, lv_steer)
-        rv = torch.where(is_turning, rv_turn, rv_steer)
+        lv = torch.where(was_turning, lv_turn, lv_steer)
+        rv = torch.where(was_turning, rv_turn, rv_steer)
+        lv = torch.where(triggered, previous_left, lv)
+        rv = torch.where(triggered, previous_right, rv)
         return lv, rv
 
     def _attraction(

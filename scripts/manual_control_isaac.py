@@ -35,7 +35,12 @@ import argparse
 
 # ── Isaac Lab bootstrap (MUST happen before other Isaac Lab imports) ──
 from isaaclab.app import AppLauncher
-from _isaac_launch import apply_windows_kit_defaults
+from _isaac_launch import (
+    add_gui_performance_args,
+    apply_gui_performance_defaults,
+    apply_runtime_gui_performance_settings,
+    apply_windows_kit_defaults,
+)
 
 TASK_CHOICES = [
     "SwarmACB-DirectionalGate-v0",
@@ -90,6 +95,8 @@ parser.add_argument("--variant", type=str, default=None,
                     help="CASA variant override for policy playback")
 parser.add_argument("--deterministic", action="store_true",
                     help="Use deterministic policy actions during checkpoint playback")
+parser.add_argument("--seed", type=int, default=0,
+                    help="Robot spawn and policy sampling seed")
 parser.add_argument("--show-sensors", action="store_true",
                     help="Draw live sensor range/debug markers in the Isaac viewport")
 parser.add_argument("--sensor-robot", type=int, default=0,
@@ -101,9 +108,15 @@ parser.add_argument("--debug-keys", action="store_true",
 parser.add_argument("--keymap", type=str, default="azerty-physical",
                     choices=["azerty-physical", "logical"],
                     help="Keyboard mapping. azerty-physical handles Isaac's QWERTY-like raw key names on AZERTY hardware")
+parser.add_argument("--status-interval", type=float, default=1.0,
+                    help="Seconds between live terminal/HUD updates; <=0 disables live status")
+parser.add_argument("--no-editor-hud", action="store_true",
+                    help="Disable the small Isaac editor playback status window")
+add_gui_performance_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 apply_windows_kit_defaults(args, "ManualIsaac")
+apply_gui_performance_defaults(args, "ManualIsaac")
 
 if getattr(args, "headless", False) and not args.no_keyboard:
     print("[ManualIsaac] Headless mode has no app window; enabling --no-keyboard.", flush=True)
@@ -112,11 +125,13 @@ if getattr(args, "headless", False) and not args.no_keyboard:
 print("[ManualIsaac] Launching Isaac Sim app...", flush=True)
 app_launcher = AppLauncher(args)
 simulation_app = app_launcher.app
+apply_runtime_gui_performance_settings(args, "ManualIsaac")
 print("[ManualIsaac] Isaac Sim app launched.", flush=True)
 
 # ── Now safe to import Isaac Lab & Omni packages ─────────────────────
 
 import math
+import random
 import weakref
 
 import carb
@@ -128,28 +143,58 @@ from pxr import Gf, UsdGeom, Vt
 
 import isaaclab.sim as sim_utils
 from isaaclab.markers import VisualizationMarkersCfg, VisualizationMarkers
-from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaacsim.core.api.simulation_context import SimulationContext
 
 # ── Import env components (bypass package chain) ────────────────────
+def _format_duration(seconds: float) -> str:
+    seconds = max(0, int(math.ceil(seconds)))
+    minutes, sec = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{sec:02d}"
+    return f"{minutes:02d}:{sec:02d}"
+
+
+class _PlaybackStatusHud:
+    """Small Isaac editor window for live viewer status."""
+
+    def __init__(self, enabled: bool):
+        self._label = None
+        self._window = None
+        if not enabled:
+            return
+        try:
+            import omni.ui as ui
+
+            self._window = ui.Window("SwarmACB Playback", width=360, height=132)
+            with self._window.frame:
+                with ui.VStack(spacing=4):
+                    ui.Label("SwarmACB Playback", height=22)
+                    self._label = ui.Label("", word_wrap=True)
+        except Exception as exc:
+            print(f"[ManualIsaac] Warning: could not create editor HUD: {exc}", flush=True)
+
+    def update(self, text: str):
+        if self._label is not None:
+            self._label.text = text
+
+
 import sys, os
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
-_EPUCK_DIR = os.path.join(
-    _PROJECT_ROOT, "source", "SwarmACB_isaac", "SwarmACB_isaac",
-    "tasks", "direct", "epuck",
-)
-_AGENTS_DIR = os.path.join(
-    _PROJECT_ROOT, "source", "SwarmACB_isaac", "SwarmACB_isaac",
-    "tasks", "direct", "agents",
-)
-for _path in (_EPUCK_DIR, _AGENTS_DIR):
-    if _path not in sys.path:
-        sys.path.insert(0, _path)
+_SOURCE_ROOT = os.path.join(_PROJECT_ROOT, "source", "SwarmACB_isaac")
+if _SOURCE_ROOT not in sys.path:
+    sys.path.insert(0, _SOURCE_ROOT)
 
-from epuck_sensors import EpuckSensors
-from behavior_modules import BehaviorModules
-from poca_networks import Actor, DiscreteActor, RecurrentDiscreteActor
+from SwarmACB_isaac.tasks.direct.epuck.epuck_sensors import EpuckSensors
+from SwarmACB_isaac.tasks.direct.epuck.behavior_modules import BehaviorModules
+from SwarmACB_isaac.tasks.direct.agents.poca_networks import (
+    Actor,
+    DiscreteActor,
+    RecurrentDiscreteActor,
+    checkpoint_memory_size,
+)
+from SwarmACB_isaac.tasks.direct.agents.option_critic_networks import FixedOptionManager
 
 
 # =====================================================================
@@ -182,6 +227,10 @@ class StandaloneDGTEnv:
         self.robot_radius = 0.035
         self.max_speed = 0.16
         self.wheelbase = 0.055
+        self.collision_solver_iterations = 4
+        self.wall_contact_epsilon = 1e-4
+        self.arena_wall_thickness = 0.01
+        self.internal_wall_thickness = 0.01
         self.dt = dt
         self.episode_length_s = _mission_length_s(self.mission)
         self.episode_steps = int(round(self.episode_length_s / self.dt))
@@ -324,6 +373,7 @@ class StandaloneDGTEnv:
         if self.mission == "homing":
             self.pos[0, :, 1] = self.pos[0, :, 1].abs()
         self.yaw[0] = torch.rand(self.N) * 2 * math.pi - math.pi
+        self._resolve_collisions()
         self.prev_y[0] = self.pos[0, :, 1]
         self.prev_ground_color = self._ground_scalar(self.pos[0]).unsqueeze(0)
         self.step_reward = 0.0
@@ -339,6 +389,7 @@ class StandaloneDGTEnv:
     def step(self, left_vel, right_vel):
         lv = left_vel.clamp(-self.max_speed, self.max_speed)
         rv = right_vel.clamp(-self.max_speed, self.max_speed)
+        prev_pos = self.pos.clone()
         dx, dy, dyaw = EpuckSensors.differential_drive(
             lv, rv, self.yaw, self.wheelbase, self.dt,
         )
@@ -349,6 +400,7 @@ class StandaloneDGTEnv:
         self._resolve_walls()
         self._resolve_gate_walls()
         self._resolve_robots()
+        self._resolve_collisions(prev_pos)
 
         if self.mission == "xor":
             in_targets = self._target_membership(self.pos[0])
@@ -500,6 +552,158 @@ class StandaloneDGTEnv:
         s = self._ground_scalar(pos[0])
         return s.unsqueeze(0).unsqueeze(-1).expand(1, -1, 3)
 
+    def _resolve_collisions(self, prev_pos: torch.Tensor | None = None):
+        self._resolve_walls()
+        if prev_pos is not None:
+            self._prevent_internal_wall_crossing(prev_pos)
+        self._resolve_internal_wall_capsules(prev_pos)
+        self._resolve_gate_walls()
+        for _ in range(max(1, int(self.collision_solver_iterations))):
+            before_contacts = self.pos.clone()
+            self._resolve_robots()
+            self._resolve_walls()
+            self._prevent_internal_wall_crossing(before_contacts)
+            self._resolve_internal_wall_capsules(before_contacts)
+            self._resolve_gate_walls()
+        self._resolve_walls()
+        if prev_pos is not None:
+            self._prevent_internal_wall_crossing(prev_pos)
+        self._resolve_internal_wall_capsules(prev_pos)
+        self._resolve_gate_walls()
+
+    def _prevent_internal_wall_crossing(self, prev_pos: torch.Tensor):
+        if not self.gate_wall_segments:
+            return
+
+        wall_extra = 0.5 * self.shelter_wall_thickness if self.mission == "sheltering" else 0.0
+        clearance = self.robot_radius + wall_extra + self.wall_contact_epsilon
+        eps = 1e-8
+
+        for ax, ay, bx, by in self.gate_wall_segments:
+            abx = bx - ax
+            aby = by - ay
+            length_sq = abx * abx + aby * aby
+            if length_sq <= eps:
+                continue
+
+            length = math.sqrt(length_sq)
+            normal = torch.tensor(
+                (-aby / length, abx / length),
+                dtype=self.pos.dtype,
+                device=self.device,
+            )
+            anchor = torch.tensor(
+                (ax, ay),
+                dtype=self.pos.dtype,
+                device=self.device,
+            )
+            tangent = torch.tensor(
+                (abx, aby),
+                dtype=self.pos.dtype,
+                device=self.device,
+            )
+
+            prev_rel = prev_pos - anchor.view(1, 1, 2)
+            curr_rel = self.pos - anchor.view(1, 1, 2)
+            prev_signed = (prev_rel * normal.view(1, 1, 2)).sum(dim=-1)
+            curr_signed = (curr_rel * normal.view(1, 1, 2)).sum(dim=-1)
+
+            denom = prev_signed - curr_signed
+            safe_denom = torch.where(denom.abs() > eps, denom, torch.ones_like(denom))
+            sweep_t = torch.where(
+                denom.abs() > eps,
+                prev_signed / safe_denom,
+                torch.zeros_like(denom),
+            )
+            intersection = prev_pos + (self.pos - prev_pos) * sweep_t.unsqueeze(-1)
+            wall_u = (
+                ((intersection - anchor.view(1, 1, 2)) * tangent.view(1, 1, 2)).sum(dim=-1)
+                / length_sq
+            )
+            crossed = (
+                (prev_signed * curr_signed < 0.0)
+                & (sweep_t >= 0.0)
+                & (sweep_t <= 1.0)
+                & (wall_u >= 0.0)
+                & (wall_u <= 1.0)
+            )
+            if not crossed.any():
+                continue
+
+            prev_side = torch.sign(prev_signed)
+            prev_side = torch.where(prev_side == 0.0, -torch.sign(curr_signed), prev_side)
+            prev_side = torch.where(prev_side == 0.0, torch.ones_like(prev_side), prev_side)
+            desired_signed = prev_side * clearance
+            correction = (desired_signed - curr_signed).unsqueeze(-1) * normal.view(1, 1, 2)
+            corrected_pos = self.pos + correction
+            self.pos = torch.where(crossed.unsqueeze(-1), corrected_pos, self.pos)
+
+    def _resolve_internal_wall_capsules(self, prev_pos: torch.Tensor | None = None):
+        if not self.gate_wall_segments:
+            return
+
+        wall_thickness = (
+            self.shelter_wall_thickness
+            if self.mission == "sheltering" else self.internal_wall_thickness
+        )
+        clearance = self.robot_radius + 0.5 * wall_thickness + self.wall_contact_epsilon
+        eps = 1e-8
+
+        for ax, ay, bx, by in self.gate_wall_segments:
+            abx = bx - ax
+            aby = by - ay
+            length_sq = abx * abx + aby * aby
+            if length_sq <= eps:
+                continue
+
+            length = math.sqrt(length_sq)
+            normal = torch.tensor(
+                (-aby / length, abx / length),
+                dtype=self.pos.dtype,
+                device=self.device,
+            )
+            anchor = torch.tensor(
+                (ax, ay),
+                dtype=self.pos.dtype,
+                device=self.device,
+            )
+            tangent = torch.tensor(
+                (abx, aby),
+                dtype=self.pos.dtype,
+                device=self.device,
+            )
+
+            rel = self.pos - anchor.view(1, 1, 2)
+            u = (rel * tangent.view(1, 1, 2)).sum(dim=-1) / length_sq
+            u_clamped = u.clamp(0.0, 1.0)
+            closest = anchor.view(1, 1, 2) + u_clamped.unsqueeze(-1) * tangent.view(1, 1, 2)
+            delta = self.pos - closest
+            raw_dist = torch.linalg.norm(delta, dim=-1)
+            dist = raw_dist.clamp_min(eps)
+
+            curr_signed = (rel * normal.view(1, 1, 2)).sum(dim=-1)
+            if prev_pos is not None:
+                prev_rel = prev_pos - anchor.view(1, 1, 2)
+                side = torch.sign((prev_rel * normal.view(1, 1, 2)).sum(dim=-1))
+                side = torch.where(side == 0.0, torch.sign(curr_signed), side)
+            else:
+                side = torch.sign(curr_signed)
+            side = torch.where(side == 0.0, torch.ones_like(side), side)
+
+            side_dir = side.unsqueeze(-1) * normal.view(1, 1, 2)
+            radial_dir = torch.where(
+                (raw_dist > eps).unsqueeze(-1),
+                delta / dist.unsqueeze(-1),
+                side_dir,
+            )
+            on_segment_span = (u >= 0.0) & (u <= 1.0)
+            push_dir = torch.where(on_segment_span.unsqueeze(-1), side_dir, radial_dir)
+
+            penetration = clearance - dist
+            near = penetration > 0.0
+            corrected = self.pos + penetration.clamp_min(0.0).unsqueeze(-1) * push_dir
+            self.pos = torch.where(near.unsqueeze(-1), corrected, self.pos)
+
     def _resolve_gate_walls(self):
         if self.mission in ("xor", "homing", "foraging"):
             return
@@ -547,17 +751,13 @@ class StandaloneDGTEnv:
         self.pos[:, :, 0] = torch.where(near_r, hw + sign_r * r, self.pos[:, :, 0])
 
     def _resolve_walls(self):
-        R = self.arena_circumradius
-        r = self.robot_radius
-        n = self.arena_n_sides
-        inradius = R * math.cos(math.pi / n)
-        for i in range(n):
-            a1 = 2 * math.pi * i / n + math.pi / n
-            a2 = 2 * math.pi * ((i + 1) % n) / n + math.pi / n
-            mid = (a1 + a2) / 2.0
-            nx, ny = -math.cos(mid), -math.sin(mid)
-            wx = inradius * math.cos(mid)
-            wy = inradius * math.sin(mid)
+        r = self.robot_radius + 0.5 * self.arena_wall_thickness + self.wall_contact_epsilon
+        for ax, ay, bx, by in self.arena_wall_segments:
+            mx = 0.5 * (ax + bx)
+            my = 0.5 * (ay + by)
+            norm = math.sqrt(mx * mx + my * my) + 1e-12
+            nx, ny = -mx / norm, -my / norm
+            wx, wy = mx, my
             dx = self.pos[:, :, 0] - wx
             dy = self.pos[:, :, 1] - wy
             sd = dx * nx + dy * ny
@@ -1198,6 +1398,8 @@ def _variant_from_config(config_path: str) -> str:
 
 
 def _infer_variant_from_checkpoint(ckpt: dict) -> str:
+    if ckpt.get("trainer_type") == "option_critic":
+        return str(ckpt.get("variant", "cyclamen"))
     if not ckpt.get("discrete", False):
         return "dandelion"
     if ckpt.get("recurrent", False):
@@ -1249,14 +1451,16 @@ def _load_policy_actor(
     if variant is None:
         variant = _infer_variant_from_checkpoint(ckpt)
 
+    trainer_type = str(ckpt.get("trainer_type", "poca"))
     discrete = bool(ckpt.get("discrete", False))
     recurrent = bool(ckpt.get("recurrent", False))
     hidden_dim = int(ckpt.get("hidden_dim", 256))
     num_layers = int(ckpt.get("num_layers", 2))
     obs_dim = int(ckpt.get("obs_dim", _expected_obs_dim(variant)))
     num_actions = int(ckpt.get("num_actions", 6))
+    num_options = int(ckpt.get("num_options", num_actions))
     act_dim = int(ckpt.get("act_dim", 2))
-    memory_size = int(ckpt.get("memory_size", 64))
+    memory_size = checkpoint_memory_size(ckpt)
 
     if obs_dim != _expected_obs_dim(variant):
         print(
@@ -1265,20 +1469,26 @@ def _load_policy_actor(
             flush=True,
         )
 
-    if discrete:
+    if trainer_type == "option_critic":
+        actor = FixedOptionManager(
+            obs_dim, num_options, hidden_dim, num_layers, memory_size,
+        ).to(device)
+        actor.load_state_dict(ckpt["manager"])
+    elif discrete:
         if recurrent:
             actor = RecurrentDiscreteActor(
                 obs_dim, num_actions, hidden_dim, num_layers, memory_size,
             ).to(device)
         else:
             actor = DiscreteActor(obs_dim, num_actions, hidden_dim, num_layers).to(device)
+        actor.load_state_dict(ckpt["actor"])
     else:
         actor = Actor(obs_dim, act_dim, hidden_dim, num_layers).to(device)
-
-    actor.load_state_dict(ckpt["actor"])
+        actor.load_state_dict(ckpt["actor"])
     actor.eval()
 
     meta = {
+        "trainer_type": trainer_type,
         "variant": variant,
         "discrete": discrete,
         "recurrent": recurrent,
@@ -1286,6 +1496,7 @@ def _load_policy_actor(
         "num_layers": num_layers,
         "obs_dim": obs_dim,
         "num_actions": num_actions,
+        "num_options": num_options,
         "act_dim": act_dim,
         "memory_size": memory_size,
     }
@@ -1313,8 +1524,16 @@ class KeyboardController:
             lambda event, *a, obj=weakref.proxy(self): obj._on_key(event, *a),
         )
 
+    @staticmethod
+    def _event_name(event) -> str:
+        raw_input = getattr(event, "input", "")
+        name = getattr(raw_input, "name", raw_input)
+        if isinstance(name, bytes):
+            name = name.decode("utf-8", errors="replace")
+        return str(name)
+
     def _on_key(self, event, *args, **kwargs):
-        name = event.input.name
+        name = self._event_name(event)
         if event.type == carb.input.KeyboardEventType.KEY_PRESS:
             self._pressed.add(name)
             self._events.append(name)
@@ -1343,6 +1562,10 @@ class KeyboardController:
 # =====================================================================
 
 def main():
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
     N = args.num_agents
     speed = args.speed
     sim_hz = max(args.sim_hz, 1.0)
@@ -1350,7 +1573,10 @@ def main():
     sim_dt = 1.0 / sim_hz
     control_dt = 1.0 / control_hz
     control_interval = max(1, round(control_dt / sim_dt))
-    status_interval = max(1, round(1.0 / sim_dt))
+    status_interval = (
+        max(1, round(args.status_interval / sim_dt))
+        if args.status_interval > 0.0 else 0
+    )
     print(
         f"[ManualIsaac] sim_hz={sim_hz:.1f}, control_hz={control_hz:.1f}, "
         f"control interval={control_interval} frames",
@@ -1381,10 +1607,14 @@ def main():
     light_cfg.func("/World/DomeLight", light_cfg)
 
     # ── Ground plane ──────────────────────────────────────────────
-    spawn_ground_plane("/World/GroundPlane", GroundPlaneCfg())
 
     # ── Kinematic env ─────────────────────────────────────────────
     env = StandaloneDGTEnv(num_agents=N, device="cpu", dt=sim_dt, task=args.task)
+    editor_hud = _PlaybackStatusHud(
+        not getattr(args, "headless", False)
+        and not args.no_editor_hud
+        and args.status_interval > 0.0
+    )
 
     policy_mode = args.policy_checkpoint is not None
     policy_device = torch.device("cpu")
@@ -1396,6 +1626,7 @@ def main():
         )
         print(
             f"[Policy] Loaded {args.policy_checkpoint} "
+            f"trainer={policy_meta['trainer_type']} "
             f"variant={policy_meta['variant']} "
             f"discrete={policy_meta['discrete']} "
             f"recurrent={policy_meta['recurrent']} "
@@ -1449,7 +1680,16 @@ def main():
     other_right_cmd = torch.zeros(1, N)
     policy_left_cmd = torch.zeros(1, N)
     policy_right_cmd = torch.zeros(1, N)
-    if policy_mode and policy_meta["recurrent"]:
+    policy_current_options = None
+    if policy_mode and policy_meta["trainer_type"] == "option_critic":
+        policy_memory = policy_actor.initial_state(N, policy_device)
+        policy_current_options = torch.full(
+            (N,),
+            -1,
+            dtype=torch.long,
+            device=policy_device,
+        )
+    elif policy_mode and policy_meta["recurrent"]:
         policy_memory = policy_actor.initial_state(N, policy_device)
     else:
         policy_memory = None
@@ -1468,7 +1708,10 @@ def main():
                 env.reset()
                 step_counter = 0
                 force_control_update = True
-                if policy_mode and policy_meta["recurrent"]:
+                if policy_mode and policy_meta["trainer_type"] == "option_critic":
+                    policy_memory = policy_actor.initial_state(N, policy_device)
+                    policy_current_options.fill_(-1)
+                elif policy_mode and policy_meta["recurrent"]:
                     policy_memory = policy_actor.initial_state(N, policy_device)
                 print("[RESET] Episode reset")
             elif evt == "NUMPAD_0":
@@ -1546,7 +1789,44 @@ def main():
                 )
                 flat_obs = obs_all.reshape(N, -1).to(policy_device)
                 with torch.no_grad():
-                    if policy_meta["discrete"]:
+                    if policy_meta["trainer_type"] == "option_critic":
+                        option_logits, termination_logits, policy_memory = policy_actor.step(
+                            flat_obs,
+                            policy_memory,
+                        )
+                        policy_memory = (
+                            policy_memory[0].detach(),
+                            policy_memory[1].detach(),
+                        )
+                        option_dist = torch.distributions.Categorical(logits=option_logits)
+                        if args.deterministic:
+                            proposed = option_dist.probs.argmax(dim=-1)
+                        else:
+                            proposed = option_dist.sample()
+
+                        force_new = policy_current_options < 0
+                        safe_current = policy_current_options.clamp(min=0)
+                        beta_logits = termination_logits.gather(
+                            -1,
+                            safe_current.unsqueeze(-1),
+                        ).squeeze(-1)
+                        if args.deterministic:
+                            terminate = torch.sigmoid(beta_logits) > 0.5
+                        else:
+                            terminate = torch.distributions.Bernoulli(
+                                logits=beta_logits,
+                            ).sample().bool()
+                        switch = terminate | force_new
+                        policy_current_options = torch.where(
+                            switch,
+                            proposed,
+                            policy_current_options,
+                        )
+                        module_ids = policy_current_options.view(1, N).cpu().long()
+                        policy_left_cmd, policy_right_cmd = env.behavior_modules.dispatch(
+                            module_ids, *behavior_inputs,
+                        )
+                    elif policy_meta["discrete"]:
                         if policy_meta["recurrent"]:
                             logits, policy_memory = policy_actor.step(flat_obs, policy_memory)
                             policy_memory = (
@@ -1584,7 +1864,10 @@ def main():
         if env.step_count >= env.episode_steps:
             env.reset(advance_episode=True)
             force_control_update = True
-            if policy_mode and policy_meta["recurrent"]:
+            if policy_mode and policy_meta["trainer_type"] == "option_critic":
+                policy_memory = policy_actor.initial_state(N, policy_device)
+                policy_current_options.fill_(-1)
+            elif policy_mode and policy_meta["recurrent"]:
                 policy_memory = policy_actor.initial_state(N, policy_device)
 
         # ── Update robot markers ──────────────────────────────────
@@ -1631,17 +1914,24 @@ def main():
             )
 
         # ── Periodic console readout ──────────────────────────────
-        if step_counter % status_interval == 0:
+        if status_interval > 0 and step_counter % status_interval == 0:
             info = env.compute_obs_robot0()
             gv = info["ground_3"]
             g_label = "BLACK" if gv[0] < 0.1 else ("WHITE" if gv[0] > 0.9 else "GREY")
             pos0 = pos_2d[0]
+            elapsed_s = env.step_count * env.dt
+            total_s = env.episode_steps * env.dt
+            remaining_s = max(0.0, total_s - elapsed_s)
+            last_score = env.completed_episode_reward
+            last_text = f" last={last_score:.0f}" if last_score is not None else ""
             mode_label = (
                 f"policy:{policy_meta['variant']}"
                 if policy_mode else MODULE_NAMES[others_module]
             )
             print(
-                f"[t={env.step_count * env.dt:6.1f}s step={env.step_count:5d}/{env.episode_steps}] "
+                f"[t={elapsed_s:6.1f}s step={env.step_count:5d}/{env.episode_steps} "
+                f"remaining={_format_duration(remaining_s)}] "
+                f"score={env.episode_reward:.0f}{last_text} "
                 f"pos=({pos0[0]:+.3f},{pos0[1]:+.3f}) "
                 f"yaw={math.degrees(yaws[0]):+6.1f}° "
                 f"ground={g_label} "
@@ -1655,6 +1945,17 @@ def main():
             )
 
         # ── Sim step (renders the viewport) ───────────────────────
+            hud_lines = [
+                f"Episode: {env.episode_index}",
+                f"Time: {_format_duration(elapsed_s)} / {_format_duration(total_s)}",
+                f"Remaining: {_format_duration(remaining_s)}",
+                f"Score: {env.episode_reward:.0f}",
+            ]
+            if last_score is not None:
+                hud_lines.append(f"Last completed: {last_score:.0f}")
+            hud_lines.append(f"Mode: {mode_label}")
+            editor_hud.update("\n".join(hud_lines))
+
         sim.step()
 
         if args.smoke_frames > 0 and step_counter >= args.smoke_frames:

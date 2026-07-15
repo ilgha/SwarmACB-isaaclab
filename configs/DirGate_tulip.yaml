@@ -11,6 +11,7 @@
 
 behaviors:
   DirGate_tulip:
+    task: SwarmACB-DirectionalGate-v0
     variant: tulip
     trainer_type: poca
 

@@ -112,7 +112,10 @@ class DirectionalGateEnvCfg(DirectMARLEnvCfg):
     arena_num_sides: int = _ARENA_N_SIDES
     arena_area: float = _ARENA_AREA
     arena_circumradius: float = _ARENA_CIRCUMRADIUS   # ≈ 1.279 m
+    # Unity PerAgentState5DSensor uses radius=12 in the 10x-scaled scene.
+    critic_state_radius: float = 1.20
     arena_wall_height: float = 0.08                    # visual wall height
+    arena_wall_thickness: float = 0.01
 
     # ── E-puck robot ──────────────────────────────────────────────
     robot_radius: float = 0.035     # m (e-puck body radius)
@@ -120,6 +123,9 @@ class DirectionalGateEnvCfg(DirectMARLEnvCfg):
     robot_mass: float = 0.190       # kg (~190 g with battery)
     max_wheel_speed: float = 0.16   # m/s (Unity Epuck.cs maxWheelSpeed)
     wheelbase: float = 0.055        # m (Unity Epuck.cs wheelBase after 10x model scaling)
+    collision_solver_iterations: int = 4
+    wall_contact_epsilon: float = 1e-4
+    internal_wall_thickness: float = 0.01
 
     # ── Sensor parameters ─────────────────────────────────────────
     prox_range: float = 0.10        # IR proximity sensor range (m)
@@ -160,7 +166,7 @@ class DirectionalGateEnvCfg(DirectMARLEnvCfg):
 
     # ── Light source ──────────────────────────────────────────────
     #  At south edge of arena, just outside the wall.
-    light_position: tuple = (0.0, -1.4, 0.0)
+    light_position: tuple = (0.0, -1.5, 0.0)
     has_light: bool = True
 
     # ── Reward ────────────────────────────────────────────────────

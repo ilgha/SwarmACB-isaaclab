@@ -11,7 +11,8 @@ Architecture (matching ML-Agents exactly):
   and `tanh_squash=False` (raw linear mean, no squashing).
   mu_head initialized with KaimingHeNormal, gain=0.2.
   Log-prob returned **per action dimension** (not summed) for per-dim PPO clipping.
-  Entropy: sum across action dims (matches ML-Agents action_model.py).
+  Entropy: mean across continuous dimensions, matching GaussianDistInstance;
+  ActionModel then sums over distribution branches (one continuous branch).
 
 • **Critic** — POCAValueNetwork wrapping MultiAgentNetworkBody:
   - Uses 5D polar state (ρ, cos α, sin α, cos β, sin β) instead of agent obs.
@@ -24,10 +25,9 @@ Architecture (matching ML-Agents exactly):
   - Post-attention LinearEncoder (num_layers, Swish, T-Fixup init).
   - Append normalized agent count → value head.
 
-• **Actor** — SimpleActor sees sensor obs concatenated with 5D state.
-  In Unity, PerAgentState5DSensor provides a second observation buffer.
-  ML-Agents VectorInput is pass-through, so concatenation is equivalent.
-  actor_obs_dim = sensor_obs_dim + 5.
+• **Actor** — SimpleActor sees local sensor observations only. The 5D polar
+  state is routed exclusively to the centralized critic by the SwarmACB POCA
+  modification.
 
 Reference: Unity ML-Agents POCA
   ml-agents/mlagents/trainers/poca/optimizer_torch.py
@@ -80,6 +80,50 @@ def _linear_layer(
     if bias_init == "zeros":
         nn.init.zeros_(layer.bias)
     return layer
+
+
+def _mlagents_lstm(
+    input_size: int,
+    memory_size: int,
+    forget_bias: float = 1.0,
+) -> tuple[nn.LSTM, int]:
+    """Build an LSTM with the memory convention used by ML-Agents.
+
+    ML-Agents stores hidden and cell state in one memory vector, so an exposed
+    ``memory_size`` of 128 corresponds to 64 recurrent units. Its initializer
+    applies Xavier independently to each gate and adds the forget bias to both
+    PyTorch bias tensors.
+    """
+    memory_size = int(memory_size)
+    if memory_size <= 0 or memory_size % 2:
+        raise ValueError("ML-Agents memory_size must be a positive even integer")
+
+    hidden_size = memory_size // 2
+    lstm = nn.LSTM(input_size, hidden_size, batch_first=True)
+    for name, param in lstm.named_parameters():
+        block_size = param.shape[0] // 4
+        if "weight" in name:
+            for gate in range(4):
+                nn.init.xavier_uniform_(
+                    param.data[gate * block_size:(gate + 1) * block_size]
+                )
+        elif "bias" in name:
+            nn.init.zeros_(param)
+            param.data[block_size:2 * block_size].add_(forget_bias)
+    return lstm, hidden_size
+
+
+def checkpoint_memory_size(checkpoint: dict, default: int = 128) -> int:
+    """Return ML-Agents-style total memory size for old and new checkpoints.
+
+    Checkpoints written before the parity revision stored the LSTM hidden size
+    under ``memory_size``. Their tensors remain loadable by doubling that value.
+    """
+    value = int(checkpoint.get("memory_size", default))
+    semantics = checkpoint.get("memory_size_semantics")
+    if semantics == "mlagents_total":
+        return value
+    return value * 2
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -194,18 +238,18 @@ class Actor(nn.Module):
         return Normal(mu, std)
 
     def evaluate(self, obs: torch.Tensor, actions: torch.Tensor):
-        """Return per-dim log_prob and summed entropy.
+        """Return per-dimension log probability and ML-Agents entropy.
 
         Returns:
             log_prob_per_dim: (B, act_dim) — NOT summed across dims.
                 ML-Agents computes PPO ratio per action dimension.
-            entropy: (B,) — SUM of entropy across action dims.
-                ML-Agents action_model.py: "Use the sum of entropy
-                across actions, not the mean" (torch.sum(entropies, dim=1)).
+            entropy: (B,) — mean entropy across continuous dimensions.
+                ML-Agents performs this mean inside GaussianDistInstance,
+                then sums the resulting distribution-branch entropies.
         """
         dist = self.get_dist(obs)
         log_prob_per_dim = dist.log_prob(actions)      # (B, act_dim)
-        entropy = dist.entropy().sum(dim=-1)            # (B,)
+        entropy = dist.entropy().mean(dim=-1)           # (B,)
         return log_prob_per_dim, entropy
 
 
@@ -240,7 +284,7 @@ class DiscreteActor(nn.Module):
         # Logits head — outputs raw logits for each discrete action
         self.logits_head = _linear_layer(
             hidden, num_actions,
-            kernel_init="kaiming_normal", kernel_gain=0.2,
+            kernel_init="kaiming_normal", kernel_gain=0.1,
         )
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
@@ -282,7 +326,7 @@ class RecurrentDiscreteActor(nn.Module):
         num_actions: int,
         hidden: int = 128,
         num_layers: int = 1,
-        memory_size: int = 64,
+        memory_size: int = 128,
     ):
         super().__init__()
         self.obs_dim = obs_dim
@@ -295,29 +339,21 @@ class RecurrentDiscreteActor(nn.Module):
             hidden,
             kernel_init="kaiming_normal",
         )
-        self.lstm = nn.LSTM(hidden, memory_size, batch_first=True)
+        self.lstm, self.hidden_size = _mlagents_lstm(hidden, memory_size)
         self.logits_head = _linear_layer(
-            memory_size,
+            self.hidden_size,
             num_actions,
             kernel_init="kaiming_normal",
-            kernel_gain=0.2,
+            kernel_gain=0.1,
         )
-
-        for name, param in self.lstm.named_parameters():
-            if "weight_ih" in name:
-                nn.init.xavier_uniform_(param)
-            elif "weight_hh" in name:
-                nn.init.orthogonal_(param)
-            elif "bias" in name:
-                nn.init.zeros_(param)
 
     def initial_state(
         self,
         batch_size: int,
         device: torch.device | str,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        h = torch.zeros(1, batch_size, self.memory_size, device=device)
-        c = torch.zeros(1, batch_size, self.memory_size, device=device)
+        h = torch.zeros(1, batch_size, self.hidden_size, device=device)
+        c = torch.zeros(1, batch_size, self.hidden_size, device=device)
         return h, c
 
     def forward_sequence(
@@ -430,7 +466,8 @@ class ResidualSelfAttention(nn.Module):
         v = self.fc_v(x).view(B, N, H, d).transpose(1, 2)
 
         # Scaled dot-product attention
-        attn = (q @ k.transpose(-2, -1)) / math.sqrt(d)      # (B, H, N, N)
+        # ML-Agents scales by the full embedding size (not per-head width).
+        attn = (q @ k.transpose(-2, -1)) / math.sqrt(D)      # (B, H, N, N)
 
         # Apply attention mask (if provided)
         if key_mask is not None:
@@ -493,12 +530,14 @@ class POCACritic(nn.Module):
         h_size: int = 256,
         num_heads: int = 4,
         num_layers: int = 2,
+        memory_size: int = 0,
     ):
         super().__init__()
         self.state_dim = state_dim
         self.act_dim = act_dim
         self.num_agents = num_agents
         self.h_size = h_size
+        self.memory_size = int(memory_size or 0)
 
         # Entity embeddings (5D state → h_size embedding)
         # ML-Agents: EntityEmbedding = LinearEncoder(1 layer, Swish, T-Fixup init)
@@ -517,8 +556,18 @@ class POCACritic(nn.Module):
             kernel_init="kaiming_normal", kernel_gain=t_fixup_gain,
         )
 
+        if self.memory_size > 0:
+            self.lstm, self.hidden_size = _mlagents_lstm(h_size, self.memory_size)
+        else:
+            self.lstm = None
+            self.hidden_size = h_size
+
         # Value head: h_size + 1 → 1  (the +1 is for normalized agent count)
-        self.value_head = nn.Linear(h_size + 1, 1)
+        self.value_head = _linear_layer(
+            self.hidden_size + 1,
+            1,
+            kernel_init="xavier_uniform",
+        )
 
         # Max-agent tracker for normalization (non-trainable)
         self._current_max_agents = nn.Parameter(
@@ -534,18 +583,56 @@ class POCACritic(nn.Module):
         val = n * 2.0 / self._current_max_agents.item() - 1.0
         return torch.full((B, 1), val, device=device)
 
-    def _encode_and_value(self, entities: torch.Tensor, n_agents: int) -> torch.Tensor:
+    def initial_state(
+        self,
+        batch_size: int,
+        device: torch.device | str,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if self.lstm is None:
+            return None
+        h = torch.zeros(1, batch_size, self.hidden_size, device=device)
+        c = torch.zeros(1, batch_size, self.hidden_size, device=device)
+        return h, c
+
+    def _encode_and_value(
+        self,
+        entities: torch.Tensor,
+        n_agents: int,
+        memory: tuple[torch.Tensor, torch.Tensor] | None = None,
+        sequence_length: int = 1,
+        return_memory: bool = False,
+    ):
         """Shared tail: RSA → linear encoder → value head."""
         B = entities.shape[0]
         pooled = self.self_attn(entities)                          # (B, h)
         encoding = self.linear_encoder(pooled)                     # (B, h)
+        next_memory = memory
+        if self.lstm is not None:
+            sequence_length = int(sequence_length)
+            if sequence_length <= 0 or B % sequence_length:
+                raise ValueError("Critic batch must be divisible by sequence_length")
+            num_sequences = B // sequence_length
+            if memory is None:
+                memory = self.initial_state(num_sequences, encoding.device)
+            seq = encoding.view(num_sequences, sequence_length, self.h_size)
+            seq, next_memory = self.lstm(seq, memory)
+            encoding = seq.reshape(B, self.hidden_size)
         nc = self._norm_agent_count(n_agents, B, encoding.device)
         encoding = torch.cat([encoding, nc], dim=-1)               # (B, h+1)
-        return self.value_head(encoding)                           # (B, 1)
+        value = self.value_head(encoding)                           # (B, 1)
+        if return_memory:
+            return value, next_memory
+        return value
 
     # ── public API ────────────────────────────────────────────────
 
-    def critic_pass(self, all_agent_states: torch.Tensor) -> torch.Tensor:
+    def critic_pass(
+        self,
+        all_agent_states: torch.Tensor,
+        memory: tuple[torch.Tensor, torch.Tensor] | None = None,
+        sequence_length: int = 1,
+        return_memory: bool = False,
+    ):
         """Team value V(s).  All agents go through state-only entity encoding.
 
         Args:   all_agent_states — (B, N, state_dim)  [5D polar state]
@@ -553,13 +640,18 @@ class POCACritic(nn.Module):
         """
         B, N, _ = all_agent_states.shape
         entities = self.obs_entity_enc(all_agent_states)   # (B, N, h)
-        return self._encode_and_value(entities, N)
+        return self._encode_and_value(
+            entities, N, memory, sequence_length, return_memory,
+        )
 
     def joint_action_pass(
         self,
         all_agent_states: torch.Tensor,
         all_agent_actions: torch.Tensor,
-    ) -> torch.Tensor:
+        memory: tuple[torch.Tensor, torch.Tensor] | None = None,
+        sequence_length: int = 1,
+        return_memory: bool = False,
+    ):
         """Collective value Q(s, a) for one joint action.
 
         Every interchangeable agent contributes a state-action entity. The
@@ -575,7 +667,9 @@ class POCACritic(nn.Module):
         _, N, _ = all_agent_states.shape
         state_act = torch.cat([all_agent_states, all_agent_actions], dim=-1)
         entities = self.obs_act_entity_enc(state_act)
-        return self._encode_and_value(entities, N)
+        return self._encode_and_value(
+            entities, N, memory, sequence_length, return_memory,
+        )
 
     def all_discrete_counterfactual_values(
         self,
@@ -618,12 +712,64 @@ class POCACritic(nn.Module):
 
         return torch.stack(values, dim=1)
 
+    def focal_discrete_counterfactual_values(
+        self,
+        all_agent_states: torch.Tensor,
+        action_indices: torch.Tensor,
+        focal_agent_ids: torch.Tensor,
+        num_actions: int,
+        memory: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """Evaluate alternatives for one focal interchangeable agent per row.
+
+        This is the minibatch form needed by collective Option-Critic. It keeps
+        every peer option fixed and avoids evaluating unused alternatives for
+        all other robots.
+        """
+        batch_size, num_agents, _ = all_agent_states.shape
+        device = all_agent_states.device
+        alternatives = torch.arange(num_actions, device=device)
+        replaced = action_indices.unsqueeze(1).expand(
+            batch_size, num_actions, num_agents,
+        ).clone()
+        batch_ids = torch.arange(batch_size, device=device).unsqueeze(1)
+        option_ids = torch.arange(num_actions, device=device).unsqueeze(0)
+        focal_ids = focal_agent_ids.long().unsqueeze(1).expand(-1, num_actions)
+        replaced[batch_ids, option_ids, focal_ids] = alternatives.unsqueeze(0)
+
+        encoded = torch.nn.functional.one_hot(
+            replaced.reshape(batch_size * num_actions, num_agents).long(),
+            num_classes=num_actions,
+        ).to(all_agent_states.dtype)
+        states = all_agent_states.unsqueeze(1).expand(
+            batch_size, num_actions, num_agents, self.state_dim,
+        ).reshape(batch_size * num_actions, num_agents, self.state_dim)
+        expanded_memory = None
+        if memory is not None:
+            h, c = memory
+            expanded_memory = (
+                h.unsqueeze(2).expand(-1, -1, num_actions, -1).reshape(
+                    h.shape[0], batch_size * num_actions, h.shape[-1],
+                ),
+                c.unsqueeze(2).expand(-1, -1, num_actions, -1).reshape(
+                    c.shape[0], batch_size * num_actions, c.shape[-1],
+                ),
+            )
+        return self.joint_action_pass(
+            states, encoded, memory=expanded_memory,
+        ).reshape(
+            batch_size, num_actions,
+        )
+
     def baseline(
         self,
         agent_i_state: torch.Tensor,    # (B, state_dim)
         other_states: torch.Tensor,      # (B, M, state_dim)
         other_actions: torch.Tensor,     # (B, M, act_dim)
-    ) -> torch.Tensor:
+        memory: tuple[torch.Tensor, torch.Tensor] | None = None,
+        sequence_length: int = 1,
+        return_memory: bool = False,
+    ):
         """Counterfactual baseline b_i.
 
         Agent i → state-only entity embedding (no action).
@@ -641,13 +787,46 @@ class POCACritic(nn.Module):
         ent_o = self.obs_act_entity_enc(state_act)                    # (B, M, h)
 
         entities = torch.cat([ent_i, ent_o], dim=1)                   # (B, 1+M, h)
-        return self._encode_and_value(entities, 1 + M)
+        return self._encode_and_value(
+            entities, 1 + M, memory, sequence_length, return_memory,
+        )
+
+    def focal_baselines(
+        self,
+        all_states: torch.Tensor,
+        all_actions: torch.Tensor,
+        focal_agent_ids: torch.Tensor,
+        memory: tuple[torch.Tensor, torch.Tensor] | None = None,
+        sequence_length: int = 1,
+        return_memory: bool = False,
+    ):
+        """Compute one counterfactual baseline per flattened sequence row."""
+        B, N, _ = all_states.shape
+        rows = torch.arange(B, device=all_states.device)
+        focal_agent_ids = focal_agent_ids.long()
+        self_state = all_states[rows, focal_agent_ids]
+
+        mask = torch.ones(B, N, dtype=torch.bool, device=all_states.device)
+        mask[rows, focal_agent_ids] = False
+        other_states = all_states[mask].view(B, N - 1, self.state_dim)
+        other_actions = all_actions[mask].view(B, N - 1, self.act_dim)
+        return self.baseline(
+            self_state,
+            other_states,
+            other_actions,
+            memory,
+            sequence_length,
+            return_memory,
+        )
 
     def all_baselines(
         self,
         all_states: torch.Tensor,     # (B, N, state_dim)
         all_actions: torch.Tensor,    # (B, N, act_dim)
-    ) -> torch.Tensor:
+        memory: tuple[torch.Tensor, torch.Tensor] | None = None,
+        sequence_length: int = 1,
+        return_memory: bool = False,
+    ):
         """Compute baselines for every agent (batched — single forward pass).
 
         Instead of N separate forward passes, we construct all N counterfactual
@@ -694,5 +873,10 @@ class POCACritic(nn.Module):
         entities_flat = entities.reshape(B * N, N, self.h_size)
 
         # Shared tail: RSA → encoder → value head
-        values = self._encode_and_value(entities_flat, N)          # (B*N, 1)
-        return values.squeeze(-1).reshape(B, N)                    # (B, N)
+        result = self._encode_and_value(
+            entities_flat, N, memory, sequence_length, return_memory,
+        )
+        if return_memory:
+            values, next_memory = result
+            return values.squeeze(-1).reshape(B, N), next_memory
+        return result.squeeze(-1).reshape(B, N)

@@ -29,7 +29,6 @@ import torch
 import isaaclab.sim as sim_utils
 from isaaclab.envs import DirectMARLEnv
 from isaaclab.markers import VisualizationMarkersCfg, VisualizationMarkers
-from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 
 from .directional_gate_env_cfg import DirectionalGateEnvCfg
 
@@ -64,6 +63,10 @@ class DirectionalGateEnv(DirectMARLEnv):
         # ── Episode reward accumulator (for trainer compatibility) ─
         self.completed_group_reward = torch.zeros(E, device=dev)
         self._episode_group_reward = torch.zeros(E, device=dev)
+        # IsaacLab auto-resets timed-out environments before returning from
+        # ``step``. Keep the true final centralized state so interrupted Unity
+        # trajectories can bootstrap from s_{t+1}, rather than from the reset.
+        self.completed_terminal_critic_state = torch.zeros(E, N, 5, device=dev)
 
         # ── Precompute arena wall segments ────────────────────────
         self.arena_wall_segments = self._build_wall_segments()
@@ -103,6 +106,9 @@ class DirectionalGateEnv(DirectMARLEnv):
         self.arena_center = torch.zeros(2, device=dev)
         light_vec = self.light_pos - self.arena_center
         self.light_dir = light_vec / (light_vec.norm() + 1e-8)
+        # PerAgentState5DSensor.cs measures alpha from Unity world +Z. With the
+        # Unity XZ plane mapped to Isaac XY, that reference is Isaac +Y.
+        self.critic_reference_dir = torch.tensor((0.0, 1.0), device=dev)
 
         # ── Sensor cache (avoids double computation for discrete variants) ──
         self._sensor_cache = None
@@ -120,8 +126,7 @@ class DirectionalGateEnv(DirectMARLEnv):
     # ──────────────────────────────────────────────────────────────
 
     def _setup_scene(self):
-        """Spawn visual primitives: ground plane, arena, zones, robot markers."""
-        spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
+        """Spawn the local arena, zones, and robot markers."""
 
         # Dome light so we can see
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
@@ -155,7 +160,7 @@ class DirectionalGateEnv(DirectMARLEnv):
         R = cfg.arena_circumradius
         n = cfg.arena_num_sides
         wall_h = cfg.arena_wall_height
-        wall_thick = 0.01
+        wall_thick = cfg.arena_wall_thickness
 
         inradius = R * math.cos(math.pi / n)
 
@@ -355,6 +360,35 @@ class DirectionalGateEnv(DirectMARLEnv):
         light_value = torch.zeros(E, N, device=self.device)
         light_angle = torch.zeros(E, N, device=self.device)
         return light_vals, light_value, light_angle
+
+    def _compute_sensor_bundle(self) -> dict[str, torch.Tensor]:
+        """Sample all local sensors once for the current robot state."""
+        cfg = self.cfg
+        prox_vals, prox_value, prox_angle = self.sensors.compute_proximity(
+            self.agent_pos,
+            self.agent_yaw,
+            obstacle_segments=self.wall_segments,
+            all_agent_pos=self.agent_pos,
+            robot_radius=cfg.robot_radius,
+        )
+        light_vals, light_value, light_angle = self._compute_light_readings()
+        ztilde, rab_proj, rab_attr_x, rab_attr_y = self.sensors.compute_rab(
+            self.agent_pos,
+            self.agent_yaw,
+            obstacle_segments=self.wall_segments,
+        )
+        return {
+            "prox_vals": prox_vals,
+            "prox_value": prox_value,
+            "prox_angle": prox_angle,
+            "light_vals": light_vals,
+            "light_value": light_value,
+            "light_angle": light_angle,
+            "ztilde": ztilde,
+            "rab_proj": rab_proj,
+            "rab_attr_x": rab_attr_x,
+            "rab_attr_y": rab_attr_y,
+        }
 
     def _update_visual_markers(self):
         """Update robot and heading marker positions from kinematic state.
@@ -745,36 +779,19 @@ class DirectionalGateEnv(DirectMARLEnv):
                 dim=1,
             )  # (E, N)
 
-            # Compute needed sensor aggregates for behaviour modules
-            prox_vals, prox_value, prox_angle = self.sensors.compute_proximity(
-                self.agent_pos, self.agent_yaw,
-                obstacle_segments=self.wall_segments,
-                all_agent_pos=self.agent_pos,
-                robot_radius=cfg.robot_radius,
-            )
-            light_vals, light_value, light_angle = self._compute_light_readings()
-            ztilde, rab_proj, rab_attr_x, rab_attr_y = self.sensors.compute_rab(
-                self.agent_pos, self.agent_yaw,
-                obstacle_segments=self.wall_segments,
-            )
-
-            # Cache sensor results so _get_observations can reuse them
-            self._sensor_cache = {
-                "prox_vals": prox_vals,
-                "prox_value": prox_value,
-                "prox_angle": prox_angle,
-                "light_vals": light_vals,
-                "light_value": light_value,
-                "light_angle": light_angle,
-                "ztilde": ztilde,
-                "rab_proj": rab_proj,
-            }
+            # Use the exact sensor snapshot that produced the policy observation.
+            # This also ensures one packet-loss sample is shared by the selector
+            # and the behavior module for the same control cycle.
+            if self._sensor_cache is None:
+                self._sensor_cache = self._compute_sensor_bundle()
+            sensors = self._sensor_cache
 
             left_vel, right_vel = self.behavior_modules.dispatch(
                 module_ids,
-                prox_value, prox_angle,
-                light_value, light_angle,
-                rab_attr_x, rab_attr_y,
+                sensors["prox_value"], sensors["prox_angle"],
+                sensors["light_value"], sensors["light_angle"],
+                sensors["rab_attr_x"], sensors["rab_attr_y"],
+                self._cached_left_vel, self._cached_right_vel,
             )
         else:
             # ── Dandelion continuous ──────────────────────────────
@@ -798,6 +815,7 @@ class DirectionalGateEnv(DirectMARLEnv):
 
         # ── Differential-drive kinematic integration ──────────────
         dt = cfg.sim.dt
+        prev_pos = self.agent_pos.clone()
         dx, dy, d_yaw = EpuckSensors.differential_drive(
             left_vel, right_vel, self.agent_yaw, cfg.wheelbase, dt,
         )
@@ -815,6 +833,11 @@ class DirectionalGateEnv(DirectMARLEnv):
 
         # ── Inter-robot collision ─────────────────────────────────
         self._resolve_robot_collisions()
+        self._resolve_collisions(prev_pos)
+
+        # Positions and headings changed; the next observation must be sampled
+        # from this new state, never from the pre-action state.
+        self._sensor_cache = None
 
         # ── Update visual markers in the viewport ─────────────────
         self._update_visual_markers()
@@ -830,22 +853,17 @@ class DirectionalGateEnv(DirectMARLEnv):
             normals: (n, 2) — inward normal for each face
             points:  (n, 2) — point on each face (at inradius)
         """
-        R = self.cfg.arena_circumradius
-        n = self.cfg.arena_num_sides
-        inradius = R * math.cos(math.pi / n)
-
         normals_list = []
         points_list = []
-        for i in range(n):
-            angle = 2 * math.pi * i / n + math.pi / n
-            next_angle = 2 * math.pi * ((i + 1) % n) / n + math.pi / n
-            mid_angle = (angle + next_angle) / 2.0
-            # Inward normal (toward center)
-            nx = -math.cos(mid_angle)
-            ny = -math.sin(mid_angle)
-            # Point on the wall face
-            wx = inradius * math.cos(mid_angle)
-            wy = inradius * math.sin(mid_angle)
+        for ax, ay, bx, by in self.arena_wall_segments:
+            mx = 0.5 * (ax + bx)
+            my = 0.5 * (ay + by)
+            norm = math.sqrt(mx * mx + my * my) + 1e-12
+            # Inward normal points from the wall midpoint toward the arena center.
+            nx = -mx / norm
+            ny = -my / norm
+            wx = mx
+            wy = my
             normals_list.append([nx, ny])
             points_list.append([wx, wy])
 
@@ -853,9 +871,187 @@ class DirectionalGateEnv(DirectMARLEnv):
         points = torch.tensor(points_list, dtype=torch.float32, device=self.device)    # (n, 2)
         return normals, points
 
+    def _resolve_collisions(self, prev_pos: torch.Tensor | None = None):
+        """Resolve wall and robot contacts with a final wall-safe projection."""
+        iterations = max(1, int(getattr(self.cfg, "collision_solver_iterations", 4)))
+
+        self._resolve_wall_collisions()
+        if prev_pos is not None:
+            self._prevent_internal_wall_crossing(prev_pos)
+        self._resolve_internal_wall_capsules(prev_pos)
+        self._resolve_gate_wall_collisions()
+
+        for _ in range(iterations):
+            before_contacts = self.agent_pos.clone()
+            self._resolve_robot_collisions()
+            self._resolve_wall_collisions()
+            self._prevent_internal_wall_crossing(before_contacts)
+            self._resolve_internal_wall_capsules(before_contacts)
+            self._resolve_gate_wall_collisions()
+
+        self._resolve_wall_collisions()
+        if prev_pos is not None:
+            self._prevent_internal_wall_crossing(prev_pos)
+        self._resolve_internal_wall_capsules(prev_pos)
+        self._resolve_gate_wall_collisions()
+
+    def _prevent_internal_wall_crossing(self, prev_pos: torch.Tensor):
+        """Undo complete crossings through line-segment internal walls.
+
+        Position-only push-out can miss a wall if crowd pressure moves a robot
+        from one side of a thin wall to the other in one solver pass.  This
+        swept side test puts the robot back on the side it occupied before
+        the move/contact.
+        """
+        if not self.gate_wall_segments:
+            return
+
+        clearance = (
+            self.cfg.robot_radius
+            + 0.5 * float(getattr(self.cfg, "shelter_wall_thickness", 0.0))
+            + float(getattr(self.cfg, "wall_contact_epsilon", 1e-4))
+        )
+        eps = 1e-8
+
+        for ax, ay, bx, by in self.gate_wall_segments:
+            abx = bx - ax
+            aby = by - ay
+            length_sq = abx * abx + aby * aby
+            if length_sq <= eps:
+                continue
+
+            length = math.sqrt(length_sq)
+            normal = torch.tensor(
+                (-aby / length, abx / length),
+                dtype=self.agent_pos.dtype,
+                device=self.device,
+            )
+            anchor = torch.tensor(
+                (ax, ay),
+                dtype=self.agent_pos.dtype,
+                device=self.device,
+            )
+            tangent = torch.tensor(
+                (abx, aby),
+                dtype=self.agent_pos.dtype,
+                device=self.device,
+            )
+
+            prev_rel = prev_pos - anchor.view(1, 1, 2)
+            curr_rel = self.agent_pos - anchor.view(1, 1, 2)
+            prev_signed = (prev_rel * normal.view(1, 1, 2)).sum(dim=-1)
+            curr_signed = (curr_rel * normal.view(1, 1, 2)).sum(dim=-1)
+
+            denom = prev_signed - curr_signed
+            safe_denom = torch.where(denom.abs() > eps, denom, torch.ones_like(denom))
+            sweep_t = torch.where(
+                denom.abs() > eps,
+                prev_signed / safe_denom,
+                torch.zeros_like(denom),
+            )
+            intersection = prev_pos + (self.agent_pos - prev_pos) * sweep_t.unsqueeze(-1)
+            wall_u = (
+                ((intersection - anchor.view(1, 1, 2)) * tangent.view(1, 1, 2)).sum(dim=-1)
+                / length_sq
+            )
+
+            crossed = (
+                (prev_signed * curr_signed < 0.0)
+                & (sweep_t >= 0.0)
+                & (sweep_t <= 1.0)
+                & (wall_u >= 0.0)
+                & (wall_u <= 1.0)
+            )
+            if not crossed.any():
+                continue
+
+            prev_side = torch.sign(prev_signed)
+            prev_side = torch.where(prev_side == 0.0, -torch.sign(curr_signed), prev_side)
+            prev_side = torch.where(prev_side == 0.0, torch.ones_like(prev_side), prev_side)
+            desired_signed = prev_side * clearance
+            correction = (desired_signed - curr_signed).unsqueeze(-1) * normal.view(1, 1, 2)
+            corrected_pos = self.agent_pos + correction
+            self.agent_pos = torch.where(crossed.unsqueeze(-1), corrected_pos, self.agent_pos)
+
+    def _resolve_internal_wall_capsules(self, prev_pos: torch.Tensor | None = None):
+        """Resolve finite internal wall segments as capsules with wall thickness."""
+        if not self.gate_wall_segments:
+            return
+
+        wall_thickness = float(getattr(
+            self.cfg,
+            "shelter_wall_thickness",
+            getattr(self.cfg, "internal_wall_thickness", 0.01),
+        ))
+        clearance = (
+            self.cfg.robot_radius
+            + 0.5 * wall_thickness
+            + float(getattr(self.cfg, "wall_contact_epsilon", 1e-4))
+        )
+        eps = 1e-8
+
+        for ax, ay, bx, by in self.gate_wall_segments:
+            abx = bx - ax
+            aby = by - ay
+            length_sq = abx * abx + aby * aby
+            if length_sq <= eps:
+                continue
+
+            length = math.sqrt(length_sq)
+            normal = torch.tensor(
+                (-aby / length, abx / length),
+                dtype=self.agent_pos.dtype,
+                device=self.device,
+            )
+            anchor = torch.tensor(
+                (ax, ay),
+                dtype=self.agent_pos.dtype,
+                device=self.device,
+            )
+            tangent = torch.tensor(
+                (abx, aby),
+                dtype=self.agent_pos.dtype,
+                device=self.device,
+            )
+
+            rel = self.agent_pos - anchor.view(1, 1, 2)
+            u = (rel * tangent.view(1, 1, 2)).sum(dim=-1) / length_sq
+            u_clamped = u.clamp(0.0, 1.0)
+            closest = anchor.view(1, 1, 2) + u_clamped.unsqueeze(-1) * tangent.view(1, 1, 2)
+            delta = self.agent_pos - closest
+            raw_dist = torch.linalg.norm(delta, dim=-1)
+            dist = raw_dist.clamp_min(eps)
+
+            curr_signed = (rel * normal.view(1, 1, 2)).sum(dim=-1)
+            if prev_pos is not None:
+                prev_rel = prev_pos - anchor.view(1, 1, 2)
+                side = torch.sign((prev_rel * normal.view(1, 1, 2)).sum(dim=-1))
+                side = torch.where(side == 0.0, torch.sign(curr_signed), side)
+            else:
+                side = torch.sign(curr_signed)
+            side = torch.where(side == 0.0, torch.ones_like(side), side)
+
+            side_dir = side.unsqueeze(-1) * normal.view(1, 1, 2)
+            radial_dir = torch.where(
+                (raw_dist > eps).unsqueeze(-1),
+                delta / dist.unsqueeze(-1),
+                side_dir,
+            )
+            on_segment_span = (u >= 0.0) & (u <= 1.0)
+            push_dir = torch.where(on_segment_span.unsqueeze(-1), side_dir, radial_dir)
+
+            penetration = clearance - dist
+            near = penetration > 0.0
+            corrected = self.agent_pos + penetration.clamp_min(0.0).unsqueeze(-1) * push_dir
+            self.agent_pos = torch.where(near.unsqueeze(-1), corrected, self.agent_pos)
+
     def _resolve_wall_collisions(self):
         """Push robots inside the dodecagonal arena boundary (fully vectorized)."""
-        r = self.cfg.robot_radius
+        r = (
+            self.cfg.robot_radius
+            + 0.5 * float(getattr(self.cfg, "arena_wall_thickness", 0.01))
+            + float(getattr(self.cfg, "wall_contact_epsilon", 1e-4))
+        )
         normals = self._wall_normals   # (n, 2)
         points = self._wall_points     # (n, 2)
 
@@ -923,27 +1119,13 @@ class DirectionalGateEnv(DirectMARLEnv):
         """Compute per-agent observations.  Layout depends on variant."""
         cfg = self.cfg
 
-        # Reuse cached sensors if available (discrete variants compute them
-        # in _apply_action already), otherwise compute fresh
+        if self._sensor_cache is None:
+            self._sensor_cache = self._compute_sensor_bundle()
         cache = self._sensor_cache
-        if cache is not None:
-            prox_vals = cache["prox_vals"]
-            light_vals = cache["light_vals"]
-            ztilde = cache["ztilde"]
-            rab_proj = cache["rab_proj"]
-            self._sensor_cache = None  # consume cache
-        else:
-            prox_vals, _, _ = self.sensors.compute_proximity(
-                self.agent_pos, self.agent_yaw,
-                obstacle_segments=self.wall_segments,
-                all_agent_pos=self.agent_pos,
-                robot_radius=cfg.robot_radius,
-            )
-            light_vals, _, _ = self._compute_light_readings()
-            ztilde, rab_proj, _, _ = self.sensors.compute_rab(
-                self.agent_pos, self.agent_yaw,
-                obstacle_segments=self.wall_segments,
-            )
+        prox_vals = cache["prox_vals"]
+        light_vals = cache["light_vals"]
+        ztilde = cache["ztilde"]
+        rab_proj = cache["rab_proj"]
 
         ground = self._ground_color(self.agent_pos)  # (E, N, 3)
 
@@ -1014,7 +1196,10 @@ class DirectionalGateEnv(DirectMARLEnv):
 
     def _get_dones(self) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         """No early termination; episode ends by time limit only."""
-        time_out = self.episode_length_buf >= self.max_episode_length - 1
+        time_out = self.episode_length_buf >= self.max_episode_length
+        if time_out.any():
+            terminal_state = self.get_critic_state()
+            self.completed_terminal_critic_state[time_out] = terminal_state[time_out]
 
         terminated = {agent: torch.zeros_like(time_out) for agent in self.cfg.possible_agents}
         truncated = {agent: time_out for agent in self.cfg.possible_agents}
@@ -1071,9 +1256,7 @@ class DirectionalGateEnv(DirectMARLEnv):
         self.agent_pos[idx] = self._sample_spawn_positions(n_reset, N)
         self.agent_yaw[idx] = torch.rand(n_reset, N, device=self.device) * 2 * math.pi - math.pi
 
-        self._resolve_wall_collisions()
-        self._resolve_gate_wall_collisions()
-        self._resolve_robot_collisions()
+        self._resolve_collisions()
 
         # Reset ground-color tracking for crossing detection
         reset_color = self._ground_color(self.agent_pos[idx])[:, :, 0]  # (len(idx), N)
@@ -1099,6 +1282,6 @@ class DirectionalGateEnv(DirectMARLEnv):
             self.agent_pos,
             self.agent_yaw,
             self.arena_center,
-            self.cfg.arena_circumradius,
-            self.light_dir,
+            self.cfg.critic_state_radius,
+            self.critic_reference_dir,
         )

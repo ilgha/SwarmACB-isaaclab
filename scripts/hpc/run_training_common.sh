@@ -18,6 +18,7 @@ echo "  Job ID:       ${SLURM_JOB_ID:-local}"
 echo "  Node:         $(hostname)"
 echo "  GPUs:         ${CUDA_VISIBLE_DEVICES:-unset}"
 echo "  Array task:   $RUN_SUFFIX"
+echo "  Seed:         $RUN_SUFFIX"
 echo "  Date:         $(date)"
 echo "  Project:      $PROJECT_DIR"
 echo "  Container:    $CONTAINER"
@@ -43,6 +44,7 @@ apptainer exec \
         python scripts/train.py \
             --config $CONFIG_PATH \
             --headless \
+            --seed $RUN_SUFFIX \
             --log_dir $RUN_DIR \
             --checkpoint_dir $CHECKPOINT_DIR
     "

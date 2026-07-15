@@ -10,6 +10,7 @@
 
 behaviors:
   DirGate_lily:
+    task: SwarmACB-DirectionalGate-v0
     variant: lily
     trainer_type: poca
 
