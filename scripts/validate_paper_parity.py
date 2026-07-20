@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import argparse
 import ast
+import importlib.util
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import yaml
 
@@ -52,6 +54,20 @@ class Audit:
             self.errors.append(f"{label}: expected {expected!r}, got {actual!r}")
 
 
+def load_network_config_module(root: Path):
+    """Load the runtime resolver without importing Isaac Lab."""
+    path = (
+        root
+        / "source/SwarmACB_isaac/SwarmACB_isaac/tasks/direct/agents/network_config.py"
+    )
+    spec = importlib.util.spec_from_file_location("swarmacb_network_config", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load network configuration helper: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def one_behavior(path: Path, audit: Audit) -> tuple[str, dict]:
     with path.open("r", encoding="utf-8") as stream:
         document = yaml.safe_load(stream)
@@ -62,7 +78,14 @@ def one_behavior(path: Path, audit: Audit) -> tuple[str, dict]:
     return next(iter(behaviors.items()))
 
 
-def audit_config(path: Path, mission: str, variant: str, is_oc: bool, audit: Audit) -> None:
+def audit_config(
+    path: Path,
+    mission: str,
+    variant: str,
+    is_oc: bool,
+    audit: Audit,
+    network_config,
+) -> None:
     run_name, block = one_behavior(path, audit)
     prefix = path.name
     task, duration, max_steps, interval = MISSIONS[mission]
@@ -97,6 +120,43 @@ def audit_config(path: Path, mission: str, variant: str, is_oc: bool, audit: Aud
         audit.equal(f"{prefix}.memory_size", memory_block.get("memory_size"), memory[0])
         audit.equal(f"{prefix}.sequence_length", memory_block.get("sequence_length"), memory[1])
 
+    # Exercise the exact dependency-free resolver used by config_loader.py.
+    # This catches a valid YAML value silently diverging at trainer runtime.
+    resolved = SimpleNamespace(
+        hidden_dim=128 if is_oc else 512,
+        num_layers=1 if is_oc else 2,
+        critic_hidden_dim=128,
+        critic_num_layers=2,
+        critic_num_heads=4,
+        recurrent=is_oc,
+        memory_size=128,
+        sequence_length=128,
+    )
+    if is_oc:
+        resolved.num_options = 6
+    network_config.apply_network_settings(
+        resolved,
+        network,
+        block.get("critic_settings", {}),
+        variant,
+        block,
+    )
+    audit.equal(f"{prefix}.resolved_actor_hidden", resolved.hidden_dim, hidden)
+    audit.equal(f"{prefix}.resolved_actor_layers", resolved.num_layers, layers)
+    audit.equal(f"{prefix}.resolved_critic_hidden", resolved.critic_hidden_dim, hidden)
+    audit.equal(f"{prefix}.resolved_critic_layers", resolved.critic_num_layers, layers)
+    audit.equal(f"{prefix}.resolved_critic_heads", resolved.critic_num_heads, 4)
+    audit.equal(f"{prefix}.resolved_recurrent", resolved.recurrent, memory is not None)
+    if memory is not None:
+        audit.equal(f"{prefix}.resolved_memory_size", resolved.memory_size, memory[0])
+        audit.equal(
+            f"{prefix}.resolved_sequence_length",
+            resolved.sequence_length,
+            memory[1],
+        )
+    if is_oc:
+        audit.equal(f"{prefix}.resolved_num_options", resolved.num_options, 6)
+
     reward = block.get("reward_signals", {}).get("extrinsic", {})
     audit.close(f"{prefix}.gamma", reward.get("gamma"), 0.99)
     audit.close(f"{prefix}.reward_strength", reward.get("strength"), 1.0)
@@ -123,6 +183,53 @@ def class_constants(path: Path, class_name: str) -> dict[str, object]:
                         pass
             return values
     return {}
+
+
+def function_call_count(path: Path, function_name: str) -> int:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    return sum(
+        1
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == function_name
+    )
+
+
+def audit_network_resolution(root: Path, network_config, audit: Audit) -> None:
+    audit.equal("paper parity version", network_config.PAPER_PARITY_VERSION, 4)
+
+    loader = (
+        root
+        / "source/SwarmACB_isaac/SwarmACB_isaac/tasks/direct/agents/config_loader.py"
+    )
+    audit.equal(
+        "config_loader shared network resolver calls",
+        function_call_count(loader, "apply_network_settings"),
+        1,
+    )
+
+    # An explicit Isaac-only critic override remains supported.
+    override = SimpleNamespace(
+        hidden_dim=512,
+        num_layers=2,
+        critic_hidden_dim=128,
+        critic_num_layers=2,
+        critic_num_heads=4,
+        recurrent=False,
+        memory_size=128,
+        sequence_length=128,
+    )
+    network_config.apply_network_settings(
+        override,
+        {"hidden_units": 512, "num_layers": 2},
+        {"hidden_units": 64, "num_layers": 3, "num_heads": 2},
+        "dandelion",
+        {},
+    )
+    audit.equal("explicit critic hidden override", override.critic_hidden_dim, 64)
+    audit.equal("explicit critic layers override", override.critic_num_layers, 3)
+    audit.equal("explicit critic heads override", override.critic_num_heads, 2)
 
 
 def audit_environment_sources(root: Path, audit: Audit) -> None:
@@ -200,16 +307,32 @@ def main() -> int:
     root = args.repo_root.resolve()
     config_dir = root / "configs"
     audit = Audit()
+    network_config = load_network_config_module(root)
+    audit_network_resolution(root, network_config, audit)
 
     expected_files: set[str] = set()
     for mission in MISSIONS:
         for variant in VARIANTS:
             filename = f"{mission}_{variant}.yaml"
             expected_files.add(filename)
-            audit_config(config_dir / filename, mission, variant, False, audit)
+            audit_config(
+                config_dir / filename,
+                mission,
+                variant,
+                False,
+                audit,
+                network_config,
+            )
         filename = f"OC_{mission}_cyclamen.yaml"
         expected_files.add(filename)
-        audit_config(config_dir / filename, mission, "cyclamen", True, audit)
+        audit_config(
+            config_dir / filename,
+            mission,
+            "cyclamen",
+            True,
+            audit,
+            network_config,
+        )
 
     actual_files = {path.name for path in config_dir.glob("*.yaml")}
     audit.equal("config file set", actual_files, expected_files)
@@ -226,7 +349,10 @@ def main() -> int:
         f"{audit.checks} checks."
     )
     print("Clock: 10 Hz | robots: 20 | envs: 5 | episodes/design: 5000")
-    print("Fresh paper-parity-v3 checkpoints are required for comparison.")
+    print(
+        f"Fresh paper-parity-v{network_config.PAPER_PARITY_VERSION} checkpoints "
+        "are required for comparison."
+    )
     return 0
 
 

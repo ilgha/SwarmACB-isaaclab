@@ -392,9 +392,14 @@ behaviors:
         sequence_length: 128
 ```
 
-Cyclamen and fixed Option-Critic checkpoints produced before paper-parity
-version 3 use incompatible recurrent/critic/training-cadence semantics. They remain usable for
-historical evaluation, but parity experiments must start from fresh weights.
+Checkpoints produced before paper-parity version 4 use incompatible network or
+training semantics. Version 4 makes the centralized critic inherit
+`hidden_units` and `num_layers` from `network_settings`, exactly as Unity passes
+the same `NetworkSettings` object to its actor and POCA critic. They remain
+usable for historical evaluation, but parity experiments must start from fresh
+weights. At startup, Cyclamen and fixed Option-Critic must report a
+`hidden=128 layers=1` critic; Dandelion, Daisy, and Lily must report
+`hidden=512 layers=2`.
 
 Before submitting the full HPC matrix, run the dependency-light parity audit:
 
@@ -402,9 +407,9 @@ Before submitting the full HPC matrix, run the dependency-light parity audit:
 python scripts/validate_paper_parity.py
 ```
 
-It validates all 30 YAML files, experiment budgets, network sizes, recurrent
-semantics, and the mission geometry/constants that are most sensitive to Unity
-scene overrides.
+It validates all 30 YAML files, experiment budgets, raw and runtime-resolved
+actor/critic network sizes, recurrent semantics, and the mission
+geometry/constants that are most sensitive to Unity scene overrides.
 
 The HPC array launcher passes `SLURM_ARRAY_TASK_ID` as `--seed`, so the ten
 controllers use reproducible seeds 0 through 9. Training also follows the

@@ -28,6 +28,7 @@ from .option_critic_buffer import FixedOptionRolloutBuffer
 from .option_critic_networks import FixedOptionManager
 from .poca_networks import POCACritic
 from .poca_trainer import PolynomialDecay, trust_region_value_loss
+from .network_config import PAPER_PARITY_VERSION
 
 
 @dataclass
@@ -888,8 +889,8 @@ class FixedOptionCriticTrainer:
     def save_checkpoint(self, path):
         torch.save({
             "trainer_type": "option_critic",
-            "option_critic_version": 6,
-            "paper_parity_version": 3,
+            "option_critic_version": 7,
+            "paper_parity_version": PAPER_PARITY_VERSION,
             "fixed_options": True,
             "collective_counterfactual": True,
             "variant": self.variant,
@@ -922,10 +923,11 @@ class FixedOptionCriticTrainer:
     def load_checkpoint(self, path):
         ckpt = torch.load(path, map_location=self.device)
         parity_version = int(ckpt.get("paper_parity_version", 0))
-        if parity_version != 3:
+        if parity_version != PAPER_PARITY_VERSION:
             raise RuntimeError(
-                "Refusing to resume a pre-parity Option-Critic checkpoint. "
-                "Use it only for legacy evaluation and start parity-v3 training fresh."
+                f"Refusing to resume a parity-v{parity_version} Option-Critic "
+                f"checkpoint with the parity-v{PAPER_PARITY_VERSION} trainer. "
+                "Use it only for legacy evaluation and start training fresh."
             )
         try:
             self.manager.load_state_dict(ckpt["manager"])
@@ -933,7 +935,7 @@ class FixedOptionCriticTrainer:
             self.optimizer.load_state_dict(ckpt["optimizer"])
         except RuntimeError as exc:
             raise RuntimeError(
-                "Checkpoint architecture does not match Option-Critic parity v6. "
+                "Checkpoint architecture does not match Option-Critic version 7. "
                 "Legacy checkpoints remain available for evaluation; retraining "
                 "must start fresh."
             ) from exc

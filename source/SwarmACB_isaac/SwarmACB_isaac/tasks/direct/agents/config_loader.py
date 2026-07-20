@@ -19,6 +19,7 @@ import yaml
 
 from .poca_trainer import POCAConfig
 from .option_critic_trainer import FixedOptionCriticConfig
+from .network_config import apply_network_settings
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -96,19 +97,9 @@ def load_config(path: str | Path) -> tuple[str, str, Any, dict[str, Any]]:
     cfg.eps_schedule = hypers.get("epsilon_schedule", "constant")
     cfg.beta_schedule = hypers.get("beta_schedule", "constant")
 
-    # Network
-    cfg.hidden_dim = network.get("hidden_units", cfg.hidden_dim)
-    cfg.num_layers = network.get("num_layers", cfg.num_layers)
-    cfg.critic_hidden_dim = critic.get("hidden_units", cfg.critic_hidden_dim)
-    cfg.critic_num_layers = critic.get("num_layers", cfg.critic_num_layers)
-    cfg.critic_num_heads = critic.get("num_heads", cfg.critic_num_heads)
-    if hasattr(cfg, "num_options"):
-        cfg.num_options = network.get("num_options", block.get("num_options", cfg.num_options))
-    memory = network.get("memory", {})
-    cfg.recurrent = bool(memory) or variant == "cyclamen"
-    if cfg.recurrent:
-        cfg.memory_size = memory.get("memory_size", cfg.memory_size)
-        cfg.sequence_length = memory.get("sequence_length", cfg.sequence_length)
+    # Unity passes one NetworkSettings object to actor and critic. Optional
+    # critic_settings values override that shared architecture explicitly.
+    apply_network_settings(cfg, network, critic, variant, block)
 
     # Reward signals
     extrinsic = reward.get("extrinsic", {})

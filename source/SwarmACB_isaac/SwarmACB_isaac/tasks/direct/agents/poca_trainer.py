@@ -34,6 +34,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from .poca_networks import Actor, DiscreteActor, RecurrentDiscreteActor, POCACritic
 from .poca_buffer import POCARolloutBuffer
+from .network_config import PAPER_PARITY_VERSION
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1036,7 +1037,7 @@ class POCATrainer:
 
     def save_checkpoint(self, path):
         torch.save({
-            "paper_parity_version": 3,
+            "paper_parity_version": PAPER_PARITY_VERSION,
             "actor": self.actor.state_dict(),
             "critic": self.critic.state_dict(),
             "optimizer": self.optimizer.state_dict(),
@@ -1066,11 +1067,12 @@ class POCATrainer:
     def load_checkpoint(self, path):
         ckpt = torch.load(path, map_location=self.device)
         parity_version = int(ckpt.get("paper_parity_version", 0))
-        if parity_version != 3:
+        if parity_version != PAPER_PARITY_VERSION:
             raise RuntimeError(
-                "Refusing to resume a pre-parity checkpoint. Its rollout cadence, "
-                "entropy objective, critic state, or recurrent layout may differ. "
-                "Use it only for legacy evaluation and start paper-parity training fresh."
+                f"Refusing to resume a parity-v{parity_version} checkpoint with "
+                f"the parity-v{PAPER_PARITY_VERSION} trainer. Its critic architecture "
+                "or training semantics may differ. Use it only for legacy evaluation "
+                "and start paper-parity training fresh."
             )
         try:
             self.actor.load_state_dict(ckpt["actor"])
