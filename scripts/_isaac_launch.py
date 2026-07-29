@@ -8,6 +8,23 @@ from __future__ import annotations
 
 import os
 import re
+import sys
+
+
+FORWARDED_KIT_ARGS_ENV = "SWARMACB_FORWARDED_KIT_ARGS"
+
+
+def consume_forwarded_kit_args(args, label: str = "IsaacLaunch") -> None:
+    """Merge custom Kit args forwarded by a parent script without CLI splitting."""
+    forwarded = os.environ.pop(FORWARDED_KIT_ARGS_ENV, "").strip()
+    if not forwarded:
+        return
+
+    direct = (getattr(args, "kit_args", "") or "").strip()
+    # Put direct child arguments last so they take precedence if both sources
+    # explicitly set the same Kit setting.
+    args.kit_args = " ".join(part for part in (forwarded, direct) if part)
+    print(f"[{label}] Received custom Kit args from the parent process.", flush=True)
 
 
 def _kit_setting_present(kit_args: str, setting_path: str) -> bool:
@@ -59,13 +76,30 @@ def _parse_gui_resolution(value: str) -> tuple[int, int] | None:
     return width, height
 
 
-def apply_gui_performance_defaults(args, label: str = "IsaacLaunch") -> None:
+def _resolve_async_rendering(args, lightweight_viewer: bool) -> bool | None:
+    """Resolve the async-rendering mode; ``None`` leaves Isaac's default intact."""
+    mode = getattr(args, "gui_async_rendering", "auto")
+    if mode == "on":
+        return True
+    if mode == "off":
+        return False
+    # Async rendering can leave the editor viewport black while a standalone
+    # script manually drives SimulationContext.render(). Keep it opt-in.
+    return None
+
+
+def apply_gui_performance_defaults(
+    args,
+    label: str = "IsaacLaunch",
+    *,
+    lightweight_viewer: bool = False,
+) -> None:
     """Apply GUI-preserving performance defaults for playback scripts.
 
     The default keeps the same rendering and visible scene features as the
-    normal viewer, but uncaps Isaac's run loops so the app can use more of the
-    machine. More aggressive changes such as lower resolution, lower texture
-    budget, or material override are opt-in CLI flags.
+    normal viewer, but uncaps Isaac's run loops and prevents RTX eco-mode from
+    pausing an animated viewport. More aggressive quality and asynchronous
+    rendering changes remain opt-in CLI flags.
     """
     if getattr(args, "headless", False):
         return
@@ -82,7 +116,14 @@ def apply_gui_performance_defaults(args, label: str = "IsaacLaunch") -> None:
     if (
         use_rendering_tweaks
         and getattr(args, "rendering_mode", None) == "balanced"
-        and not getattr(args, "rendering_mode_explicit", False)
+        and not getattr(
+            args,
+            "rendering_mode_explicit",
+            any(
+                token == "--rendering_mode" or token.startswith("--rendering_mode=")
+                for token in sys.argv
+            ),
+        )
     ):
         args.rendering_mode = "performance"
         print(f"[{label}] GUI rendering mode defaulted to performance.", flush=True)
@@ -114,13 +155,50 @@ def apply_gui_performance_defaults(args, label: str = "IsaacLaunch") -> None:
     )
     args._gui_runtime_texture_budget = texture_budget > 0.0 and not texture_setting_explicit
 
-    additions: list[tuple[str, str]] = [
+    bool_defaults: list[tuple[str, str]] = [
         ("/app/runLoopsGlobal/syncToPresent", "--/app/runLoopsGlobal/syncToPresent=false"),
         ("/app/runLoops/main/manualModeEnabled", "--/app/runLoops/main/manualModeEnabled=true"),
         ("/app/runLoops/main/rateLimitEnabled", "--/app/runLoops/main/rateLimitEnabled=false"),
         ("/app/runLoops/present/rateLimitEnabled", "--/app/runLoops/present/rateLimitEnabled=false"),
         ("/app/runLoops/rendering_0/rateLimitEnabled", "--/app/runLoops/rendering_0/rateLimitEnabled=false"),
+        ("/rtx/ecoMode/enabled", "--/rtx/ecoMode/enabled=false"),
     ]
+    # Convert the CLI strings above to runtime values while retaining the
+    # original spelling for Kit startup.
+    additions: list[tuple[str, str]] = list(bool_defaults)
+    runtime_bools = {
+        path: argument.rsplit("=", 1)[-1].lower() == "true"
+        for path, argument in bool_defaults
+        if not _kit_setting_present(existing_kit_args, path)
+    }
+
+    int_defaults: list[tuple[str, int, str]] = [
+        ("/app/renderer/sleepMsOnFocus", 0, "--/app/renderer/sleepMsOnFocus=0"),
+        ("/app/renderer/sleepMsOutOfFocus", 0, "--/app/renderer/sleepMsOutOfFocus=0"),
+    ]
+    additions.extend((path, argument) for path, _, argument in int_defaults)
+    runtime_ints = {
+        path: value
+        for path, value, _ in int_defaults
+        if not _kit_setting_present(existing_kit_args, path)
+    }
+
+    async_rendering = _resolve_async_rendering(args, lightweight_viewer)
+    if async_rendering is not None:
+        async_defaults = [
+            ("/exts/isaacsim.core.throttling/enable_async", False),
+            ("/app/asyncRendering", async_rendering),
+            ("/app/omni.usd/asyncHandshake", async_rendering),
+            ("/omni/replicator/asyncRendering", async_rendering),
+        ]
+        for path, value in async_defaults:
+            argument = f"--{path}={'true' if value else 'false'}"
+            additions.append((path, argument))
+            if not _kit_setting_present(existing_kit_args, path):
+                runtime_bools[path] = value
+
+    args._gui_runtime_bool_settings = runtime_bools
+    args._gui_runtime_int_settings = runtime_ints
     if use_rendering_tweaks:
         additions.append(("/rtx/post/dlss/execMode", "--/rtx/post/dlss/execMode=0"))
     if texture_budget > 0.0:
@@ -155,17 +233,16 @@ def apply_runtime_gui_performance_settings(args, label: str = "IsaacLaunch") -> 
     """Re-apply selected settings after Kit starts, when carb is available."""
     if getattr(args, "headless", False):
         return
-    if getattr(args, "gui_performance_preset", "fast") == "off":
+    if getattr(args, "gui_performance_preset", "same") == "off":
         return
     try:
         import carb
 
         settings = carb.settings.get_settings()
-        settings.set_bool("/app/runLoopsGlobal/syncToPresent", False)
-        settings.set_bool("/app/runLoops/main/manualModeEnabled", True)
-        settings.set_bool("/app/runLoops/main/rateLimitEnabled", False)
-        settings.set_bool("/app/runLoops/present/rateLimitEnabled", False)
-        settings.set_bool("/app/runLoops/rendering_0/rateLimitEnabled", False)
+        for path, value in getattr(args, "_gui_runtime_bool_settings", {}).items():
+            settings.set_bool(path, value)
+        for path, value in getattr(args, "_gui_runtime_int_settings", {}).items():
+            settings.set_int(path, value)
         if getattr(args, "_gui_runtime_material_override", False):
             settings.set_int("/rtx/debugMaterialType", 0)
         texture_budget = float(getattr(args, "gui_texture_budget", 0.0))
@@ -217,6 +294,15 @@ def add_gui_performance_args(parser) -> None:
         type=int,
         default=0,
         help="Optional cap for Isaac/PhysX worker threads; 0 leaves Isaac's default",
+    )
+    group.add_argument(
+        "--gui-async-rendering",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help=(
+            "Async render thread: auto keeps Isaac's stable default, on forces "
+            "it, and off explicitly forces synchronous rendering"
+        ),
     )
 
 

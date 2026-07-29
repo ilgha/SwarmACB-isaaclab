@@ -19,6 +19,7 @@ import yaml
 
 from .poca_trainer import POCAConfig
 from .option_critic_trainer import FixedOptionCriticConfig
+from .learned_option_critic_trainer import LearnedOptionCriticConfig
 from .network_config import apply_network_settings
 
 
@@ -35,7 +36,7 @@ def load_config(path: str | Path) -> tuple[str, str, Any, dict[str, Any]]:
         The behaviour key (e.g. ``"DirGate_dandelion"``).
     variant : str
         CASA variant extracted from the config.
-    cfg : POCAConfig | FixedOptionCriticConfig
+    cfg : POCAConfig | FixedOptionCriticConfig | LearnedOptionCriticConfig
         Fully populated trainer config.
     env_overrides : dict
         Keys that should be applied to the env cfg.
@@ -65,7 +66,15 @@ def load_config(path: str | Path) -> tuple[str, str, Any, dict[str, Any]]:
     task_id = block.get("task", environment.get("task", None))
 
     # Build the selected trainer config.
-    if trainer_type in ("option_critic", "fixed_option_critic", "fixed_oc", "oc"):
+    if trainer_type in (
+        "learned_option_critic",
+        "option_critic_2",
+        "learned_oc",
+        "oc2",
+    ):
+        cfg = LearnedOptionCriticConfig()
+        cfg.trainer_type = "learned_option_critic"
+    elif trainer_type in ("option_critic", "fixed_option_critic", "fixed_oc", "oc"):
         cfg = FixedOptionCriticConfig()
         cfg.trainer_type = "option_critic"
     elif trainer_type == "poca":
@@ -81,16 +90,28 @@ def load_config(path: str | Path) -> tuple[str, str, Any, dict[str, Any]]:
     cfg.clip_eps = hypers.get("epsilon", cfg.clip_eps)
     cfg.lam = hypers.get("lambd", cfg.lam)
     cfg.num_epochs = hypers.get("num_epoch", cfg.num_epochs)
-    if hasattr(cfg, "termination_penalty"):
-        cfg.termination_penalty = hypers.get("termination_penalty", cfg.termination_penalty)
-        cfg.termination_coef = hypers.get("termination_coef", cfg.termination_coef)
-        cfg.termination_entropy_coef = hypers.get(
-            "termination_entropy_coef",
-            cfg.termination_entropy_coef,
-        )
-        cfg.value_coef = hypers.get("value_coef", cfg.value_coef)
-        cfg.option_value_coef = hypers.get("option_value_coef", cfg.option_value_coef)
-        cfg.baseline_coef = hypers.get("baseline_coef", cfg.baseline_coef)
+    option_critic_hyperparameters = {
+        "termination_penalty": "termination_penalty",
+        "termination_coef": "termination_coef",
+        "termination_entropy_coef": "termination_entropy_coef",
+        "value_coef": "value_coef",
+        "option_value_coef": "option_value_coef",
+        "baseline_coef": "baseline_coef",
+        "intra_option_coef": "intra_option_coef",
+        "selector_coef": "selector_coef",
+        "option_entropy_coef": "option_entropy_coef",
+        "action_baseline_coef": "action_baseline_coef",
+        "option_baseline_coef": "option_baseline_coef",
+        "attention_diversity_coef": "attention_diversity_coef",
+        "attention_temporal_coef": "attention_temporal_coef",
+    }
+    for yaml_key, config_key in option_critic_hyperparameters.items():
+        if hasattr(cfg, config_key):
+            setattr(
+                cfg,
+                config_key,
+                hypers.get(yaml_key, getattr(cfg, config_key)),
+            )
 
     # Schedules: "linear" or "constant"  (default: constant)
     cfg.lr_schedule = hypers.get("learning_rate_schedule", "constant")
@@ -142,7 +163,12 @@ def load_config(path: str | Path) -> tuple[str, str, Any, dict[str, Any]]:
 def print_config(run_name: str, variant: str, cfg: Any, env_ov: dict):
     """Print a human-readable summary matching ML-Agents console output."""
     trainer_type = getattr(cfg, "trainer_type", "poca")
-    trainer_label = "Fixed Option-Critic" if trainer_type == "option_critic" else "POCA"
+    if trainer_type == "learned_option_critic":
+        trainer_label = "Learned Option-Critic (Phase 2)"
+    elif trainer_type == "option_critic":
+        trainer_label = "Fixed Option-Critic (Phase 1)"
+    else:
+        trainer_label = "POCA"
     sep = "-" * 60
     print(f"\n{sep}")
     print(f"  SwarmACB Training Config")
@@ -165,7 +191,16 @@ def print_config(run_name: str, variant: str, cfg: Any, env_ov: dict):
         print(f"    termination_entropy : {cfg.termination_entropy_coef}")
         print(f"    value_coef          : {cfg.value_coef}")
         print(f"    option_value_coef   : {cfg.option_value_coef}")
-        print(f"    baseline_coef       : {cfg.baseline_coef}")
+        if hasattr(cfg, "baseline_coef"):
+            print(f"    baseline_coef       : {cfg.baseline_coef}")
+        if hasattr(cfg, "intra_option_coef"):
+            print(f"    intra_option_coef   : {cfg.intra_option_coef}")
+            print(f"    selector_coef       : {cfg.selector_coef}")
+            print(f"    action_baseline     : {cfg.action_baseline_coef}")
+            print(f"    option_baseline     : {cfg.option_baseline_coef}")
+            print(f"    option_entropy      : {cfg.option_entropy_coef}")
+            print(f"    attention_diversity : {cfg.attention_diversity_coef}")
+            print(f"    attention_temporal  : {cfg.attention_temporal_coef}")
     print(f"  Network")
     print(f"    hidden_units        : {cfg.hidden_dim}")
     print(f"    num_layers          : {cfg.num_layers}")
@@ -173,7 +208,12 @@ def print_config(run_name: str, variant: str, cfg: Any, env_ov: dict):
     print(f"    critic_layers       : {cfg.critic_num_layers}")
     print(f"    critic_heads        : {cfg.critic_num_heads}")
     if hasattr(cfg, "num_options"):
-        print(f"    fixed_options       : {cfg.num_options}")
+        option_label = (
+            "learned_options"
+            if trainer_type == "learned_option_critic"
+            else "fixed_options"
+        )
+        print(f"    {option_label:20s}: {cfg.num_options}")
     if cfg.recurrent:
         print(f"    memory_size         : {cfg.memory_size} ({cfg.memory_size // 2} LSTM units)")
         print(f"    sequence_length     : {cfg.sequence_length}")

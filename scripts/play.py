@@ -2,7 +2,7 @@
 # Copyright (c) 2025 SwarmACB Project
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Play / evaluate a trained POCA or fixed-option Option-Critic agent.
+"""Play or evaluate POCA and both Option-Critic phases.
 
 Usage:
     # Preferred: config + checkpoint
@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import glob
 import math
 import os
 import sys
@@ -24,6 +25,7 @@ import time
 
 from isaaclab.app import AppLauncher
 from _isaac_launch import (
+    FORWARDED_KIT_ARGS_ENV,
     add_gui_performance_args,
     apply_gui_performance_defaults,
     apply_runtime_gui_performance_settings,
@@ -41,7 +43,7 @@ parser.add_argument("--task", type=str, default=None,
                     help="Registered Gymnasium task ID; overrides config task")
 parser.add_argument("--variant", type=str, default=None,
                     choices=["dandelion", "daisy", "lily", "tulip", "cyclamen"])
-parser.add_argument("--checkpoint", type=str, required=True,
+parser.add_argument("--checkpoint", type=str, default=None,
                     help="Path to trained checkpoint (.pt)")
 parser.add_argument("--num_envs", type=int, default=1)
 parser.add_argument("--num_episodes", type=int, default=10,
@@ -58,18 +60,58 @@ parser.add_argument("--sim-hz", type=float, default=60.0,
                     help="Fast viewer render / kinematic update rate")
 parser.add_argument("--control-hz", type=float, default=10.0,
                     help="Fast viewer policy decision rate")
+parser.add_argument("--playback-speed", type=float, default=1.0,
+                    help="Fast-viewer simulation speed relative to real time; 0 runs uncapped")
 parser.add_argument("--visual-hz", type=float, default=60.0,
-                    help="GUI simulation/render substep rate; 10 Hz stays closest to real time")
+                    help="Full IsaacLab viewer physics/render substep rate")
 parser.add_argument("--status-interval", type=float, default=1.0,
                     help="Seconds between live score/time updates; <=0 disables live status")
 parser.add_argument("--no-editor-hud", action="store_true",
                     help="Disable the small Isaac editor playback status window")
+parser.add_argument("--show-sensors", action="store_true",
+                    help="Draw live sensor markers in the lightweight viewer")
+parser.add_argument("--sensor-robot", type=int, default=0,
+                    help="Robot index for sensor markers; -1 draws all robots")
+parser.add_argument("--sensor-ring-segments", type=int, default=48,
+                    help="Point count for each RAB range ring")
+parser.add_argument("--sensor-visual-hz", type=float, default=10.0,
+                    help="Sensor-overlay refresh rate in the lightweight viewer")
+parser.add_argument("--viewer-torch-threads", type=int, default=1,
+                    help="PyTorch CPU threads used by the lightweight viewer")
 
 add_gui_performance_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
-apply_windows_kit_defaults(args, "Play")
-apply_gui_performance_defaults(args, "Play")
+if not args.checkpoint:
+    parser.error("the following argument is required: --checkpoint")
+
+_user_kit_args = (getattr(args, "kit_args", "") or "").strip()
+_rendering_mode_explicit = any(
+    token == "--rendering_mode" or token.startswith("--rendering_mode=")
+    for token in sys.argv[1:]
+)
+
+checkpoint_arg = args.checkpoint
+checkpoint_path = os.path.abspath(
+    os.path.expandvars(os.path.expanduser(checkpoint_arg))
+)
+if not os.path.isfile(checkpoint_path):
+    run_dir = os.path.dirname(checkpoint_path)
+    parent_dir = os.path.dirname(run_dir)
+    run_name = os.path.basename(run_dir)
+    filename = os.path.basename(checkpoint_path)
+    candidates = []
+    if parent_dir and run_name and filename:
+        candidates = sorted(glob.glob(
+            os.path.join(parent_dir, f"{run_name}_*", filename)
+        ))
+    message = f"checkpoint not found: {checkpoint_arg}"
+    if candidates:
+        preview = "\n  ".join(candidates[:5])
+        extra = "" if len(candidates) <= 5 else f"\n  ... and {len(candidates) - 5} more"
+        message += f"\nAvailable matching checkpoints:\n  {preview}{extra}"
+    parser.error(message)
+args.checkpoint = checkpoint_path
 
 
 def _launch_fast_viewer_from_play():
@@ -87,9 +129,15 @@ def _launch_fast_viewer_from_play():
         "--checkpoint", args.checkpoint,
         "--sim-hz", str(args.sim_hz),
         "--control-hz", str(control_hz),
+        "--playback-speed", str(args.playback_speed),
         "--status-interval", str(args.status_interval),
         "--seed", str(args.seed),
+        "--sensor-robot", str(args.sensor_robot),
+        "--sensor-ring-segments", str(args.sensor_ring_segments),
+        "--sensor-visual-hz", str(args.sensor_visual_hz),
+        "--viewer-torch-threads", str(args.viewer_torch_threads),
         "--gui-performance-preset", args.gui_performance_preset,
+        "--gui-async-rendering", args.gui_async_rendering,
         "--gui-resolution", args.gui_resolution,
         "--gui-texture-budget", str(args.gui_texture_budget),
         "--gui-cpu-threads", str(args.gui_cpu_threads),
@@ -102,14 +150,22 @@ def _launch_fast_viewer_from_play():
         cmd.append("--deterministic")
     if args.no_editor_hud:
         cmd.append("--no-editor-hud")
+    if args.show_sensors:
+        cmd.append("--show-sensors")
     if args.gui_keep_materials:
         cmd.append("--gui-keep-materials")
     if getattr(args, "gui_disable_materials", False):
         cmd.append("--gui-disable-materials")
     if getattr(args, "device", None):
         cmd += ["--device", str(args.device)]
-    if getattr(args, "rendering_mode", None):
+    if getattr(args, "rendering_mode", None) and _rendering_mode_explicit:
         cmd += ["--rendering_mode", str(args.rendering_mode)]
+    if _user_kit_args:
+        # On Windows, os.execv may split a single argument containing multiple
+        # Kit flags. The child consumes this environment value before launch.
+        os.environ[FORWARDED_KIT_ARGS_ENV] = _user_kit_args
+    else:
+        os.environ.pop(FORWARDED_KIT_ARGS_ENV, None)
     print(
         f"[Play] GUI mode uses fast {args.sim_hz:g} Hz visual playback "
         f"with policy_hz={control_hz:g}. "
@@ -157,6 +213,8 @@ def _decision_period_from_config(config_path: str | None) -> int | None:
 if not getattr(args, "headless", False) and not args.exact_env:
     _launch_fast_viewer_from_play()
 
+apply_windows_kit_defaults(args, "Play")
+apply_gui_performance_defaults(args, "Play")
 app_launcher = AppLauncher(args)
 simulation_app = app_launcher.app
 apply_runtime_gui_performance_settings(args, "Play")
@@ -177,6 +235,9 @@ from SwarmACB_isaac.tasks.direct.agents.poca_networks import (
 )
 from SwarmACB_isaac.tasks.direct.agents.option_critic_networks import (
     FixedOptionManager,
+)
+from SwarmACB_isaac.tasks.direct.agents.learned_option_critic_networks import (
+    LearnedOptionActor,
 )
 
 
@@ -266,6 +327,14 @@ def main():
     env_cfg.seed = args.seed
     if hasattr(env_cfg, "update_variant"):
         env_cfg.update_variant(variant)
+    checkpoint_trainer_type = ckpt_meta.get("trainer_type", "poca")
+    if checkpoint_trainer_type == "learned_option_critic":
+        if not hasattr(env_cfg, "use_continuous_actions"):
+            raise ValueError(
+                f"Task {task_id} does not expose the continuous primitive "
+                "action interface required by learned Option-Critic."
+            )
+        env_cfg.use_continuous_actions(full_observations=True)
     for key, value in env_overrides.items():
         if key == "num_envs":
             env_cfg.scene.num_envs = value
@@ -299,7 +368,9 @@ def main():
     agents = unwrapped.cfg.possible_agents
 
     # ── Load checkpoint ───────────────────────────────────────────
-    ckpt = torch.load(args.checkpoint, map_location=device)
+    # load_state_dict copies CPU tensors to the selected device, so reuse the
+    # checkpoint metadata load instead of reading the file twice.
+    ckpt = ckpt_meta
     trainer_type = ckpt.get("trainer_type", "poca")
     discrete = ckpt.get("discrete", False)
     hidden_dim = ckpt.get("hidden_dim", 256)
@@ -308,7 +379,11 @@ def main():
     num_options = ckpt.get("num_options", num_actions)
     recurrent = bool(ckpt.get("recurrent", False))
     memory_size = checkpoint_memory_size(ckpt)
-    if trainer_type != "option_critic" and recurrent and not discrete:
+    if (
+        trainer_type not in ("option_critic", "learned_option_critic")
+        and recurrent
+        and not discrete
+    ):
         raise ValueError("Recurrent playback is only implemented for discrete actors")
 
     obs_dict, _ = env.reset()
@@ -320,7 +395,19 @@ def main():
           f"hidden={hidden_dim}  layers={num_layers}  "
           f"obs={obs_dim}  act={'discrete(' + str(num_actions) + ')' if discrete else str(act_dim)}")
 
-    if trainer_type == "option_critic":
+    if trainer_type == "learned_option_critic":
+        actor = LearnedOptionActor(
+            obs_dim,
+            act_dim,
+            num_options,
+            hidden_dim,
+            num_layers,
+            memory_size,
+        ).to(device)
+        actor.load_state_dict(ckpt["actor"])
+        actor.eval()
+        manager = None
+    elif trainer_type == "option_critic":
         manager = FixedOptionManager(
             obs_dim, num_options, hidden_dim, num_layers, memory_size,
         ).to(device)
@@ -337,7 +424,7 @@ def main():
     else:
         actor = Actor(obs_dim, act_dim, hidden_dim, num_layers).to(device)
 
-    if trainer_type != "option_critic":
+    if trainer_type not in ("option_critic", "learned_option_critic"):
         actor.load_state_dict(ckpt["actor"])
         actor.eval()
 
@@ -348,8 +435,14 @@ def main():
     obs_dict, _ = env.reset()
     num_envs = unwrapped.num_envs
     ep_reward = torch.zeros(num_envs, device=device)
-    if trainer_type == "option_critic":
-        memory_h, memory_c = manager.initial_state(num_envs * len(agents), device)
+    if trainer_type in ("option_critic", "learned_option_critic"):
+        recurrent_policy = (
+            manager if trainer_type == "option_critic" else actor
+        )
+        memory_h, memory_c = recurrent_policy.initial_state(
+            num_envs * len(agents),
+            device,
+        )
         current_options = torch.full(
             (num_envs, len(agents)),
             -1,
@@ -364,7 +457,10 @@ def main():
 
     print(f"[Play] Evaluating {args.num_episodes} episodes "
           f"({'deterministic' if args.deterministic else 'stochastic'})...")
-    if trainer_type == "option_critic" and args.deterministic:
+    if (
+        trainer_type in ("option_critic", "learned_option_critic")
+        and args.deterministic
+    ):
         print(
             "[Play] Warning: deterministic Option-Critic playback thresholds "
             "termination probabilities at 0.5. Use stochastic playback to "
@@ -423,9 +519,79 @@ def main():
         _emit_status(last_status_wall)
 
     while episode_count < args.num_episodes:
+        # Recurrent states are reset in-place for individual vectorized envs
+        # below; no_grad keeps those tensors mutable while avoiding autograd.
         with torch.no_grad():
             action_dict = {}
-            if trainer_type == "option_critic":
+            if trainer_type == "learned_option_critic":
+                obs_stacked = torch.stack(
+                    [obs_dict[a] for a in agents],
+                    dim=1,
+                )
+                flat_obs = obs_stacked.reshape(
+                    -1,
+                    obs_stacked.shape[-1],
+                )
+                (
+                    option_logits,
+                    termination_logits,
+                    action_means,
+                    action_stds,
+                    _attentions,
+                    next_memory,
+                ) = actor.step(flat_obs, (memory_h, memory_c))
+                memory_h = next_memory[0].detach()
+                memory_c = next_memory[1].detach()
+
+                if args.deterministic:
+                    proposed = option_logits.argmax(dim=-1)
+                else:
+                    proposed = torch.distributions.Categorical(
+                        logits=option_logits,
+                    ).sample()
+                proposed = proposed.view(num_envs, len(agents))
+
+                force_new = current_options < 0
+                safe_current = current_options.clamp(min=0).reshape(-1)
+                beta_logits = actor.selected_termination_logits(
+                    termination_logits,
+                    safe_current,
+                )
+                if args.deterministic:
+                    terminate = (beta_logits > 0.0).view(
+                        num_envs,
+                        len(agents),
+                    )
+                else:
+                    terminate = torch.distributions.Bernoulli(
+                        logits=beta_logits,
+                    ).sample().bool().view(num_envs, len(agents))
+                current_options = torch.where(
+                    terminate | force_new,
+                    proposed,
+                    current_options,
+                )
+
+                action_dist = actor.selected_action_dist(
+                    action_means,
+                    action_stds,
+                    current_options.reshape(-1),
+                )
+                raw_actions = (
+                    action_dist.mean
+                    if args.deterministic
+                    else action_dist.sample()
+                )
+                all_actions = raw_actions.clamp(-3.0, 3.0).div(3.0).view(
+                    num_envs,
+                    len(agents),
+                    act_dim,
+                )
+                action_dict = {
+                    agent: all_actions[:, agent_id]
+                    for agent_id, agent in enumerate(agents)
+                }
+            elif trainer_type == "option_critic":
                 obs_stacked = torch.stack([obs_dict[a] for a in agents], dim=1)
                 flat_obs = obs_stacked.reshape(-1, obs_stacked.shape[-1])
                 option_logits, termination_logits, next_memory = manager.step(
@@ -433,11 +599,12 @@ def main():
                     (memory_h, memory_c),
                 )
                 memory_h, memory_c = next_memory[0].detach(), next_memory[1].detach()
-                option_dist = torch.distributions.Categorical(logits=option_logits)
                 if args.deterministic:
-                    proposed = option_dist.probs.argmax(dim=-1)
+                    proposed = option_logits.argmax(dim=-1)
                 else:
-                    proposed = option_dist.sample()
+                    proposed = torch.distributions.Categorical(
+                        logits=option_logits,
+                    ).sample()
                 proposed = proposed.view(num_envs, len(agents))
 
                 force_new = current_options < 0
@@ -447,7 +614,7 @@ def main():
                     safe_current.unsqueeze(-1),
                 ).squeeze(-1)
                 if args.deterministic:
-                    terminate = (torch.sigmoid(beta_logits) > 0.5).view(num_envs, len(agents))
+                    terminate = (beta_logits > 0.0).view(num_envs, len(agents))
                 else:
                     terminate = torch.distributions.Bernoulli(
                         logits=beta_logits,
@@ -461,30 +628,31 @@ def main():
                 flat_obs = obs_stacked.reshape(-1, obs_stacked.shape[-1])
                 logits, next_memory = actor.step(flat_obs, (memory_h, memory_c))
                 memory_h, memory_c = next_memory[0].detach(), next_memory[1].detach()
-                dist = torch.distributions.Categorical(logits=logits)
                 if args.deterministic:
-                    flat_act = dist.probs.argmax(dim=-1)
+                    flat_act = logits.argmax(dim=-1)
                 else:
-                    flat_act = dist.sample()
+                    flat_act = torch.distributions.Categorical(logits=logits).sample()
                 all_actions = flat_act.view(num_envs, len(agents), 1)
                 action_dict = {a: all_actions[:, i] for i, a in enumerate(agents)}
             else:
-                for i, agent in enumerate(agents):
-                    obs = obs_dict[agent]  # (E, obs_dim)
-                    dist = actor.get_dist(obs)
-                    if args.deterministic:
-                        if discrete:
-                            act = dist.probs.argmax(dim=-1)  # (E,)
-                        else:
-                            act = dist.mean  # (E, act_dim)
-                    else:
-                        act = dist.sample()
+                obs_stacked = torch.stack([obs_dict[a] for a in agents], dim=1)
+                flat_obs = obs_stacked.reshape(-1, obs_stacked.shape[-1])
+                if args.deterministic:
+                    flat_act = (
+                        actor(flat_obs).argmax(dim=-1)
+                        if discrete else actor(flat_obs)[0]
+                    )
+                else:
+                    flat_act = actor.get_dist(flat_obs).sample()
 
-                    if discrete:
-                        action_dict[agent] = act.unsqueeze(-1)  # (E, 1)
-                    else:
-                        # ML-Agents preprocessing: clamp(-3,3)/3 before env
-                        action_dict[agent] = act.clamp(-3, 3) / 3
+                if discrete:
+                    all_actions = flat_act.view(num_envs, len(agents), 1)
+                else:
+                    # ML-Agents preprocessing: clamp(-3,3)/3 before env.
+                    all_actions = flat_act.clamp(-3, 3).div_(3).view(
+                        num_envs, len(agents), act_dim,
+                    )
+                action_dict = {a: all_actions[:, i] for i, a in enumerate(agents)}
 
         substep_active = torch.ones(num_envs, dtype=torch.bool, device=device)
         for _ in range(decision_period):
@@ -498,7 +666,10 @@ def main():
                 for ei in newly_done.nonzero(as_tuple=False).flatten().tolist():
                     episode_rewards.append(ep_reward[ei].item())
                     ep_reward[ei] = 0.0
-                    if trainer_type == "option_critic":
+                    if trainer_type in (
+                        "option_critic",
+                        "learned_option_critic",
+                    ):
                         current_options[ei] = -1
                         start = ei * len(agents)
                         end = start + len(agents)
@@ -536,7 +707,7 @@ def main():
     print(f"  Max reward  : {max(episode_rewards):.2f}")
     print(f"  Median      : {statistics.median(episode_rewards):.2f}")
     print(f"  Eval time   : {eval_elapsed:.1f}s wall / {realtime_target:.1f}s real-time target")
-    print(f"{'='*50}")
+    print(f"{'='*50}", flush=True)
 
     env.close()
     simulation_app.close()

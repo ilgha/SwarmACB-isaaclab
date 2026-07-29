@@ -2,7 +2,7 @@
 # Copyright (c) 2025 SwarmACB Project
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Train a POCA or fixed-module Option-Critic agent on SwarmACB missions.
+"""Train a POCA, fixed-option OC, or learned-option OC agent.
 
 Usage:
     # Preferred: use a YAML config file (ML-Agents style)
@@ -85,6 +85,9 @@ from SwarmACB_isaac.tasks.direct.agents.poca_trainer import (
 from SwarmACB_isaac.tasks.direct.agents.option_critic_trainer import (
     FixedOptionCriticTrainer,
 )
+from SwarmACB_isaac.tasks.direct.agents.learned_option_critic_trainer import (
+    LearnedOptionCriticTrainer,
+)
 from SwarmACB_isaac.tasks.direct.agents.config_loader import (
     load_config, print_config,
 )
@@ -162,9 +165,17 @@ def main():
     # ── Build env config and apply overrides BEFORE gym.make ─────
     env_cfg = _resolve_env_cfg(task_id)
     env_cfg.seed = cfg.seed
+    trainer_type = getattr(cfg, "trainer_type", "poca")
 
     if hasattr(env_cfg, "update_variant"):
         env_cfg.update_variant(variant)
+    if trainer_type == "learned_option_critic":
+        if not hasattr(env_cfg, "use_continuous_actions"):
+            raise ValueError(
+                f"Task {task_id} does not expose the continuous primitive "
+                "action interface required by learned Option-Critic."
+            )
+        env_cfg.use_continuous_actions(full_observations=True)
     for key, value in env_overrides.items():
         if key == "num_envs":
             env_cfg.scene.num_envs = value
@@ -177,8 +188,9 @@ def main():
     env = gym.make(task_id, cfg=env_cfg)
 
     # ── Create trainer and run ────────────────────────────────────
-    trainer_type = getattr(cfg, "trainer_type", "poca")
-    if trainer_type == "option_critic":
+    if trainer_type == "learned_option_critic":
+        trainer = LearnedOptionCriticTrainer(env, cfg)
+    elif trainer_type == "option_critic":
         trainer = FixedOptionCriticTrainer(env, cfg)
     elif trainer_type == "poca":
         trainer = POCATrainer(env, cfg)

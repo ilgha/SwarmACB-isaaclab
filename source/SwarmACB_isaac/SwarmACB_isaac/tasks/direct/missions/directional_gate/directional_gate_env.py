@@ -1129,7 +1129,10 @@ class DirectionalGateEnv(DirectMARLEnv):
 
         ground = self._ground_color(self.agent_pos)  # (E, N, 3)
 
-        if cfg.variant in ("dandelion", "daisy"):
+        if (
+            cfg.variant in ("dandelion", "daisy")
+            or cfg.full_policy_observations
+        ):
             obs_all = self.sensors.collect_obs_dandelion(
                 prox_vals, light_vals, ground, ztilde, rab_proj,
             )  # (E, N, 24)

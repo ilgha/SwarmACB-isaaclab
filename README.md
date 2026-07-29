@@ -43,7 +43,7 @@ SwarmACB_isaac/
     manual_control_isaac.py     # Isaac Sim viewport manual control / fast viewer
     hpc/                        # Cluster helper scripts
   source/SwarmACB_isaac/SwarmACB_isaac/tasks/direct/
-    agents/                     # POCA and fixed-option Option-Critic trainers
+    agents/                     # POCA and both Option-Critic phases
     epuck/                      # E-puck sensors and behavior modules
     missions/
       directional_gate/
@@ -121,6 +121,56 @@ it does not enumerate the collective joint-option space. Option selection
 remains a recurrent PPO policy trained at option boundaries, which is an
 SMDP-level policy-over-options implementation.
 
+## Learned Option-Critic Phase 2
+
+Phase 2 is configured as `trainer_type: learned_option_critic` and currently
+uses the working name `OC2_cyclamen`. The six options are no longer mapped to
+the six predefined behavior modules. Each option learns its own stochastic
+continuous intra-option policy over the two normalized wheel commands.
+The number of learned options is controlled by
+`network_settings.num_options`; the initial benchmark uses six for a direct
+comparison with Phase 1.
+
+The local actor contains:
+
+- Cyclamen's recurrent policy over six options
+- six learned termination functions
+- six learned Gaussian intra-option wheel policies
+- six state-dependent feature-attention masks
+
+The recurrent selector receives exactly Cyclamen's four inputs
+`[ground_0, ground_1, ground_2, ztilde]`. Learned motor options also need
+proximity, light, and directional RAB information that was previously available
+inside the fixed behavior modules. They therefore attend over the full local
+24-channel sensor vector. This keeps the high-level Cyclamen comparison while
+giving learned motor options enough local information to avoid obstacles,
+follow light, and react directionally to neighbors.
+
+Training remains centralized and execution decentralized. Three critic roles
+separate the objectives:
+
+```text
+V(s)                                  team value for lambda returns
+b_i^U((s, omega), a_-i)              primitive-action counterfactual baseline
+Q_Omega(s, omega_vector),
+b_i^Omega(s, omega_-i)               collective option value and baseline
+```
+
+The intra-option PPO advantage omits only robot `i`'s wheel action; its active
+option and every peer option/action remain fixed. The selector advantage omits
+only robot `i`'s option:
+
+```text
+A_i^U     = lambda_return - b_i^U((s, omega), a_-i)
+A_i^Omega = lambda_return - b_i^Omega(s, omega_-i)
+```
+
+The arrival-state termination theorem is the same collective replacement test
+as Phase 1. The intra-option policy is updated every decision, while the policy
+over options is updated only at sampled option boundaries. Pairwise attention
+cosine similarity is minimized to discourage option collapse, and a temporal
+attention loss discourages rapidly changing option focus.
+
 ## Sensor Suite
 
 Each e-puck has:
@@ -139,7 +189,7 @@ sensor_visual_robot_index: -1   # -1 shows all env-0 robots
 sensor_visual_rab_ring_segments: 48
 ```
 
-Then run `scripts/play.py` with `--exact-env` and without `--headless`. The live overlay draws proximity rays, light rays, RAB range rings, visible RAB neighbor links, and three ground-channel dots colored black, grey, or white.
+Then run `scripts/play.py` with `--exact-env` and without `--headless`. The live overlay draws proximity rays, light rays, RAB range rings, visible RAB neighbor links, and three ground-channel dots colored black, grey, or white. For the lightweight viewer, pass `--show-sensors`; its overlay is sampled at 10 Hz by default while robot animation remains at 60 Hz.
 
 For manual IsaacSim inspection, run:
 
@@ -196,6 +246,23 @@ python scripts/train.py --config configs/OC_Foraging_cyclamen.yaml --headless
 python scripts/train.py --config configs/OC_Sheltering_cyclamen.yaml --headless
 ```
 
+Train the learned-option Option-Critic phase-2 controller:
+
+```bash
+python scripts/train.py --config configs/OC2_DirGate_cyclamen.yaml --headless
+python scripts/train.py --config configs/OC2_XOR_cyclamen.yaml --headless
+python scripts/train.py --config configs/OC2_Homing_cyclamen.yaml --headless
+python scripts/train.py --config configs/OC2_Foraging_cyclamen.yaml --headless
+python scripts/train.py --config configs/OC2_Sheltering_cyclamen.yaml --headless
+```
+
+Submit ten independent Phase 2 designs per mission on the cluster with
+`scripts/hpc/train_oc2_<mission>.slurm`, for example:
+
+```bash
+sbatch scripts/hpc/train_oc2_dirgate.slurm
+```
+
 Or override the task and variant from the command line:
 
 ```bash
@@ -208,15 +275,17 @@ Useful smoke test:
 ```bash
 python scripts/train.py --config configs/Sheltering_cyclamen.yaml --headless --total_timesteps 2000 --num_envs 1 --log_dir runs/Sheltering_smoke --checkpoint_dir checkpoints/Sheltering_smoke
 python scripts/train.py --config configs/OC_Sheltering_cyclamen.yaml --headless --total_timesteps 2000 --num_envs 1 --log_dir runs/OC_Sheltering_smoke --checkpoint_dir checkpoints/OC_Sheltering_smoke
+python scripts/train.py --config configs/OC2_Sheltering_cyclamen.yaml --headless --total_timesteps 2000 --num_envs 1 --log_dir runs/OC2_Sheltering_smoke --checkpoint_dir checkpoints/OC2_Sheltering_smoke
 ```
 
 ## Evaluation
 
-Evaluate an IsaacLab environment exactly:
+Evaluate the full IsaacLab environment exactly:
 
 ```bash
-python scripts/play.py --config configs/DirGate_cyclamen.yaml --checkpoint checkpoints/DirGate_cyclamen/poca_final.pt --num_envs 1 --num_episodes 10 --deterministic
-python scripts/play.py --config configs/OC_DirGate_cyclamen.yaml --checkpoint checkpoints/OC_DirGate_cyclamen/option_critic_final.pt --num_envs 1 --num_episodes 10
+python scripts/play.py --config configs/DirGate_cyclamen.yaml --checkpoint checkpoints/DirGate_cyclamen/poca_final.pt --exact-env --num_envs 1 --num_episodes 10 --deterministic
+python scripts/play.py --config configs/OC_DirGate_cyclamen.yaml --checkpoint checkpoints/OC_DirGate_cyclamen/option_critic_final.pt --exact-env --num_envs 1 --num_episodes 10
+python scripts/play.py --config configs/OC2_DirGate_cyclamen.yaml --checkpoint checkpoints/OC2_DirGate_cyclamen/option_critic_2_final.pt --exact-env --num_envs 1 --num_episodes 10
 ```
 
 Use stochastic playback for the primary Option-Critic evaluation. Its learned
@@ -224,12 +293,18 @@ termination probability is Bernoulli-sampled during training. Passing
 `--deterministic` thresholds termination at `0.5`, which is useful only as a
 diagnostic.
 
-The play script can also use a fast Isaac viewport viewer for smoother POCA
-inspection:
+GUI playback uses the lightweight Isaac viewport by default. It reproduces the
+mission kinematics and sensors without advancing an unused PhysX scene, batches
+policy inference across all robots, and updates the visible swarm through one
+USD point instancer:
 
 ```bash
-python scripts/play.py --config configs/Sheltering_cyclamen.yaml --checkpoint checkpoints/Sheltering_cyclamen/poca_final.pt --fast-viewer --deterministic
+python scripts/play.py --config configs/Sheltering_cyclamen.yaml --checkpoint checkpoints/Sheltering_cyclamen/poca_final.pt --deterministic
+python scripts/play.py --config configs/Sheltering_cyclamen.yaml --checkpoint checkpoints/Sheltering_cyclamen/poca_final.pt --show-sensors --sensor-robot 0 --deterministic
 ```
+
+`--fast-viewer` remains as a compatibility alias. Use `--exact-env` whenever
+the full IsaacLab physics/environment implementation itself is under test.
 
 Compare behavior-module usage for the 10 classical Cyclamen controllers and
 the 10 fixed-option OC-Cyclamen controllers in headless mode:
@@ -254,26 +329,39 @@ the same IsaacLab environment.
 Use `--deterministic` for argmax actions and thresholded OC terminations;
 the default is stochastic playback, matching `scripts/play.py`.
 
-GUI playback keeps the normal viewport features by default: native resolution,
-60 Hz visual stepping, scene materials, the live terminal/HUD status, and sensor
-overlays when enabled. Under the hood the default `--gui-performance-preset same`
-loads Isaac's loop runner and disables Kit run-loop rate limits so the GUI can
-use more CPU/GPU time without changing rendering fidelity. Pass
-`--gui-performance-preset off` for stock Isaac loop behavior, or
-`--gui-performance-preset fast` to also enable rendering-side speed tweaks.
+GUI playback keeps normal viewport fidelity by default: native resolution,
+scene materials, a 60 Hz swarm animation, and the terminal/editor status HUD.
+The lightweight viewer evaluates policies and sensor-dependent modules at the
+Unity-matching control frequency, normally 10 Hz, while retaining the last
+command between decisions. Sensor debug geometry is also refreshed at 10 Hz
+instead of rebuilding it every rendered frame.
+
+The default `--gui-performance-preset same` disables VSync/rate-limit sleeps and
+RTX eco mode without changing materials or resolution. The lightweight viewer
+also enables Isaac's asynchronous render thread. Use
+`--gui-async-rendering off` if a driver or Isaac Sim version shows stale USD
+updates, `--gui-performance-preset off` for entirely stock Kit behavior, or
+`--gui-performance-preset fast` for rendering-side quality/performance tweaks.
+
+Playback is paced to real time by default. `--playback-speed 2` runs at twice
+real time when the machine can sustain it, while `--playback-speed 0` removes
+the pacer for maximum throughput. `--sim-hz 120` can provide a smoother
+high-refresh animation; it does not increase the policy decision frequency.
 
 Use these flags when you need a more aggressive speed profile:
 
 ```bash
 # Faster GUI if the viewport is still lagging
-python scripts/play.py --config configs/DirGate_dandelion.yaml --checkpoint checkpoints/DirGate_dandelion/poca_final.pt --fast-viewer --gui-performance-preset fast --gui-resolution 640x360 --gui-texture-budget 0.25 --sim-hz 20 --deterministic
+python scripts/play.py --config configs/DirGate_dandelion.yaml --checkpoint checkpoints/DirGate_dandelion/poca_final.pt --gui-performance-preset fast --gui-resolution 640x360 --gui-texture-budget 0.25 --sim-hz 60 --deterministic
 
 # Maximum viewport speed, at the cost of material/color fidelity
-python scripts/play.py --config configs/DirGate_dandelion.yaml --checkpoint checkpoints/DirGate_dandelion/poca_final.pt --fast-viewer --gui-performance-preset fast --gui-disable-materials --gui-resolution 640x360 --sim-hz 20 --deterministic
+python scripts/play.py --config configs/DirGate_dandelion.yaml --checkpoint checkpoints/DirGate_dandelion/poca_final.pt --gui-performance-preset fast --gui-disable-materials --gui-resolution 640x360 --sim-hz 60 --deterministic
 ```
 
 The same GUI flags work with `scripts/manual_control_isaac.py`. If Isaac Sim
-over-subscribes a many-core CPU, try `--gui-cpu-threads 16`.
+over-subscribes a many-core CPU, try `--gui-cpu-threads 16`. The lightweight
+viewer defaults its small CPU policy workload to one PyTorch thread; set
+`--viewer-torch-threads 0` to leave PyTorch's global setting unchanged.
 
 ## Manual Mission Checks
 
@@ -392,6 +480,36 @@ behaviors:
         sequence_length: 128
 ```
 
+Learned-option Phase 2 configs use `trainer_type: learned_option_critic`.
+`num_options` controls the number of policies learned from scratch:
+
+```yaml
+behaviors:
+  OC2_Sheltering_cyclamen:
+    task: SwarmACB-Sheltering-v0
+    variant: cyclamen
+    trainer_type: learned_option_critic
+    hyperparameters:
+      learning_rate: 0.0003
+      intra_option_coef: 1.0
+      selector_coef: 1.0
+      option_entropy_coef: 0.005
+      termination_penalty: 0.01
+      termination_coef: 0.1
+      action_baseline_coef: 0.25
+      option_value_coef: 0.5
+      option_baseline_coef: 0.25
+      attention_diversity_coef: 0.01
+      attention_temporal_coef: 0.01
+    network_settings:
+      hidden_units: 128
+      num_layers: 1
+      num_options: 6
+      memory:
+        memory_size: 128
+        sequence_length: 128
+```
+
 Checkpoints produced before paper-parity version 4 use incompatible network or
 training semantics. Version 4 makes the centralized critic inherit
 `hidden_units` and `num_layers` from `network_settings`, exactly as Unity passes
@@ -407,7 +525,7 @@ Before submitting the full HPC matrix, run the dependency-light parity audit:
 python scripts/validate_paper_parity.py
 ```
 
-It validates all 30 YAML files, experiment budgets, raw and runtime-resolved
+It validates all 35 YAML files, experiment budgets, raw and runtime-resolved
 actor/critic network sizes, recurrent semantics, and the mission
 geometry/constants that are most sensitive to Unity scene overrides.
 

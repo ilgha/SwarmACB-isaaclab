@@ -32,6 +32,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 
 # ── Isaac Lab bootstrap (MUST happen before other Isaac Lab imports) ──
 from isaaclab.app import AppLauncher
@@ -40,6 +41,7 @@ from _isaac_launch import (
     apply_gui_performance_defaults,
     apply_runtime_gui_performance_settings,
     apply_windows_kit_defaults,
+    consume_forwarded_kit_args,
 )
 
 TASK_CHOICES = [
@@ -81,10 +83,14 @@ parser.add_argument("--no-keyboard", action="store_true",
                     help="Do not subscribe to keyboard events; useful for startup smoke tests")
 parser.add_argument("--smoke-frames", type=int, default=0,
                     help="Run this many rendered frames, then exit; 0 means run until closed")
+parser.add_argument("--viewport-screenshot", type=str, default=None,
+                    help="Save a viewport PNG after renderer warm-up; useful for GUI diagnostics")
 parser.add_argument("--sim-hz", type=float, default=60.0,
                     help="Kinematic integration and viewport update rate")
 parser.add_argument("--control-hz", type=float, default=10.0,
                     help="Behaviour-module decision rate; 10 Hz matches the original 0.1 s step")
+parser.add_argument("--playback-speed", type=float, default=1.0,
+                    help="GUI simulation speed relative to real time; 0 runs uncapped")
 parser.add_argument("--policy-checkpoint", "--checkpoint", dest="policy_checkpoint",
                     type=str, default=None,
                     help="Optional POCA checkpoint to drive all robots in the fast viewer")
@@ -103,6 +109,10 @@ parser.add_argument("--sensor-robot", type=int, default=0,
                     help="Robot index to draw sensors for; -1 draws all robots")
 parser.add_argument("--sensor-ring-segments", type=int, default=48,
                     help="Number of point markers used for each RAB range ring")
+parser.add_argument("--sensor-visual-hz", type=float, default=10.0,
+                    help="Sensor-overlay refresh rate; 10 Hz matches sensor/control sampling")
+parser.add_argument("--viewer-torch-threads", type=int, default=1,
+                    help="PyTorch CPU threads for the small viewer model; 0 keeps the global default")
 parser.add_argument("--debug-keys", action="store_true",
                     help="Print raw Isaac keyboard event names when keys are pressed")
 parser.add_argument("--keymap", type=str, default="azerty-physical",
@@ -115,8 +125,17 @@ parser.add_argument("--no-editor-hud", action="store_true",
 add_gui_performance_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
+consume_forwarded_kit_args(args, "ManualIsaac")
+if args.policy_checkpoint:
+    checkpoint_arg = args.policy_checkpoint
+    checkpoint_path = os.path.abspath(
+        os.path.expandvars(os.path.expanduser(checkpoint_arg))
+    )
+    if not os.path.isfile(checkpoint_path):
+        parser.error(f"checkpoint not found: {checkpoint_arg}")
+    args.policy_checkpoint = checkpoint_path
 apply_windows_kit_defaults(args, "ManualIsaac")
-apply_gui_performance_defaults(args, "ManualIsaac")
+apply_gui_performance_defaults(args, "ManualIsaac", lightweight_viewer=True)
 
 if getattr(args, "headless", False) and not args.no_keyboard:
     print("[ManualIsaac] Headless mode has no app window; enabling --no-keyboard.", flush=True)
@@ -132,6 +151,7 @@ print("[ManualIsaac] Isaac Sim app launched.", flush=True)
 
 import math
 import random
+import time
 import weakref
 
 import carb
@@ -144,6 +164,7 @@ from pxr import Gf, UsdGeom, Vt
 import isaaclab.sim as sim_utils
 from isaaclab.markers import VisualizationMarkersCfg, VisualizationMarkers
 from isaacsim.core.api.simulation_context import SimulationContext
+from isaacsim.core.utils.viewports import set_camera_view
 
 # ── Import env components (bypass package chain) ────────────────────
 def _format_duration(seconds: float) -> str:
@@ -166,7 +187,7 @@ class _PlaybackStatusHud:
         try:
             import omni.ui as ui
 
-            self._window = ui.Window("SwarmACB Playback", width=360, height=132)
+            self._window = ui.Window("SwarmACB Playback", width=360, height=154)
             with self._window.frame:
                 with ui.VStack(spacing=4):
                     ui.Label("SwarmACB Playback", height=22)
@@ -179,7 +200,7 @@ class _PlaybackStatusHud:
             self._label.text = text
 
 
-import sys, os
+import sys
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
 _SOURCE_ROOT = os.path.join(_PROJECT_ROOT, "source", "SwarmACB_isaac")
@@ -195,6 +216,9 @@ from SwarmACB_isaac.tasks.direct.agents.poca_networks import (
     checkpoint_memory_size,
 )
 from SwarmACB_isaac.tasks.direct.agents.option_critic_networks import FixedOptionManager
+from SwarmACB_isaac.tasks.direct.agents.learned_option_critic_networks import (
+    LearnedOptionActor,
+)
 
 
 # =====================================================================
@@ -1080,18 +1104,13 @@ def _build_arena_visuals(env: StandaloneDGTEnv):
                        translation=(0.0, -(R + 0.1), 0.03))
 
 
-def _create_robot_markers(env: StandaloneDGTEnv) -> VisualizationMarkers:
-    """Create instanced robot markers using VisualizationMarkers.
-
-    Two prototypes:
-      0 = controlled robot (green)
-      1 = other robot (blue)
-    """
+def _create_swarm_markers(env: StandaloneDGTEnv) -> VisualizationMarkers:
+    """Create one point instancer for robot bodies and heading dots."""
     r = env.robot_radius
     h = 0.05  # robot height
 
     cfg = VisualizationMarkersCfg(
-        prim_path="/World/Visuals/Robots",
+        prim_path="/World/Visuals/Swarm",
         markers={
             "controlled": sim_utils.CylinderCfg(
                 radius=r,
@@ -1107,21 +1126,6 @@ def _create_robot_markers(env: StandaloneDGTEnv) -> VisualizationMarkers:
                     diffuse_color=(0.31, 0.55, 0.86),
                 ),
             ),
-        },
-    )
-    return VisualizationMarkers(cfg)
-
-
-def _create_heading_markers(env: StandaloneDGTEnv) -> VisualizationMarkers:
-    """Create small arrow-like cone markers for heading indication.
-
-    Two prototypes:
-      0 = controlled heading (yellow)
-      1 = other heading (light grey)
-    """
-    cfg = VisualizationMarkersCfg(
-        prim_path="/World/Visuals/Headings",
-        markers={
             "ctrl_heading": sim_utils.SphereCfg(
                 radius=0.012,
                 visual_material=sim_utils.PreviewSurfaceCfg(
@@ -1137,6 +1141,58 @@ def _create_heading_markers(env: StandaloneDGTEnv) -> VisualizationMarkers:
         },
     )
     return VisualizationMarkers(cfg)
+
+
+class _RobotVisualBuffers:
+    """Reusable NumPy buffers for the combined swarm point instancer."""
+
+    def __init__(
+        self,
+        env: StandaloneDGTEnv,
+        markers: VisualizationMarkers,
+    ):
+        self._env = env
+        self._markers = markers
+        self._indices = np.concatenate((
+            np.array([0] + [1] * (env.N - 1), dtype=np.int32),
+            np.array([2] + [3] * (env.N - 1), dtype=np.int32),
+        ))
+        self._positions = np.zeros((env.N * 2, 3), dtype=np.float32)
+        self._positions[:env.N, 2] = 0.025
+        self._positions[env.N:, 2] = 0.035
+        self._cos_yaw = np.empty(env.N, dtype=np.float32)
+        self._sin_yaw = np.empty(env.N, dtype=np.float32)
+        self._last_positions = np.full((env.N, 2), np.nan, dtype=np.float32)
+        self._last_yaws = np.full(env.N, np.nan, dtype=np.float32)
+        self._seeded = False
+
+    def update(self, force: bool = False) -> tuple[np.ndarray, np.ndarray, bool]:
+        pos_2d = self._env.pos[0].detach().numpy()
+        yaws = self._env.yaw[0].detach().numpy()
+        changed = (
+            force
+            or not np.array_equal(pos_2d, self._last_positions)
+            or not np.array_equal(yaws, self._last_yaws)
+        )
+        if not changed:
+            return pos_2d, yaws, False
+
+        np.copyto(self._last_positions, pos_2d)
+        np.copyto(self._last_yaws, yaws)
+        self._positions[:self._env.N, :2] = pos_2d
+
+        np.cos(yaws, out=self._cos_yaw)
+        np.sin(yaws, out=self._sin_yaw)
+
+        arrow_len = self._env.robot_radius * 1.8
+        self._positions[self._env.N:, 0] = pos_2d[:, 0] + arrow_len * self._cos_yaw
+        self._positions[self._env.N:, 1] = pos_2d[:, 1] + arrow_len * self._sin_yaw
+        self._markers.visualize(
+            translations=self._positions,
+            marker_indices=None if self._seeded else self._indices,
+        )
+        self._seeded = True
+        return pos_2d, yaws, True
 
 
 def _create_sensor_line_markers() -> VisualizationMarkers:
@@ -1238,46 +1294,79 @@ def _selected_sensor_indices(env: StandaloneDGTEnv, robot_index: int) -> np.ndar
     return np.arange(env.N, dtype=np.int64)
 
 
-def _line_blocks_segment(env: StandaloneDGTEnv, start: np.ndarray, end: np.ndarray) -> bool:
-    ray = end - start
-    dist = float(np.linalg.norm(ray))
-    if dist <= 1e-6:
-        return False
-    rdx, rdy = ray[0] / dist, ray[1] / dist
-    ox, oy = float(start[0]), float(start[1])
-    for ax, ay, bx, by in env.wall_segments:
-        sx, sy = bx - ax, by - ay
-        denom = rdx * sy - rdy * sx
-        if abs(denom) <= 1e-8:
-            continue
-        t = ((ax - ox) * sy - (ay - oy) * sx) / denom
-        u = ((ax - ox) * rdy - (ay - oy) * rdx) / denom
-        if 1e-5 < t < dist - 1e-5 and 0.0 <= u <= 1.0:
-            return True
-    return False
+class _SensorVisualCache:
+    """Static sensor-overlay geometry shared by every overlay refresh."""
+
+    def __init__(self, env: StandaloneDGTEnv, robot_index: int, ring_segments: int):
+        self.selected = _selected_sensor_indices(env, robot_index)
+        self.local_x = env.sensors._cos_a.detach().numpy().copy()
+        self.local_y = env.sensors._sin_a.detach().numpy().copy()
+        count = max(8, int(ring_segments))
+        angles = np.linspace(0.0, 2.0 * math.pi, count, endpoint=False, dtype=np.float32)
+        self.ring_offsets = env.sensors.rab_range * np.column_stack(
+            (np.cos(angles), np.sin(angles))
+        ).astype(np.float32)
+        self.wall_segments = np.asarray(env.wall_segments, dtype=np.float32)
+
+
+def _rab_visibility_matrix(
+    env: StandaloneDGTEnv,
+    cache: _SensorVisualCache,
+    positions: np.ndarray,
+) -> np.ndarray:
+    """Vectorized geometric RAB range and wall-occlusion mask."""
+    delta = positions[None, :, :] - positions[:, None, :]
+    dist = np.linalg.norm(delta, axis=-1)
+    visible = (dist < env.sensors.rab_range) & ~np.eye(env.N, dtype=bool)
+    if cache.wall_segments.size == 0:
+        return visible
+
+    safe_dist = np.maximum(dist, 1e-8)
+    ray_x = delta[:, :, 0] / safe_dist
+    ray_y = delta[:, :, 1] / safe_dist
+    segments = cache.wall_segments
+    ax = segments[:, 0][None, None, :]
+    ay = segments[:, 1][None, None, :]
+    sx = (segments[:, 2] - segments[:, 0])[None, None, :]
+    sy = (segments[:, 3] - segments[:, 1])[None, None, :]
+    ox = positions[:, 0][:, None, None]
+    oy = positions[:, 1][:, None, None]
+    rdx = ray_x[:, :, None]
+    rdy = ray_y[:, :, None]
+    denom = rdx * sy - rdy * sx
+    valid = np.abs(denom) > 1e-8
+    safe_denom = np.where(valid, denom, 1.0)
+    t = ((ax - ox) * sy - (ay - oy) * sx) / safe_denom
+    u = ((ax - ox) * rdy - (ay - oy) * rdx) / safe_denom
+    blocked = (
+        valid
+        & (t > 1e-5)
+        & (t < dist[:, :, None] - 1e-5)
+        & (u >= 0.0)
+        & (u <= 1.0)
+    )
+    return visible & ~blocked.any(axis=-1)
 
 
 def _update_sensor_markers(
     env: StandaloneDGTEnv,
     line_markers: VisualizationMarkers,
     point_markers: VisualizationMarkers,
-    robot_index: int,
-    ring_segments: int,
+    cache: _SensorVisualCache,
 ):
-    selected = _selected_sensor_indices(env, robot_index)
+    selected = cache.selected
     prox_vals, _, _ = env.sensors.compute_proximity(
         env.pos, env.yaw, env.wall_segments, env.pos, env.robot_radius,
     )
     light_vals, _, _ = env._compute_light_readings()
     ground_vals = env._ground_3ch(env.pos)
 
-    pos_2d = env.pos[0].cpu().numpy()
-    yaws = env.yaw[0].cpu().numpy()
-    prox_np = prox_vals[0, selected].cpu().numpy()
-    light_np = light_vals[0, selected].cpu().numpy()
-    ground_np = ground_vals[0, selected].cpu().numpy()
-    local_x = env.sensors._cos_a.cpu().numpy()
-    local_y = env.sensors._sin_a.cpu().numpy()
+    pos_2d = env.pos[0].detach().numpy()
+    yaws = env.yaw[0].detach().numpy()
+    prox_np = prox_vals[0, selected].detach().numpy()
+    light_np = light_vals[0, selected].detach().numpy()
+    ground_np = ground_vals[0, selected].detach().numpy()
+    visible_neighbors = _rab_visibility_matrix(env, cache, pos_2d)
 
     starts: list[np.ndarray] = []
     ends: list[np.ndarray] = []
@@ -1290,8 +1379,8 @@ def _update_sensor_markers(
         yaw = yaws[robot_i]
         cos_y = math.cos(yaw)
         sin_y = math.sin(yaw)
-        dirs_x = local_x * cos_y - local_y * sin_y
-        dirs_y = local_x * sin_y + local_y * cos_y
+        dirs_x = cache.local_x * cos_y - cache.local_y * sin_y
+        dirs_y = cache.local_x * sin_y + cache.local_y * cos_y
         origin = np.array([pos_2d[robot_i, 0], pos_2d[robot_i, 1], z_ray], dtype=np.float32)
 
         ground_val = float(ground_np[row, 0])
@@ -1327,22 +1416,13 @@ def _update_sensor_markers(
                 points.append(light_end)
                 point_idx.append(2)
 
-        for k in range(max(8, ring_segments)):
-            a = 2.0 * math.pi * k / max(8, ring_segments)
-            points.append(np.array([
-                pos_2d[robot_i, 0] + env.sensors.rab_range * math.cos(a),
-                pos_2d[robot_i, 1] + env.sensors.rab_range * math.sin(a),
-                z_ray,
-            ], dtype=np.float32))
-            point_idx.append(3)
+        ring_points = np.empty((len(cache.ring_offsets), 3), dtype=np.float32)
+        ring_points[:, :2] = pos_2d[robot_i] + cache.ring_offsets
+        ring_points[:, 2] = z_ray
+        points.extend(ring_points)
+        point_idx.extend([3] * len(ring_points))
 
-        for other_i in range(env.N):
-            if other_i == robot_i:
-                continue
-            delta = pos_2d[other_i] - pos_2d[robot_i]
-            dist = float(np.linalg.norm(delta))
-            if dist >= env.sensors.rab_range or _line_blocks_segment(env, pos_2d[robot_i], pos_2d[other_i]):
-                continue
+        for other_i in np.flatnonzero(visible_neighbors[robot_i]):
             neighbor = np.array([pos_2d[other_i, 0], pos_2d[other_i, 1], z_ray], dtype=np.float32)
             starts.append(origin)
             ends.append(neighbor)
@@ -1398,7 +1478,10 @@ def _variant_from_config(config_path: str) -> str:
 
 
 def _infer_variant_from_checkpoint(ckpt: dict) -> str:
-    if ckpt.get("trainer_type") == "option_critic":
+    if ckpt.get("trainer_type") in (
+        "option_critic",
+        "learned_option_critic",
+    ):
         return str(ckpt.get("variant", "cyclamen"))
     if not ckpt.get("discrete", False):
         return "dandelion"
@@ -1413,7 +1496,11 @@ def _expected_obs_dim(variant: str) -> int:
     return 24 if variant in ("dandelion", "daisy") else 4
 
 
-def _policy_observations(env: StandaloneDGTEnv, variant: str):
+def _policy_observations(
+    env: StandaloneDGTEnv,
+    variant: str,
+    full_observations: bool = False,
+):
     """Compute the same local observations used by the training environment."""
     prox_vals, prox_value, prox_angle = env.sensors.compute_proximity(
         env.pos, env.yaw, env.wall_segments, env.pos, env.robot_radius,
@@ -1424,7 +1511,7 @@ def _policy_observations(env: StandaloneDGTEnv, variant: str):
         env.pos, env.yaw, obstacle_segments=env.wall_segments,
     )
 
-    if variant in ("dandelion", "daisy"):
+    if full_observations or variant in ("dandelion", "daisy"):
         obs_all = env.sensors.collect_obs_dandelion(
             prox_vals, light_vals, ground, ztilde, rab_proj,
         )
@@ -1462,14 +1549,29 @@ def _load_policy_actor(
     act_dim = int(ckpt.get("act_dim", 2))
     memory_size = checkpoint_memory_size(ckpt)
 
-    if obs_dim != _expected_obs_dim(variant):
+    expected_obs_dim = (
+        24
+        if trainer_type == "learned_option_critic"
+        else _expected_obs_dim(variant)
+    )
+    if obs_dim != expected_obs_dim:
         print(
             f"[Policy] Warning: checkpoint obs_dim={obs_dim}, "
-            f"but variant '{variant}' expects {_expected_obs_dim(variant)}.",
+            f"but this '{variant}' policy expects {expected_obs_dim}.",
             flush=True,
         )
 
-    if trainer_type == "option_critic":
+    if trainer_type == "learned_option_critic":
+        actor = LearnedOptionActor(
+            obs_dim,
+            act_dim,
+            num_options,
+            hidden_dim,
+            num_layers,
+            memory_size,
+        ).to(device)
+        actor.load_state_dict(ckpt["actor"])
+    elif trainer_type == "option_critic":
         actor = FixedOptionManager(
             obs_dim, num_options, hidden_dim, num_layers, memory_size,
         ).to(device)
@@ -1565,21 +1667,32 @@ def main():
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    if args.viewer_torch_threads > 0:
+        torch.set_num_threads(args.viewer_torch_threads)
+        try:
+            torch.set_num_interop_threads(1)
+        except RuntimeError:
+            pass
 
     N = args.num_agents
     speed = args.speed
+    render_viewport = not getattr(args, "headless", False)
     sim_hz = max(args.sim_hz, 1.0)
     control_hz = max(args.control_hz, 1.0)
+    sensor_visual_hz = max(args.sensor_visual_hz, 0.1)
     sim_dt = 1.0 / sim_hz
     control_dt = 1.0 / control_hz
     control_interval = max(1, round(control_dt / sim_dt))
-    status_interval = (
-        max(1, round(args.status_interval / sim_dt))
-        if args.status_interval > 0.0 else 0
+    sensor_visual_interval = max(1, round(sim_hz / sensor_visual_hz))
+    playback_speed = max(0.0, args.playback_speed)
+    frame_period = (
+        sim_dt / playback_speed
+        if render_viewport and playback_speed > 0.0 else 0.0
     )
     print(
         f"[ManualIsaac] sim_hz={sim_hz:.1f}, control_hz={control_hz:.1f}, "
-        f"control interval={control_interval} frames",
+        f"control interval={control_interval} frames, "
+        f"playback={'uncapped' if playback_speed == 0.0 else f'{playback_speed:g}x'}",
         flush=True,
     )
     if args.keymap == "azerty-physical":
@@ -1603,8 +1716,9 @@ def main():
     print("[ManualIsaac] SimulationContext ready.", flush=True)
 
     # ── Lighting ──────────────────────────────────────────────────
-    light_cfg = sim_utils.DomeLightCfg(intensity=3000.0, color=(0.80, 0.80, 0.80))
-    light_cfg.func("/World/DomeLight", light_cfg)
+    if render_viewport:
+        light_cfg = sim_utils.DomeLightCfg(intensity=3000.0, color=(0.80, 0.80, 0.80))
+        light_cfg.func("/World/DomeLight", light_cfg)
 
     # ── Ground plane ──────────────────────────────────────────────
 
@@ -1635,31 +1749,51 @@ def main():
         )
 
     # ── Visual scene ──────────────────────────────────────────────
-    print("[ManualIsaac] Building arena visuals...", flush=True)
-    _build_arena_visuals(env)
-    robot_markers = _create_robot_markers(env)
-    heading_markers = _create_heading_markers(env)
-    sensor_line_markers = _create_sensor_line_markers() if args.show_sensors else None
-    sensor_point_markers = _create_sensor_point_markers() if args.show_sensors else None
-    print("[ManualIsaac] Visual scene ready.", flush=True)
+    robot_visuals = None
+    sensor_line_markers = None
+    sensor_point_markers = None
+    sensor_visual_cache = None
+    if render_viewport:
+        print("[ManualIsaac] Building arena visuals...", flush=True)
+        _build_arena_visuals(env)
+        set_camera_view(
+            eye=[0.0, -3.2, 3.2],
+            target=[0.0, 0.0, 0.0],
+        )
+        swarm_markers = _create_swarm_markers(env)
+        robot_visuals = _RobotVisualBuffers(env, swarm_markers)
+        robot_visuals.update(force=True)
+        if args.show_sensors:
+            sensor_line_markers = _create_sensor_line_markers()
+            sensor_point_markers = _create_sensor_point_markers()
+            sensor_visual_cache = _SensorVisualCache(
+                env, args.sensor_robot, args.sensor_ring_segments,
+            )
+            _update_sensor_markers(
+                env, sensor_line_markers, sensor_point_markers, sensor_visual_cache,
+            )
+        print("[ManualIsaac] Visual scene ready.", flush=True)
+    elif args.show_sensors:
+        print("[ManualIsaac] Sensor overlays are disabled in headless mode.", flush=True)
 
     # ── Keyboard ──────────────────────────────────────────────────
     kb = None if args.no_keyboard else KeyboardController(debug_keys=args.debug_keys)
     others_module = 1 if args.others_explore else 0  # 1=explore, 0=stop
 
-    # ── Let the sim initialise ────────────────────────────────────
-    print("[ManualIsaac] Resetting simulation...", flush=True)
-    sim.reset()
+    print("[ManualIsaac] Initializing viewer...", flush=True)
+    if render_viewport:
+        # A hard reset is required once after USD authoring: it starts the
+        # timeline, initializes Hydra/Fabric, and warms the viewport buffers.
+        # Subsequent frames remain render-only because motion is analytical.
+        sim.reset()
+    else:
+        simulation_app.update()
     print("[ManualIsaac] Entering main loop.", flush=True)
 
-    # Marker index arrays (robot 0 = prototype 0, rest = prototype 1)
-    robot_proto = np.array([0] + [1] * (N - 1), dtype=np.int32)
-    heading_proto = np.array([0] + [1] * (N - 1), dtype=np.int32)
-
     print("\n" + "=" * 60)
-    print("  SwarmACB — Manual Control (Isaac Sim)")
+    print("  SwarmACB - Manual Control (Isaac Sim)")
     print("  Robot #0 = GREEN   |   Others = BLUE")
-    print("  Z/W/↑=fwd  S/↓=bwd  Q/←=left  D/→=right  A/SPACE=stop")
+    print("  Z/W/UP=fwd  S/DOWN=bwd  Q/LEFT=left  D/RIGHT=right  A/SPACE=stop")
     print(f"  Keymap={args.keymap}")
     print("  Numpad 0-5: set others' behaviour module")
     print("  R=reset  ESC=quit")
@@ -1676,12 +1810,21 @@ def main():
         )
 
     step_counter = 0
+    frame_counter = 0
+    left = torch.zeros(1, N)
+    right = torch.zeros(1, N)
     other_left_cmd = torch.zeros(1, N)
     other_right_cmd = torch.zeros(1, N)
     policy_left_cmd = torch.zeros(1, N)
     policy_right_cmd = torch.zeros(1, N)
     policy_current_options = None
-    if policy_mode and policy_meta["trainer_type"] == "option_critic":
+    if (
+        policy_mode
+        and policy_meta["trainer_type"] in (
+            "option_critic",
+            "learned_option_critic",
+        )
+    ):
         policy_memory = policy_actor.initial_state(N, policy_device)
         policy_current_options = torch.full(
             (N,),
@@ -1694,6 +1837,21 @@ def main():
     else:
         policy_memory = None
     force_control_update = True
+    force_visual_update = False
+    loop_wall_start = time.perf_counter()
+    last_status_wall = loop_wall_start
+    last_status_frame = 0
+    next_frame_deadline = loop_wall_start
+    viewport_api = None
+    viewport_capture = None
+    viewport_capture_path = None
+    if render_viewport:
+        try:
+            from omni.kit.viewport.utility import get_active_viewport
+
+            viewport_api = get_active_viewport()
+        except Exception:
+            pass
 
     while simulation_app.is_running():
         # ── Handle keyboard events ────────────────────────────────
@@ -1708,7 +1866,14 @@ def main():
                 env.reset()
                 step_counter = 0
                 force_control_update = True
-                if policy_mode and policy_meta["trainer_type"] == "option_critic":
+                force_visual_update = True
+                if (
+                    policy_mode
+                    and policy_meta["trainer_type"] in (
+                        "option_critic",
+                        "learned_option_critic",
+                    )
+                ):
                     policy_memory = policy_actor.initial_state(N, policy_device)
                     policy_current_options.fill_(-1)
                 elif policy_mode and policy_meta["recurrent"]:
@@ -1717,27 +1882,27 @@ def main():
             elif evt == "NUMPAD_0":
                 others_module = 0
                 force_control_update = True
-                print(f"[MODULE] Others → {MODULE_NAMES[0]}")
+                print(f"[MODULE] Others -> {MODULE_NAMES[0]}")
             elif evt == "NUMPAD_1":
                 others_module = 1
                 force_control_update = True
-                print(f"[MODULE] Others → {MODULE_NAMES[1]}")
+                print(f"[MODULE] Others -> {MODULE_NAMES[1]}")
             elif evt == "NUMPAD_2":
                 others_module = 2
                 force_control_update = True
-                print(f"[MODULE] Others → {MODULE_NAMES[2]}")
+                print(f"[MODULE] Others -> {MODULE_NAMES[2]}")
             elif evt == "NUMPAD_3":
                 others_module = 3
                 force_control_update = True
-                print(f"[MODULE] Others → {MODULE_NAMES[3]}")
+                print(f"[MODULE] Others -> {MODULE_NAMES[3]}")
             elif evt == "NUMPAD_4":
                 others_module = 4
                 force_control_update = True
-                print(f"[MODULE] Others → {MODULE_NAMES[4]}")
+                print(f"[MODULE] Others -> {MODULE_NAMES[4]}")
             elif evt == "NUMPAD_5":
                 others_module = 5
                 force_control_update = True
-                print(f"[MODULE] Others → {MODULE_NAMES[5]}")
+                print(f"[MODULE] Others -> {MODULE_NAMES[5]}")
 
         # ── Keyboard → wheel velocities for robot 0 ──────────────
         lv0, rv0 = 0.0, 0.0
@@ -1754,9 +1919,9 @@ def main():
         if kb is not None and kb.is_held(*stop_keys):
             lv0, rv0 = 0.0, 0.0
 
-        # Build velocity tensors
-        left = torch.zeros(1, N)
-        right = torch.zeros(1, N)
+        # Reuse the command tensors instead of allocating them at render rate.
+        left.zero_()
+        right.zero_()
         left[0, 0] = lv0
         right[0, 0] = rv0
 
@@ -1785,11 +1950,74 @@ def main():
         if policy_mode:
             if force_control_update or step_counter % control_interval == 0:
                 obs_all, behavior_inputs = _policy_observations(
-                    env, str(policy_meta["variant"]),
+                    env,
+                    str(policy_meta["variant"]),
+                    full_observations=(
+                        policy_meta["trainer_type"]
+                        == "learned_option_critic"
+                    ),
                 )
                 flat_obs = obs_all.reshape(N, -1).to(policy_device)
+                # Behavior modules keep mutable controller state across decisions
+                # and reset it at episode boundaries, so it must remain non-inference state.
                 with torch.no_grad():
-                    if policy_meta["trainer_type"] == "option_critic":
+                    if policy_meta["trainer_type"] == "learned_option_critic":
+                        (
+                            option_logits,
+                            termination_logits,
+                            action_means,
+                            action_stds,
+                            _attentions,
+                            policy_memory,
+                        ) = policy_actor.step(flat_obs, policy_memory)
+                        policy_memory = (
+                            policy_memory[0].detach(),
+                            policy_memory[1].detach(),
+                        )
+                        if args.deterministic:
+                            proposed = option_logits.argmax(dim=-1)
+                        else:
+                            proposed = torch.distributions.Categorical(
+                                logits=option_logits,
+                            ).sample()
+
+                        force_new = policy_current_options < 0
+                        safe_current = policy_current_options.clamp(min=0)
+                        beta_logits = policy_actor.selected_termination_logits(
+                            termination_logits,
+                            safe_current,
+                        )
+                        if args.deterministic:
+                            terminate = beta_logits > 0.0
+                        else:
+                            terminate = torch.distributions.Bernoulli(
+                                logits=beta_logits,
+                            ).sample().bool()
+                        policy_current_options = torch.where(
+                            terminate | force_new,
+                            proposed,
+                            policy_current_options,
+                        )
+                        action_dist = policy_actor.selected_action_dist(
+                            action_means,
+                            action_stds,
+                            policy_current_options,
+                        )
+                        raw_actions = (
+                            action_dist.mean
+                            if args.deterministic
+                            else action_dist.sample()
+                        )
+                        wheel_actions = (
+                            raw_actions.clamp(-3.0, 3.0) / 3.0
+                        ).view(1, N, 2).cpu()
+                        policy_left_cmd = (
+                            wheel_actions[:, :, 0] * env.max_speed
+                        )
+                        policy_right_cmd = (
+                            wheel_actions[:, :, 1] * env.max_speed
+                        )
+                    elif policy_meta["trainer_type"] == "option_critic":
                         option_logits, termination_logits, policy_memory = policy_actor.step(
                             flat_obs,
                             policy_memory,
@@ -1798,11 +2026,12 @@ def main():
                             policy_memory[0].detach(),
                             policy_memory[1].detach(),
                         )
-                        option_dist = torch.distributions.Categorical(logits=option_logits)
                         if args.deterministic:
-                            proposed = option_dist.probs.argmax(dim=-1)
+                            proposed = option_logits.argmax(dim=-1)
                         else:
-                            proposed = option_dist.sample()
+                            proposed = torch.distributions.Categorical(
+                                logits=option_logits,
+                            ).sample()
 
                         force_new = policy_current_options < 0
                         safe_current = policy_current_options.clamp(min=0)
@@ -1811,7 +2040,7 @@ def main():
                             safe_current.unsqueeze(-1),
                         ).squeeze(-1)
                         if args.deterministic:
-                            terminate = torch.sigmoid(beta_logits) > 0.5
+                            terminate = beta_logits > 0.0
                         else:
                             terminate = torch.distributions.Bernoulli(
                                 logits=beta_logits,
@@ -1833,21 +2062,26 @@ def main():
                                 policy_memory[0].detach(),
                                 policy_memory[1].detach(),
                             )
-                            dist = torch.distributions.Categorical(logits=logits)
+                            if args.deterministic:
+                                action_ids = logits.argmax(dim=-1)
+                            else:
+                                action_ids = torch.distributions.Categorical(
+                                    logits=logits,
+                                ).sample()
                         else:
-                            dist = policy_actor.get_dist(flat_obs)
-
-                        if args.deterministic:
-                            action_ids = dist.probs.argmax(dim=-1)
-                        else:
-                            action_ids = dist.sample()
+                            if args.deterministic:
+                                action_ids = policy_actor(flat_obs).argmax(dim=-1)
+                            else:
+                                action_ids = policy_actor.get_dist(flat_obs).sample()
                         module_ids = action_ids.view(1, N).cpu().long()
                         policy_left_cmd, policy_right_cmd = env.behavior_modules.dispatch(
                             module_ids, *behavior_inputs,
                         )
                     else:
-                        dist = policy_actor.get_dist(flat_obs)
-                        raw_actions = dist.mean if args.deterministic else dist.sample()
+                        if args.deterministic:
+                            raw_actions = policy_actor(flat_obs)[0]
+                        else:
+                            raw_actions = policy_actor.get_dist(flat_obs).sample()
                         wheel_actions = raw_actions.clamp(-3.0, 3.0) / 3.0
                         wheel_actions = wheel_actions.view(1, N, 2).cpu()
                         policy_left_cmd = wheel_actions[:, :, 0] * env.max_speed
@@ -1855,67 +2089,63 @@ def main():
 
                 force_control_update = False
 
-            left = policy_left_cmd.clone()
-            right = policy_right_cmd.clone()
+            left.copy_(policy_left_cmd)
+            right.copy_(policy_right_cmd)
 
         # ── Step kinematic env ────────────────────────────────────
         env.step(left, right)
         step_counter += 1
+        frame_counter += 1
         if env.step_count >= env.episode_steps:
             env.reset(advance_episode=True)
             force_control_update = True
-            if policy_mode and policy_meta["trainer_type"] == "option_critic":
+            force_visual_update = True
+            if (
+                policy_mode
+                and policy_meta["trainer_type"] in (
+                    "option_critic",
+                    "learned_option_critic",
+                )
+            ):
                 policy_memory = policy_actor.initial_state(N, policy_device)
                 policy_current_options.fill_(-1)
             elif policy_mode and policy_meta["recurrent"]:
                 policy_memory = policy_actor.initial_state(N, policy_device)
 
-        # ── Update robot markers ──────────────────────────────────
-        pos_2d = env.pos[0].cpu().numpy()  # (N, 2)
-        yaws = env.yaw[0].cpu().numpy()    # (N,)
+        # ── Update dynamic viewport markers ───────────────────────
+        visual_force = force_visual_update
+        if robot_visuals is not None:
+            pos_2d, yaws, _ = robot_visuals.update(force=visual_force)
+        else:
+            pos_2d = env.pos[0].detach().numpy()
+            yaws = env.yaw[0].detach().numpy()
+        force_visual_update = False
 
-        # 3D positions: (N, 3) — robots sit on the ground at z=robot_height/2
-        robot_z = 0.025
-        robot_pos_3d = np.zeros((N, 3), dtype=np.float32)
-        robot_pos_3d[:, 0] = pos_2d[:, 0]
-        robot_pos_3d[:, 1] = pos_2d[:, 1]
-        robot_pos_3d[:, 2] = robot_z
-
-        # Orientation: yaw around Z → quaternion (w, x, y, z)
-        robot_orient = np.zeros((N, 4), dtype=np.float32)
-        robot_orient[:, 0] = np.cos(yaws / 2)   # w
-        robot_orient[:, 3] = np.sin(yaws / 2)   # z
-
-        robot_markers.visualize(
-            translations=robot_pos_3d,
-            orientations=robot_orient,
-            marker_indices=robot_proto,
-        )
-
-        # ── Update heading markers (small sphere in front of each robot) ──
-        arrow_len = env.robot_radius * 1.8
-        heading_pos_3d = np.zeros((N, 3), dtype=np.float32)
-        heading_pos_3d[:, 0] = pos_2d[:, 0] + arrow_len * np.cos(yaws)
-        heading_pos_3d[:, 1] = pos_2d[:, 1] + arrow_len * np.sin(yaws)
-        heading_pos_3d[:, 2] = robot_z + 0.01
-
-        heading_markers.visualize(
-            translations=heading_pos_3d,
-            marker_indices=heading_proto,
-        )
-
-        if sensor_line_markers is not None and sensor_point_markers is not None:
+        if (
+            sensor_line_markers is not None
+            and sensor_point_markers is not None
+            and sensor_visual_cache is not None
+            and (visual_force or frame_counter % sensor_visual_interval == 0)
+        ):
             _update_sensor_markers(
                 env,
                 sensor_line_markers,
                 sensor_point_markers,
-                args.sensor_robot,
-                args.sensor_ring_segments,
+                sensor_visual_cache,
             )
 
         # ── Periodic console readout ──────────────────────────────
-        if status_interval > 0 and step_counter % status_interval == 0:
-            info = env.compute_obs_robot0()
+        now = time.perf_counter()
+        if args.status_interval > 0.0 and now - last_status_wall >= args.status_interval:
+            wall_delta = max(now - last_status_wall, 1e-8)
+            frame_delta = frame_counter - last_status_frame
+            loop_fps = frame_delta / wall_delta
+            real_time_factor = frame_delta * sim_dt / wall_delta
+            last_status_wall = now
+            last_status_frame = frame_counter
+            # Status inspection must not perturb stochastic policy/RAB sampling.
+            with torch.random.fork_rng(devices=[]):
+                info = env.compute_obs_robot0()
             gv = info["ground_3"]
             g_label = "BLACK" if gv[0] < 0.1 else ("WHITE" if gv[0] > 0.9 else "GREY")
             pos0 = pos_2d[0]
@@ -1941,10 +2171,10 @@ def main():
                 f"neighbors={info['n_neighbors']} "
                 f"reward={env.step_reward:+.0f} "
                 f"K+={env.k_plus_total} K-={env.k_minus_total} "
-                f"module={mode_label}"
+                f"module={mode_label} "
+                f"fps={loop_fps:.1f} rtf={real_time_factor:.2f}x"
             )
 
-        # ── Sim step (renders the viewport) ───────────────────────
             hud_lines = [
                 f"Episode: {env.episode_index}",
                 f"Time: {_format_duration(elapsed_s)} / {_format_duration(total_s)}",
@@ -1954,9 +2184,45 @@ def main():
             if last_score is not None:
                 hud_lines.append(f"Last completed: {last_score:.0f}")
             hud_lines.append(f"Mode: {mode_label}")
+            viewport_fps = float(getattr(viewport_api, "fps", 0.0) or 0.0)
+            fps_text = (
+                f"{viewport_fps:.1f} viewport"
+                if viewport_fps > 0.0 else f"{loop_fps:.1f} loop"
+            )
+            hud_lines.append(f"FPS: {fps_text}   RTF: {real_time_factor:.2f}x")
             editor_hud.update("\n".join(hud_lines))
 
-        sim.step()
+        # The robots are analytical point-instancer animations. A PhysX step
+        # here only adds latency; rendering alone still updates the viewport,
+        # UI, keyboard events, and every visible marker.
+        if render_viewport:
+            sim.render()
+            if (
+                args.viewport_screenshot
+                and viewport_capture is None
+                and frame_counter >= 30
+                and viewport_api is not None
+            ):
+                from omni.kit.viewport.utility import capture_viewport_to_file
+
+                viewport_capture_path = os.path.abspath(
+                    os.path.expandvars(os.path.expanduser(args.viewport_screenshot))
+                )
+                os.makedirs(os.path.dirname(viewport_capture_path), exist_ok=True)
+                viewport_capture = capture_viewport_to_file(
+                    viewport_api,
+                    file_path=viewport_capture_path,
+                )
+        elif frame_counter % 256 == 0:
+            simulation_app.update()
+
+        if frame_period > 0.0:
+            next_frame_deadline += frame_period
+            delay = next_frame_deadline - time.perf_counter()
+            if delay > 0.0:
+                time.sleep(delay)
+            elif delay < -4.0 * frame_period:
+                next_frame_deadline = time.perf_counter()
 
         if args.smoke_frames > 0 and step_counter >= args.smoke_frames:
             print(f"[ManualIsaac] Smoke test completed after {step_counter} frames.", flush=True)
@@ -1965,6 +2231,19 @@ def main():
     # ── Cleanup ───────────────────────────────────────────────────
     if kb is not None:
         kb.destroy()
+    if viewport_capture is not None:
+        for _ in range(3):
+            sim.render()
+        try:
+            import omni.kit.renderer_capture
+
+            omni.kit.renderer_capture.acquire_renderer_capture_interface().wait_async_capture()
+        except Exception as exc:
+            print(f"[ManualIsaac] Warning: viewport capture did not finish cleanly: {exc}", flush=True)
+        if viewport_capture_path and os.path.isfile(viewport_capture_path):
+            print(f"[ManualIsaac] Viewport screenshot -> {viewport_capture_path}", flush=True)
+        else:
+            print("[ManualIsaac] Warning: viewport screenshot was not written.", flush=True)
     simulation_app.close()
 
 

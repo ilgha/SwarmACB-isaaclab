@@ -85,6 +85,7 @@ def audit_config(
     is_oc: bool,
     audit: Audit,
     network_config,
+    learned_oc: bool = False,
 ) -> None:
     run_name, block = one_behavior(path, audit)
     prefix = path.name
@@ -95,7 +96,16 @@ def audit_config(
     audit.equal(f"{prefix}.run_name", run_name, path.stem)
     audit.equal(f"{prefix}.task", block.get("task", environment.get("task")), task)
     audit.equal(f"{prefix}.variant", block.get("variant"), variant)
-    audit.equal(f"{prefix}.trainer_type", block.get("trainer_type"), "option_critic" if is_oc else "poca")
+    expected_trainer = (
+        "learned_option_critic"
+        if learned_oc
+        else ("option_critic" if is_oc else "poca")
+    )
+    audit.equal(
+        f"{prefix}.trainer_type",
+        block.get("trainer_type"),
+        expected_trainer,
+    )
 
     hyper = block.get("hyperparameters", {})
     audit.equal(f"{prefix}.batch_size", hyper.get("batch_size"), 2048)
@@ -113,6 +123,18 @@ def audit_config(
     audit.equal(f"{prefix}.num_layers", network.get("num_layers"), layers)
     if is_oc:
         audit.equal(f"{prefix}.num_options", network.get("num_options"), 6)
+    if learned_oc:
+        learned_defaults = {
+            "intra_option_coef": 1.0,
+            "selector_coef": 1.0,
+            "option_entropy_coef": 0.005,
+            "action_baseline_coef": 0.25,
+            "option_baseline_coef": 0.25,
+            "attention_diversity_coef": 0.01,
+            "attention_temporal_coef": 0.01,
+        }
+        for key, expected in learned_defaults.items():
+            audit.close(f"{prefix}.{key}", hyper.get(key), expected)
     if memory is None:
         audit.equal(f"{prefix}.memory", network.get("memory"), None)
     else:
@@ -332,6 +354,17 @@ def main() -> int:
             True,
             audit,
             network_config,
+        )
+        learned_filename = f"OC2_{mission}_cyclamen.yaml"
+        expected_files.add(learned_filename)
+        audit_config(
+            config_dir / learned_filename,
+            mission,
+            "cyclamen",
+            True,
+            audit,
+            network_config,
+            learned_oc=True,
         )
 
     actual_files = {path.name for path in config_dir.glob("*.yaml")}

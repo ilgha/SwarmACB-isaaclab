@@ -20,4 +20,10 @@ from .poca_trainer import POCATrainer, POCAConfig, PolynomialDecay
 from .option_critic_networks import FixedOptionManager
 from .option_critic_buffer import FixedOptionRolloutBuffer
 from .option_critic_trainer import FixedOptionCriticTrainer, FixedOptionCriticConfig
+from .learned_option_critic_networks import LearnedOptionActor
+from .learned_option_critic_buffer import LearnedOptionRolloutBuffer
+from .learned_option_critic_trainer import (
+    LearnedOptionCriticTrainer,
+    LearnedOptionCriticConfig,
+)
 from .config_loader import load_config, print_config

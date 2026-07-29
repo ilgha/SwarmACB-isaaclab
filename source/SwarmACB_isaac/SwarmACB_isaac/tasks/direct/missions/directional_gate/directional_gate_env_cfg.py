@@ -91,6 +91,7 @@ class DirectionalGateEnvCfg(DirectMARLEnvCfg):
     # Whether actions are discrete (for POCA trainer)
     discrete_actions: bool = False
     num_actions: int = _NUM_BEHAVIOR_MODULES  # only used when discrete_actions=True
+    full_policy_observations: bool = False
 
     # ── Simulation ────────────────────────────────────────────────
     decimation: int = 1            # physics steps per control step
@@ -189,3 +190,19 @@ class DirectionalGateEnvCfg(DirectMARLEnvCfg):
         self.observation_spaces = _obs_spaces(variant, self.num_agents)
         self.action_spaces = _act_spaces(variant, self.num_agents)
         self.discrete_actions = (variant != "dandelion")
+
+    def use_continuous_actions(self, full_observations: bool = False):
+        """Keep the selected observation variant but expose wheel actions.
+
+        Learned Option-Critic Phase 2 keeps Cyclamen's compact recurrent
+        manager input while its motor options receive the full local sensor
+        vector.
+        """
+        self.action_spaces = _act_spaces("dandelion", self.num_agents)
+        self.discrete_actions = False
+        self.full_policy_observations = bool(full_observations)
+        if self.full_policy_observations:
+            self.observation_spaces = _obs_spaces(
+                "dandelion",
+                self.num_agents,
+            )
