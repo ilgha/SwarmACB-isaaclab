@@ -35,11 +35,25 @@ def apply_network_settings(
             "num_options",
             block.get("num_options", cfg.num_options),
         )
+    if hasattr(cfg, "option_hidden_dim"):
+        cfg.option_hidden_dim = network.get(
+            "option_hidden_units",
+            cfg.option_hidden_dim,
+        )
+        cfg.option_num_layers = network.get(
+            "option_num_layers",
+            cfg.option_num_layers,
+        )
 
     memory = network.get("memory", {})
     cfg.recurrent = bool(memory) or variant == "cyclamen"
     if cfg.recurrent:
         cfg.memory_size = memory.get("memory_size", cfg.memory_size)
         cfg.sequence_length = memory.get("sequence_length", cfg.sequence_length)
+        if hasattr(cfg, "option_memory_size"):
+            cfg.option_memory_size = memory.get(
+                "option_memory_size",
+                cfg.option_memory_size,
+            )
 
     return cfg

@@ -123,33 +123,52 @@ SMDP-level policy-over-options implementation.
 
 ## Learned Option-Critic Phase 2
 
-Phase 2 is configured as `trainer_type: learned_option_critic` and currently
-uses the working name `OC2_cyclamen`. The six options are no longer mapped to
-the six predefined behavior modules. Each option learns its own stochastic
-continuous intra-option policy over the two normalized wheel commands.
-The number of learned options is controlled by
-`network_settings.num_options`; the initial benchmark uses six for a direct
-comparison with Phase 1.
+Phase 2 is configured as `trainer_type: learned_option_critic` and uses the
+working name `OC2_cyclamen`. Unlike Phase 1, its options are not mapped to the
+six predefined behavior modules. Each option learns its attention, recurrent
+representation, continuous intra-option wheel policy, and termination
+function. `network_settings.num_options` controls their number; the initial
+benchmark uses six for a direct comparison with Phase 1.
 
-The local actor contains:
-
-- Cyclamen's recurrent policy over six options
-- six learned termination functions
-- six learned Gaussian intra-option wheel policies
-- six state-dependent feature-attention masks
-
-The recurrent selector receives exactly Cyclamen's four inputs
-`[ground_0, ground_1, ground_2, ztilde]`. Learned motor options also need
-proximity, light, and directional RAB information that was previously available
-inside the fixed behavior modules. They therefore attend over the full local
-24-channel sensor vector. This keeps the high-level Cyclamen comparison while
-giving learned motor options enough local information to avoid obstacles,
-follow light, and react directionally to neighbors.
-
-Training remains centralized and execution decentralized. Three critic roles
-separate the objectives:
+OC2 checkpoint version 2 implements the Attention Option-Critic dependency
+strictly. For robot `i` and option `omega`:
 
 ```text
+h_i,omega = attention_omega(x_i, manager_memory_i)
+x_i,omega = h_i,omega * x_i
+
+local option value q_i^Omega(x_i,omega),
+intra-option policy pi_i,omega(a_i | x_i), and
+termination beta_i,omega(x_i)
+    all consume only the encoded x_i,omega and its option memory
+```
+
+The compact Cyclamen input `[ground_0, ground_1, ground_2, ztilde]` maintains
+the manager memory used to generate the masks. Every option has a separate
+recurrent state, while encoder and recurrent weights remain shared across
+options and robots. There is no unmasked feature shortcut to the selector,
+wheel policy, or termination heads. The motor paths attend over the full local
+24-channel vector so they can learn the sensing-to-motion functions previously
+provided by the fixed modules.
+
+Wheel actions use a tanh-squashed Normal distribution with corrected log
+probabilities. Samples are already normalized to `[-1, 1]` when passed to the
+environment; no post-sampling clamp changes the action after its probability
+has been evaluated. The log standard deviation is bounded separately for each
+option.
+
+The policy over options is the Boltzmann distribution of the local attended
+option values. The selected local value is fitted to the same lambda return as
+the team critic, while the boundary-only selector update uses the collective
+counterfactual option advantage. Thus attention receives both option-evaluation
+and option-improvement gradients without exposing centralized state at
+execution time.
+
+Training remains centralized and execution decentralized. One local value and
+three centralized critic roles separate the objectives:
+
+```text
+q_i^Omega(x_i, omega_i)                local attended option value (execution)
 V(s)                                  team value for lambda returns
 b_i^U((s, omega), a_-i)              primitive-action counterfactual baseline
 Q_Omega(s, omega_vector),
@@ -166,10 +185,31 @@ A_i^Omega = lambda_return - b_i^Omega(s, omega_-i)
 ```
 
 The arrival-state termination theorem is the same collective replacement test
-as Phase 1. The intra-option policy is updated every decision, while the policy
-over options is updated only at sampled option boundaries. Pairwise attention
-cosine similarity is minimized to discourage option collapse, and a temporal
-attention loss discourages rapidly changing option focus.
+as Phase 1:
+
+```text
+L_beta = beta_i,omega(s') *
+  [Q_Omega(s', omega_vector) -
+   sum_omega' mu_i(omega' | x_i')
+     Q_Omega(s', (omega_-i, omega')) + xi]
+```
+
+There is one `beta_i,omega` output per option. The positive deliberation cost
+`xi` discourages unnecessary switching. OC2 initializes beta to `0.05` (about
+20 decisions or two simulated seconds on average at 10 Hz) and applies no
+termination-entropy bonus by default. This avoids the old version-1 equilibrium
+near beta `0.27`. The intra-option policy is updated every decision; selector
+PPO and selector entropy are evaluated only at sampled option boundaries.
+Pairwise attention cosine similarity is minimized to discourage option
+collapse, and a temporal attention loss discourages rapidly changing focus.
+
+For Phase 2 validation, monitor `Policy/Option Usage/*`,
+`Policy/Intra-Option Std/*`, `Policy/Mean Termination Probability`,
+`Policy/Termination Probability/*`, `Policy/Switch Rate`,
+`Policy/Option Switch Rate/*`, `Policy/Mean Option Duration Decisions`,
+`Policy/Local Option Value Spread`, `Policy/Wheel Action Saturation`, and the
+two attention losses. Comparable task reward alone is not sufficient evidence
+that distinct temporal options formed.
 
 ## Sensor Suite
 
@@ -491,43 +531,66 @@ behaviors:
     trainer_type: learned_option_critic
     hyperparameters:
       learning_rate: 0.0003
+      beta: 0.001
       intra_option_coef: 1.0
       selector_coef: 1.0
+      local_option_value_coef: 0.5
       option_entropy_coef: 0.005
       termination_penalty: 0.01
-      termination_coef: 0.1
+      termination_coef: 1.0
+      termination_entropy_coef: 0.0
+      initial_termination_probability: 0.05
       action_baseline_coef: 0.25
       option_value_coef: 0.5
       option_baseline_coef: 0.25
       attention_diversity_coef: 0.01
       attention_temporal_coef: 0.01
+      initial_log_std: -0.7
+      min_log_std: -2.5
+      max_log_std: 0.0
+      max_grad_norm: 10.0
+      option_value_temperature: 1.0
     network_settings:
       hidden_units: 128
       num_layers: 1
+      option_hidden_units: 512
+      option_num_layers: 2
       num_options: 6
       memory:
         memory_size: 128
+        option_memory_size: 64
         sequence_length: 128
+    critic_settings:
+      hidden_units: 512
+      num_layers: 2
+      num_heads: 4
 ```
 
-Checkpoints produced before paper-parity version 4 use incompatible network or
-training semantics. Version 4 makes the centralized critic inherit
-`hidden_units` and `num_layers` from `network_settings`, exactly as Unity passes
-the same `NetworkSettings` object to its actor and POCA critic. They remain
-usable for historical evaluation, but parity experiments must start from fresh
-weights. At startup, Cyclamen and fixed Option-Critic must report a
-`hidden=128 layers=1` critic; Dandelion, Daisy, and Lily must report
-`hidden=512 layers=2`.
+Paper-parity version 4 remains the Unity-matched architecture for classical
+Cyclamen and Phase 1; the corrected research architecture is recorded
+separately as OC2 checkpoint version 2.
+Classical Cyclamen and fixed Option-Critic use a `128 x 1` actor/critic;
+Dandelion, Daisy, and Lily use `512 x 2`. OC2 keeps the `128 x 1` Cyclamen
+manager, but uses `512 x 2` learned motor paths and centralized critics because
+the fixed low-level modules no longer provide that capacity.
+
+OC2 version-1 checkpoints are intentionally rejected by the trainer and both
+viewers. They contain the old attention bypass, unbounded/clipped action policy,
+and incompatible recurrent state layout. Start every corrected OC2 experiment
+from fresh weights.
 
 Before submitting the full HPC matrix, run the dependency-light parity audit:
 
 ```bash
 python scripts/validate_paper_parity.py
+python scripts/validate_oc2_architecture.py
 ```
 
-It validates all 35 YAML files, experiment budgets, raw and runtime-resolved
-actor/critic network sizes, recurrent semantics, and the mission
-geometry/constants that are most sensitive to Unity scene overrides.
+The first command validates all 35 YAML files, experiment budgets, resolved
+network sizes, recurrent semantics, and sensitive mission constants. The OC2
+validator additionally checks tensor shapes, recurrent step/sequence parity,
+attention gradients to all three option outputs, bounded-action probabilities,
+and the signs of the termination theorem.
 
 The HPC array launcher passes `SLURM_ARRAY_TASK_ID` as `--seed`, so the ten
 controllers use reproducible seeds 0 through 9. Training also follows the

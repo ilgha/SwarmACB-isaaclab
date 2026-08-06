@@ -396,15 +396,12 @@ def main():
           f"obs={obs_dim}  act={'discrete(' + str(num_actions) + ')' if discrete else str(act_dim)}")
 
     if trainer_type == "learned_option_critic":
-        actor = LearnedOptionActor(
-            obs_dim,
-            act_dim,
-            num_options,
-            hidden_dim,
-            num_layers,
-            memory_size,
-        ).to(device)
-        actor.load_state_dict(ckpt["actor"])
+        actor = LearnedOptionActor.from_checkpoint(ckpt, device)
+        if actor.obs_dim != obs_dim:
+            raise RuntimeError(
+                f"OC2 checkpoint expects obs_dim={actor.obs_dim}, but the "
+                f"environment produced obs_dim={obs_dim}."
+            )
         actor.eval()
         manager = None
     elif trainer_type == "option_critic":
@@ -533,7 +530,7 @@ def main():
                     obs_stacked.shape[-1],
                 )
                 (
-                    option_logits,
+                    option_values,
                     termination_logits,
                     action_means,
                     action_stds,
@@ -544,11 +541,9 @@ def main():
                 memory_c = next_memory[1].detach()
 
                 if args.deterministic:
-                    proposed = option_logits.argmax(dim=-1)
+                    proposed = option_values.argmax(dim=-1)
                 else:
-                    proposed = torch.distributions.Categorical(
-                        logits=option_logits,
-                    ).sample()
+                    proposed = actor.option_dist(option_values).sample()
                 proposed = proposed.view(num_envs, len(agents))
 
                 force_new = current_options < 0
@@ -577,12 +572,12 @@ def main():
                     action_stds,
                     current_options.reshape(-1),
                 )
-                raw_actions = (
+                normalized_actions = (
                     action_dist.mean
                     if args.deterministic
                     else action_dist.sample()
                 )
-                all_actions = raw_actions.clamp(-3.0, 3.0).div(3.0).view(
+                all_actions = normalized_actions.view(
                     num_envs,
                     len(agents),
                     act_dim,

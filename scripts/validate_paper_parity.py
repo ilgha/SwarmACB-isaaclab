@@ -125,22 +125,49 @@ def audit_config(
         audit.equal(f"{prefix}.num_options", network.get("num_options"), 6)
     if learned_oc:
         learned_defaults = {
+            "beta": 0.001,
             "intra_option_coef": 1.0,
             "selector_coef": 1.0,
+            "local_option_value_coef": 0.5,
             "option_entropy_coef": 0.005,
+            "termination_penalty": 0.01,
+            "termination_coef": 1.0,
+            "termination_entropy_coef": 0.0,
+            "initial_termination_probability": 0.05,
             "action_baseline_coef": 0.25,
             "option_baseline_coef": 0.25,
             "attention_diversity_coef": 0.01,
             "attention_temporal_coef": 0.01,
+            "initial_log_std": -0.7,
+            "min_log_std": -2.5,
+            "max_log_std": 0.0,
+            "max_grad_norm": 10.0,
+            "option_value_temperature": 1.0,
         }
         for key, expected in learned_defaults.items():
             audit.close(f"{prefix}.{key}", hyper.get(key), expected)
+        audit.equal(
+            f"{prefix}.option_hidden_units",
+            network.get("option_hidden_units"),
+            512,
+        )
+        audit.equal(
+            f"{prefix}.option_num_layers",
+            network.get("option_num_layers"),
+            2,
+        )
     if memory is None:
         audit.equal(f"{prefix}.memory", network.get("memory"), None)
     else:
         memory_block = network.get("memory", {})
         audit.equal(f"{prefix}.memory_size", memory_block.get("memory_size"), memory[0])
         audit.equal(f"{prefix}.sequence_length", memory_block.get("sequence_length"), memory[1])
+        if learned_oc:
+            audit.equal(
+                f"{prefix}.option_memory_size",
+                memory_block.get("option_memory_size"),
+                64,
+            )
 
     # Exercise the exact dependency-free resolver used by config_loader.py.
     # This catches a valid YAML value silently diverging at trainer runtime.
@@ -156,6 +183,10 @@ def audit_config(
     )
     if is_oc:
         resolved.num_options = 6
+    if learned_oc:
+        resolved.option_hidden_dim = 512
+        resolved.option_num_layers = 2
+        resolved.option_memory_size = 64
     network_config.apply_network_settings(
         resolved,
         network,
@@ -165,8 +196,18 @@ def audit_config(
     )
     audit.equal(f"{prefix}.resolved_actor_hidden", resolved.hidden_dim, hidden)
     audit.equal(f"{prefix}.resolved_actor_layers", resolved.num_layers, layers)
-    audit.equal(f"{prefix}.resolved_critic_hidden", resolved.critic_hidden_dim, hidden)
-    audit.equal(f"{prefix}.resolved_critic_layers", resolved.critic_num_layers, layers)
+    expected_critic_hidden = 512 if learned_oc else hidden
+    expected_critic_layers = 2 if learned_oc else layers
+    audit.equal(
+        f"{prefix}.resolved_critic_hidden",
+        resolved.critic_hidden_dim,
+        expected_critic_hidden,
+    )
+    audit.equal(
+        f"{prefix}.resolved_critic_layers",
+        resolved.critic_num_layers,
+        expected_critic_layers,
+    )
     audit.equal(f"{prefix}.resolved_critic_heads", resolved.critic_num_heads, 4)
     audit.equal(f"{prefix}.resolved_recurrent", resolved.recurrent, memory is not None)
     if memory is not None:
@@ -178,6 +219,22 @@ def audit_config(
         )
     if is_oc:
         audit.equal(f"{prefix}.resolved_num_options", resolved.num_options, 6)
+    if learned_oc:
+        audit.equal(
+            f"{prefix}.resolved_option_hidden",
+            resolved.option_hidden_dim,
+            512,
+        )
+        audit.equal(
+            f"{prefix}.resolved_option_layers",
+            resolved.option_num_layers,
+            2,
+        )
+        audit.equal(
+            f"{prefix}.resolved_option_memory",
+            resolved.option_memory_size,
+            64,
+        )
 
     reward = block.get("reward_signals", {}).get("extrinsic", {})
     audit.close(f"{prefix}.gamma", reward.get("gamma"), 0.99)

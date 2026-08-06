@@ -99,11 +99,18 @@ def load_config(path: str | Path) -> tuple[str, str, Any, dict[str, Any]]:
         "baseline_coef": "baseline_coef",
         "intra_option_coef": "intra_option_coef",
         "selector_coef": "selector_coef",
+        "local_option_value_coef": "local_option_value_coef",
         "option_entropy_coef": "option_entropy_coef",
         "action_baseline_coef": "action_baseline_coef",
         "option_baseline_coef": "option_baseline_coef",
         "attention_diversity_coef": "attention_diversity_coef",
         "attention_temporal_coef": "attention_temporal_coef",
+        "initial_termination_probability": "initial_termination_probability",
+        "initial_log_std": "initial_log_std",
+        "min_log_std": "min_log_std",
+        "max_log_std": "max_log_std",
+        "max_grad_norm": "max_grad_norm",
+        "option_value_temperature": "option_value_temperature",
     }
     for yaml_key, config_key in option_critic_hyperparameters.items():
         if hasattr(cfg, config_key):
@@ -196,17 +203,32 @@ def print_config(run_name: str, variant: str, cfg: Any, env_ov: dict):
         if hasattr(cfg, "intra_option_coef"):
             print(f"    intra_option_coef   : {cfg.intra_option_coef}")
             print(f"    selector_coef       : {cfg.selector_coef}")
+            print(f"    local_option_value  : {cfg.local_option_value_coef}")
             print(f"    action_baseline     : {cfg.action_baseline_coef}")
             print(f"    option_baseline     : {cfg.option_baseline_coef}")
             print(f"    option_entropy      : {cfg.option_entropy_coef}")
             print(f"    attention_diversity : {cfg.attention_diversity_coef}")
             print(f"    attention_temporal  : {cfg.attention_temporal_coef}")
+            print(
+                "    initial_termination : "
+                f"{cfg.initial_termination_probability}"
+            )
+            print(
+                f"    action_log_std      : {cfg.initial_log_std} "
+                f"[{cfg.min_log_std}, {cfg.max_log_std}]"
+            )
+            print(
+                f"    option_temperature  : {cfg.option_value_temperature}"
+            )
     print(f"  Network")
     print(f"    hidden_units        : {cfg.hidden_dim}")
     print(f"    num_layers          : {cfg.num_layers}")
     print(f"    critic_hidden       : {cfg.critic_hidden_dim}")
     print(f"    critic_layers       : {cfg.critic_num_layers}")
     print(f"    critic_heads        : {cfg.critic_num_heads}")
+    if hasattr(cfg, "option_hidden_dim"):
+        print(f"    option_hidden       : {cfg.option_hidden_dim}")
+        print(f"    option_layers       : {cfg.option_num_layers}")
     if hasattr(cfg, "num_options"):
         option_label = (
             "learned_options"
@@ -216,6 +238,11 @@ def print_config(run_name: str, variant: str, cfg: Any, env_ov: dict):
         print(f"    {option_label:20s}: {cfg.num_options}")
     if cfg.recurrent:
         print(f"    memory_size         : {cfg.memory_size} ({cfg.memory_size // 2} LSTM units)")
+        if hasattr(cfg, "option_memory_size"):
+            print(
+                f"    option_memory       : {cfg.option_memory_size} "
+                f"({cfg.option_memory_size // 2} LSTM units/option)"
+            )
         print(f"    sequence_length     : {cfg.sequence_length}")
     print(f"  Training")
     print(f"    seed                 : {cfg.seed}")

@@ -194,8 +194,8 @@ class DirectionalGateEnvCfg(DirectMARLEnvCfg):
     def use_continuous_actions(self, full_observations: bool = False):
         """Keep the selected observation variant but expose wheel actions.
 
-        Learned Option-Critic Phase 2 keeps Cyclamen's compact recurrent
-        manager input while its motor options receive the full local sensor
+        Learned Option-Critic Phase 2 keeps Cyclamen's compact manager memory,
+        while each attended recurrent option receives the full local sensor
         vector.
         """
         self.action_spaces = _act_spaces("dandelion", self.num_agents)

@@ -49,8 +49,13 @@ class LearnedOptionRolloutBuffer:
             time, envs, agents, dtype=torch.long, device=device,
         )
         self.option_log_probs = torch.zeros(time, envs, agents, device=device)
+        self.local_option_values = torch.zeros(time, envs, agents, device=device)
         self.option_masks = torch.zeros(time, envs, agents, device=device)
         self.beta_probs = torch.zeros(time, envs, agents, device=device)
+        self.termination_options = torch.zeros(
+            time, envs, agents, dtype=torch.long, device=device,
+        )
+        self.termination_valid = torch.zeros(time, envs, agents, device=device)
 
         self.actions = torch.zeros(
             time, envs, agents, act_dim, device=device,
@@ -122,8 +127,11 @@ class LearnedOptionRolloutBuffer:
         next_critic_states: torch.Tensor,
         options: torch.Tensor,
         option_log_probs: torch.Tensor,
+        local_option_values: torch.Tensor,
         option_masks: torch.Tensor,
         beta_probs: torch.Tensor,
+        termination_options: torch.Tensor,
+        termination_valid: torch.Tensor,
         actions: torch.Tensor,
         action_log_probs: torch.Tensor,
         reward: torch.Tensor,
@@ -158,8 +166,11 @@ class LearnedOptionRolloutBuffer:
         self.next_critic_states[t] = next_critic_states
         self.options[t] = options.long()
         self.option_log_probs[t] = option_log_probs
+        self.local_option_values[t] = local_option_values
         self.option_masks[t] = option_masks
         self.beta_probs[t] = beta_probs
+        self.termination_options[t] = termination_options.long()
+        self.termination_valid[t] = termination_valid
         self.actions[t] = actions
         self.action_log_probs[t] = action_log_probs
         self.rewards[t] = reward
@@ -307,6 +318,9 @@ class LearnedOptionRolloutBuffer:
                 "options": stack_focal("options"),
                 "critic_options": stack_group("options"),
                 "old_option_log_probs": stack_focal("option_log_probs"),
+                "old_local_option_values": stack_focal(
+                    "local_option_values"
+                ),
                 "option_masks": stack_focal("option_masks"),
                 "actions": stack_focal("actions"),
                 "critic_actions": stack_group("actions"),

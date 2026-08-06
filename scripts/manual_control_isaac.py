@@ -1562,15 +1562,7 @@ def _load_policy_actor(
         )
 
     if trainer_type == "learned_option_critic":
-        actor = LearnedOptionActor(
-            obs_dim,
-            act_dim,
-            num_options,
-            hidden_dim,
-            num_layers,
-            memory_size,
-        ).to(device)
-        actor.load_state_dict(ckpt["actor"])
+        actor = LearnedOptionActor.from_checkpoint(ckpt, device)
     elif trainer_type == "option_critic":
         actor = FixedOptionManager(
             obs_dim, num_options, hidden_dim, num_layers, memory_size,
@@ -1963,7 +1955,7 @@ def main():
                 with torch.no_grad():
                     if policy_meta["trainer_type"] == "learned_option_critic":
                         (
-                            option_logits,
+                            option_values,
                             termination_logits,
                             action_means,
                             action_stds,
@@ -1975,10 +1967,10 @@ def main():
                             policy_memory[1].detach(),
                         )
                         if args.deterministic:
-                            proposed = option_logits.argmax(dim=-1)
+                            proposed = option_values.argmax(dim=-1)
                         else:
-                            proposed = torch.distributions.Categorical(
-                                logits=option_logits,
+                            proposed = policy_actor.option_dist(
+                                option_values,
                             ).sample()
 
                         force_new = policy_current_options < 0
@@ -2003,14 +1995,14 @@ def main():
                             action_stds,
                             policy_current_options,
                         )
-                        raw_actions = (
+                        normalized_actions = (
                             action_dist.mean
                             if args.deterministic
                             else action_dist.sample()
                         )
-                        wheel_actions = (
-                            raw_actions.clamp(-3.0, 3.0) / 3.0
-                        ).view(1, N, 2).cpu()
+                        wheel_actions = normalized_actions.view(
+                            1, N, 2,
+                        ).cpu()
                         policy_left_cmd = (
                             wheel_actions[:, :, 0] * env.max_speed
                         )

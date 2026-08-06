@@ -24,11 +24,15 @@ from tqdm import tqdm
 import torch
 import torch.nn.functional as functional
 import torch.optim as optim
-from torch.distributions import Bernoulli, Categorical
+from torch.distributions import Bernoulli
 from torch.utils.tensorboard import SummaryWriter
 
 from .learned_option_critic_buffer import LearnedOptionRolloutBuffer
-from .learned_option_critic_networks import LearnedOptionActor
+from .learned_option_critic_networks import (
+    LEARNED_OPTION_CRITIC_VERSION,
+    LearnedOptionActor,
+    termination_objective,
+)
 from .network_config import PAPER_PARITY_VERSION
 from .poca_networks import POCACritic
 from .poca_trainer import (
@@ -49,18 +53,19 @@ class LearnedOptionCriticConfig:
     num_epochs: int = 3
     mini_batch_size: int = 2048
     clip_eps: float = 0.2
-    beta: float = 0.005
+    beta: float = 0.001
 
     # Objective weights.
     intra_option_coef: float = 1.0
     selector_coef: float = 1.0
+    local_option_value_coef: float = 0.5
     option_entropy_coef: float = 0.005
     value_coef: float = 0.5
     action_baseline_coef: float = 0.25
     option_value_coef: float = 0.5
     option_baseline_coef: float = 0.25
-    termination_coef: float = 0.1
-    termination_entropy_coef: float = 0.001
+    termination_coef: float = 1.0
+    termination_entropy_coef: float = 0.0
     termination_penalty: float = 0.01
     attention_diversity_coef: float = 0.01
     attention_temporal_coef: float = 0.01
@@ -75,6 +80,7 @@ class LearnedOptionCriticConfig:
     lr_schedule: str = "constant"
     eps_schedule: str = "constant"
     beta_schedule: str = "constant"
+    max_grad_norm: float = 10.0
 
     # Run control.
     total_timesteps: int = 120_000_000
@@ -98,6 +104,14 @@ class LearnedOptionCriticConfig:
     memory_size: int = 128
     sequence_length: int = 128
     num_options: int = 6
+    option_hidden_dim: int = 512
+    option_num_layers: int = 2
+    option_memory_size: int = 64
+    initial_termination_probability: float = 0.05
+    initial_log_std: float = -0.7
+    min_log_std: float = -2.5
+    max_log_std: float = 0.0
+    option_value_temperature: float = 1.0
 
     # Logging.
     log_dir: str = "runs/learned_option_critic"
@@ -107,7 +121,7 @@ class LearnedOptionCriticConfig:
 class LearnedOptionCriticTrainer:
     """Train learned continuous options with collective counterfactual credit."""
 
-    CHECKPOINT_VERSION = 1
+    CHECKPOINT_VERSION = LEARNED_OPTION_CRITIC_VERSION
 
     def __init__(
         self,
@@ -175,8 +189,8 @@ class LearnedOptionCriticTrainer:
             f"decision_period={self.decision_period}"
         )
         print(
-            "[LearnedOC] Learning recurrent policy-over-options, "
-            "terminations, attentions, and continuous intra-option policies"
+            "[LearnedOC] Faithful attention paths: selector, termination, and "
+            "continuous intra-option policy all consume attended sensors"
         )
         print(
             "[LearnedOC] Counterfactual action credit conditions on active "
@@ -194,6 +208,14 @@ class LearnedOptionCriticTrainer:
             cfg.hidden_dim,
             cfg.num_layers,
             cfg.memory_size,
+            cfg.option_hidden_dim,
+            cfg.option_num_layers,
+            cfg.option_memory_size,
+            cfg.initial_termination_probability,
+            cfg.initial_log_std,
+            cfg.min_log_std,
+            cfg.max_log_std,
+            cfg.option_value_temperature,
         ).to(self.device)
 
         # V(s): state-only team value used for lambda returns.
@@ -230,14 +252,14 @@ class LearnedOptionCriticTrainer:
             memory_size=cfg.memory_size,
         ).to(self.device)
 
-        parameters = (
+        self.trainable_parameters = (
             list(self.actor.parameters())
             + list(self.team_critic.parameters())
             + list(self.action_critic.parameters())
             + list(self.option_critic.parameters())
         )
         self.optimizer = optim.Adam(
-            parameters,
+            self.trainable_parameters,
             lr=cfg.lr,
             eps=cfg.adam_eps,
         )
@@ -336,6 +358,11 @@ class LearnedOptionCriticTrainer:
             f"{sum(p.numel() for p in self.actor.parameters()):,}"
         )
         print(
+            f"[LearnedOC] Manager={cfg.hidden_dim}x{cfg.num_layers}, "
+            f"motor={cfg.option_hidden_dim}x{cfg.option_num_layers}, "
+            f"packed_memory={self.actor.hidden_size}"
+        )
+        print(
             "[LearnedOC] Critic params: "
             f"team={sum(p.numel() for p in self.team_critic.parameters()):,}  "
             f"action={sum(p.numel() for p in self.action_critic.parameters()):,}  "
@@ -399,7 +426,7 @@ class LearnedOptionCriticTrainer:
                 -1,
             ).clone()
             (
-                option_logits,
+                option_values,
                 termination_logits,
                 action_means,
                 action_stds,
@@ -412,7 +439,7 @@ class LearnedOptionCriticTrainer:
             self.actor_memory_h = next_actor_memory[0].detach()
             self.actor_memory_c = next_actor_memory[1].detach()
 
-            option_dist = Categorical(logits=option_logits)
+            option_dist = self.actor.option_dist(option_values)
             proposed = option_dist.sample().view(
                 self.num_envs,
                 self.num_agents,
@@ -448,18 +475,22 @@ class LearnedOptionCriticTrainer:
             )
 
             flat_options = self.current_options.reshape(-1)
+            local_option_values = option_values.gather(
+                -1,
+                flat_options.unsqueeze(-1),
+            ).squeeze(-1).view(self.num_envs, self.num_agents)
             action_dist = self.actor.selected_action_dist(
                 action_means,
                 action_stds,
                 flat_options,
             )
-            raw_actions = action_dist.sample().view(
+            actions = action_dist.sample().view(
                 self.num_envs,
                 self.num_agents,
                 self.act_dim,
             )
             action_log_probs = action_dist.log_prob(
-                raw_actions.reshape(-1, self.act_dim),
+                actions.reshape(-1, self.act_dim),
             ).view(self.num_envs, self.num_agents, self.act_dim)
 
             critic_state = self.unwrapped.get_critic_state()
@@ -508,7 +539,7 @@ class LearnedOptionCriticTrainer:
                 next_action_baseline_memory,
             ) = self.action_critic.all_baselines(
                 option_states,
-                raw_actions,
+                actions,
                 (
                     self.action_baseline_memory_h,
                     self.action_baseline_memory_c,
@@ -561,9 +592,8 @@ class LearnedOptionCriticTrainer:
                 next_option_baseline_memory[1].detach()
             )
 
-            env_actions = raw_actions.clamp(-3.0, 3.0) / 3.0
             action_dict = {
-                agent: env_actions[:, agent_id]
+                agent: actions[:, agent_id]
                 for agent_id, agent in enumerate(agents)
             }
             accumulated_reward = torch.zeros(
@@ -625,9 +655,12 @@ class LearnedOptionCriticTrainer:
                 next_critic_states=next_critic_state,
                 options=self.current_options,
                 option_log_probs=option_log_probs,
+                local_option_values=local_option_values,
                 option_masks=option_mask.float(),
                 beta_probs=beta_probs,
-                actions=raw_actions,
+                termination_options=prior_options,
+                termination_valid=(~force_new).float(),
+                actions=actions,
                 action_log_probs=action_log_probs,
                 reward=accumulated_reward * self.reward_strength,
                 done=last_done,
@@ -761,7 +794,7 @@ class LearnedOptionCriticTrainer:
         num_agents = states.shape[2]
 
         (
-            option_logits,
+            option_values,
             _termination_logits,
             action_means,
             action_stds,
@@ -775,26 +808,19 @@ class LearnedOptionCriticTrainer:
             ),
         )
 
-        flat_option_dist = Categorical(
-            logits=option_logits.reshape(
-                batch_size * sequence_length,
-                self.cfg.num_options,
-            )
-        )
-        new_option_logp = flat_option_dist.log_prob(
-            options.reshape(-1),
-        ).view(batch_size, sequence_length)
-        option_entropy_values = flat_option_dist.entropy().view(
-            batch_size,
-            sequence_length,
-        )
-        option_entropy = (
-            option_entropy_values * loss_mask
-        ).sum() / loss_mask.sum().clamp_min(1)
+        option_dist = self.actor.option_dist(option_values)
+        new_option_logp = option_dist.log_prob(options)
+        option_entropy_values = option_dist.entropy()
+        boundary_steps = (batch["option_masks"] > 0.5) & loss_mask
+        boundary_count = boundary_steps.sum()
+        if boundary_count.item() > 0:
+            option_entropy = (
+                option_entropy_values * boundary_steps
+            ).sum() / boundary_count
+        else:
+            option_entropy = option_entropy_values.sum() * 0.0
 
-        boundary_mask = (
-            (batch["option_masks"] > 0.5) & loss_mask
-        ).reshape(-1)
+        boundary_mask = boundary_steps.reshape(-1)
         flat_new_option_logp = new_option_logp.reshape(-1)
         flat_old_option_logp = batch["old_option_log_probs"].reshape(-1)
         flat_option_advantage = batch["option_advantages"].reshape(
@@ -842,7 +868,7 @@ class LearnedOptionCriticTrainer:
             self.obs_dim,
         )
         (
-            next_option_logits,
+            next_option_values,
             next_termination_logits,
             _next_action_means,
             _next_action_stds,
@@ -893,6 +919,16 @@ class LearnedOptionCriticTrainer:
         ).reshape(-1)
         flat_returns = batch["returns"].reshape(-1)
         flat_loss_mask = loss_mask.reshape(-1)
+        selected_local_option_values = option_values.gather(
+            -1,
+            options.unsqueeze(-1),
+        ).squeeze(-1).reshape(-1)
+        local_option_value_mean = (
+            selected_local_option_values * flat_loss_mask
+        ).sum() / flat_loss_mask.sum().clamp_min(1.0)
+        option_value_spread = (
+            option_values.std(dim=-1, unbiased=False) * loss_mask
+        ).sum() / loss_mask.sum().clamp_min(1)
 
         new_team_values = self.team_critic.critic_pass(
             flat_states,
@@ -935,6 +971,13 @@ class LearnedOptionCriticTrainer:
         value_loss = trust_region_value_loss(
             new_team_values,
             batch["old_team_values"].reshape(-1),
+            flat_returns,
+            current_eps,
+            flat_loss_mask,
+        )
+        local_option_value_loss = trust_region_value_loss(
+            selected_local_option_values,
+            batch["old_local_option_values"].reshape(-1),
             flat_returns,
             current_eps,
             flat_loss_mask,
@@ -989,10 +1032,9 @@ class LearnedOptionCriticTrainer:
                     memory=next_joint_memory,
                 )
             )
-            next_selector_probs = torch.softmax(
-                next_option_logits,
-                dim=-1,
-            )
+            next_selector_probs = self.actor.option_dist(
+                next_option_values,
+            ).probs
             next_reselection = (
                 next_alternatives * next_selector_probs
             ).sum(dim=-1)
@@ -1003,12 +1045,12 @@ class LearnedOptionCriticTrainer:
         termination_mask = (1.0 - dones) * loss_mask
         termination_count = termination_mask.sum()
         if termination_count.item() > 0:
-            termination_signal = (
-                termination_advantage + self.cfg.termination_penalty
+            termination_loss = termination_objective(
+                next_beta,
+                termination_advantage,
+                self.cfg.termination_penalty,
+                termination_mask,
             )
-            termination_loss = (
-                next_beta * termination_signal * termination_mask
-            ).sum() / termination_count
             termination_entropy_values = Bernoulli(
                 logits=next_beta_logits,
             ).entropy()
@@ -1036,6 +1078,9 @@ class LearnedOptionCriticTrainer:
         return {
             "intra_option_loss": intra_option_loss,
             "selector_loss": selector_loss,
+            "local_option_value_loss": local_option_value_loss,
+            "local_option_value_mean": local_option_value_mean,
+            "option_value_spread": option_value_spread,
             "value_loss": value_loss,
             "action_baseline_loss": action_baseline_loss,
             "joint_option_value_loss": joint_option_value_loss,
@@ -1074,6 +1119,9 @@ class LearnedOptionCriticTrainer:
         metric_names = (
             "intra_option_loss",
             "selector_loss",
+            "local_option_value_loss",
+            "local_option_value_mean",
+            "option_value_spread",
             "value_loss",
             "action_baseline_loss",
             "joint_option_value_loss",
@@ -1090,6 +1138,7 @@ class LearnedOptionCriticTrainer:
         )
         totals = {name: 0.0 for name in metric_names}
         num_updates = 0
+        gradient_norm_total = 0.0
         cfg = self.cfg
 
         for _epoch in range(cfg.num_epochs):
@@ -1104,6 +1153,8 @@ class LearnedOptionCriticTrainer:
                 total_loss = (
                     cfg.intra_option_coef * losses["intra_option_loss"]
                     + cfg.selector_coef * losses["selector_loss"]
+                    + cfg.local_option_value_coef
+                    * losses["local_option_value_loss"]
                     + cfg.value_coef * losses["value_loss"]
                     + cfg.action_baseline_coef
                     * losses["action_baseline_loss"]
@@ -1122,12 +1173,17 @@ class LearnedOptionCriticTrainer:
                     * losses["termination_entropy"]
                 )
 
-                self.optimizer.zero_grad()
+                self.optimizer.zero_grad(set_to_none=True)
                 total_loss.backward()
+                gradient_norm = torch.nn.utils.clip_grad_norm_(
+                    self.trainable_parameters,
+                    cfg.max_grad_norm,
+                )
                 self.optimizer.step()
 
                 for name in metric_names:
                     totals[name] += losses[name].item()
+                gradient_norm_total += float(gradient_norm)
                 num_updates += 1
 
         self.update_count += 1
@@ -1140,13 +1196,45 @@ class LearnedOptionCriticTrainer:
             self.buffer.options[:active].reshape(-1),
             minlength=cfg.num_options,
         ).float()
+        switch_rate = self.buffer.option_masks[:active].mean().item()
+        active_actions = self.buffer.actions[:active]
+        option_stds = self.actor.option_log_stds().detach().exp().mean(dim=-1)
+        termination_options = self.buffer.termination_options[:active]
+        termination_valid = self.buffer.termination_valid[:active] > 0.5
+        per_option_beta = []
+        per_option_switch = []
+        per_option_termination_count = []
+        for option_id in range(cfg.num_options):
+            option_mask = termination_valid & (
+                termination_options == option_id
+            )
+            count = int(option_mask.sum().item())
+            per_option_termination_count.append(count)
+            if count > 0:
+                per_option_beta.append(
+                    self.buffer.beta_probs[:active][option_mask].mean().item()
+                )
+                per_option_switch.append(
+                    self.buffer.option_masks[:active][option_mask].mean().item()
+                )
+            else:
+                per_option_beta.append(0.0)
+                per_option_switch.append(0.0)
         metrics.update({
             "lr": self.current_lr,
             "eps": self.current_eps,
             "beta": self.current_beta,
-            "switch_rate": (
-                self.buffer.option_masks[:active].mean().item()
-            ),
+            "gradient_norm": gradient_norm_total / divisor,
+            "switch_rate": switch_rate,
+            "mean_option_duration": 1.0 / max(switch_rate, 1e-8),
+            "mean_abs_action": active_actions.abs().mean().item(),
+            "action_saturation": (
+                active_actions.abs() > 0.95
+            ).float().mean().item(),
+            "option_stds": option_stds.tolist(),
+            "option_betas": per_option_beta,
+            "option_switch_rates": per_option_switch,
+            "option_termination_counts": per_option_termination_count,
             "option_usage": (
                 option_counts
                 / option_counts.sum().clamp_min(1.0)
@@ -1287,6 +1375,9 @@ class LearnedOptionCriticTrainer:
         scalar_names = {
             "Losses/Intra-Option Policy Loss": "intra_option_loss",
             "Losses/Option Selector Loss": "selector_loss",
+            "Losses/Local Attended Option Value": (
+                "local_option_value_loss"
+            ),
             "Losses/Value Loss": "value_loss",
             "Losses/Counterfactual Action Baseline Loss": (
                 "action_baseline_loss"
@@ -1300,18 +1391,24 @@ class LearnedOptionCriticTrainer:
             "Losses/Termination Loss": "termination_loss",
             "Losses/Attention Diversity": "attention_diversity_loss",
             "Losses/Attention Temporal": "attention_temporal_loss",
-            "Policy/Intra-Option Entropy": "action_entropy",
-            "Policy/Option Entropy": "option_entropy",
+            "Policy/Pre-Squash Intra-Option Entropy": "action_entropy",
+            "Policy/Option Entropy At Boundaries": "option_entropy",
             "Policy/Termination Entropy": "termination_entropy",
             "Policy/Mean Attention": "mean_attention",
+            "Policy/Local Option Value Mean": "local_option_value_mean",
+            "Policy/Local Option Value Spread": "option_value_spread",
             "Policy/Mean Termination Probability": "mean_beta",
             "Policy/Mean Termination Advantage": (
                 "mean_termination_advantage"
             ),
             "Policy/Switch Rate": "switch_rate",
+            "Policy/Mean Option Duration Decisions": "mean_option_duration",
+            "Policy/Mean Absolute Wheel Action": "mean_abs_action",
+            "Policy/Wheel Action Saturation": "action_saturation",
             "Policy/Learning Rate": "lr",
             "Policy/Epsilon": "eps",
             "Policy/Beta": "beta",
+            "Diagnostics/Gradient Norm Before Clip": "gradient_norm",
         }
         for tag, metric_name in scalar_names.items():
             self.writer.add_scalar(tag, metrics[metric_name], step)
@@ -1319,6 +1416,27 @@ class LearnedOptionCriticTrainer:
             self.writer.add_scalar(
                 f"Policy/Option Usage/{option_id}",
                 usage,
+                step,
+            )
+        for option_id, std in enumerate(metrics["option_stds"]):
+            self.writer.add_scalar(
+                f"Policy/Intra-Option Std/{option_id}",
+                std,
+                step,
+            )
+        for option_id, count in enumerate(
+            metrics["option_termination_counts"]
+        ):
+            if count <= 0:
+                continue
+            self.writer.add_scalar(
+                f"Policy/Termination Probability/{option_id}",
+                metrics["option_betas"][option_id],
+                step,
+            )
+            self.writer.add_scalar(
+                f"Policy/Option Switch Rate/{option_id}",
+                metrics["option_switch_rates"][option_id],
                 step,
             )
 
@@ -1381,7 +1499,15 @@ class LearnedOptionCriticTrainer:
             "learned_options": True,
             "collective_counterfactual": True,
             "attention_options": True,
+            "attention_conditioned_outputs": [
+                "local_option_value",
+                "intra_option_policy",
+                "termination",
+            ],
+            "option_selection": "boltzmann_local_option_value",
             "primitive_action_space": "continuous_wheels",
+            "action_distribution": "tanh_squashed_normal",
+            "action_transform": "identity_normalized",
             "variant": self.variant,
             "actor": self.actor.state_dict(),
             "team_critic": self.team_critic.state_dict(),
@@ -1396,8 +1522,20 @@ class LearnedOptionCriticTrainer:
             "recurrent": True,
             "memory_size": self.cfg.memory_size,
             "memory_size_semantics": "mlagents_total",
-            "lstm_hidden_size": self.actor.hidden_size,
+            "lstm_hidden_size": self.actor.manager_hidden_size,
+            "actor_packed_memory_size": self.actor.hidden_size,
             "sequence_length": self.cfg.sequence_length,
+            "option_hidden_dim": self.cfg.option_hidden_dim,
+            "option_num_layers": self.cfg.option_num_layers,
+            "option_memory_size": self.cfg.option_memory_size,
+            "option_recurrent_size": self.actor.option_recurrent_size,
+            "initial_termination_probability": (
+                self.cfg.initial_termination_probability
+            ),
+            "initial_log_std": self.cfg.initial_log_std,
+            "min_log_std": self.cfg.min_log_std,
+            "max_log_std": self.cfg.max_log_std,
+            "option_value_temperature": self.cfg.option_value_temperature,
             "critic_hidden_dim": self.cfg.critic_hidden_dim,
             "critic_num_layers": self.cfg.critic_num_layers,
             "critic_num_heads": self.cfg.critic_num_heads,
@@ -1423,7 +1561,9 @@ class LearnedOptionCriticTrainer:
         if version != self.CHECKPOINT_VERSION:
             raise RuntimeError(
                 f"Checkpoint uses learned Option-Critic version {version}; "
-                f"this trainer expects version {self.CHECKPOINT_VERSION}."
+                f"this trainer expects version {self.CHECKPOINT_VERSION}. "
+                "OC2 v2 changed every option output to the faithful attended "
+                "path and requires fresh training."
             )
         self.actor.load_state_dict(checkpoint["actor"])
         self.team_critic.load_state_dict(checkpoint["team_critic"])

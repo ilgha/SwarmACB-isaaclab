@@ -1,31 +1,104 @@
 # Copyright (c) 2025 SwarmACB Project
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Local actor networks for learned-option collective Option-Critic.
+"""Decentralized actor for collective Attention Option-Critic.
 
-Phase 2 retains Cyclamen's compact local observation and recurrent memory, but
-learns the intra-option motor policies instead of treating the six ACB modules
-as fixed options. Centralized critics are defined in ``poca_networks.py`` and
-are used only during training.
+Each learned option receives its own attended sensor stream. The policy over
+options, intra-option wheel policy, and termination function are all computed
+from that attended representation. The full observation can influence the
+attention masks, but there is no unmasked shortcut to any option output.
 """
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
-from torch.distributions import Normal
+import torch.nn.functional as functional
+from torch.distributions import Categorical, Normal
 
 from .poca_networks import LinearEncoder, _linear_layer, _mlagents_lstm
 
 
-class LearnedOptionActor(nn.Module):
-    """Shared recurrent policy-over-options, terminations, and motor options.
+LEARNED_OPTION_CRITIC_VERSION = 2
 
-    The recurrent manager receives Cyclamen's four inputs. Each motor option
-    applies a state-dependent attention mask to the full local sensor vector,
-    then combines the attended encoding with the recurrent manager state. This
-    follows feature-level Attention Option-Critic while keeping execution local
-    to each robot.
+
+def termination_objective(
+    termination_probability: torch.Tensor,
+    option_advantage: torch.Tensor,
+    deliberation_cost: float,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """Option-Critic termination-gradient objective.
+
+    Minimizing ``beta * (Q_omega - V_omega + xi)`` decreases termination when
+    the current option is better than reselection and increases it when the
+    current option is sufficiently worse. ``xi`` is the deliberation cost.
+    """
+    active = mask.to(dtype=termination_probability.dtype)
+    count = active.sum()
+    if count.item() <= 0:
+        return termination_probability.sum() * 0.0
+    signal = option_advantage + float(deliberation_cost)
+    return (termination_probability * signal * active).sum() / count
+
+
+class SquashedNormal:
+    """Diagonal Normal followed by ``tanh``, with corrected log probability.
+
+    The environment consumes actions in ``[-1, 1]``. Using a squashed policy
+    keeps sampled and evaluated actions identical, unlike clipping an
+    unbounded Gaussian after its log probability has already been computed.
+    ``entropy()`` returns the base-Normal entropy, which is the stable quantity
+    used as the exploration regularizer.
+    """
+
+    _EPS = 1e-6
+
+    def __init__(self, loc: torch.Tensor, scale: torch.Tensor):
+        self.loc = loc
+        self.scale = scale
+        self.base_dist = Normal(loc, scale)
+
+    @property
+    def mean(self) -> torch.Tensor:
+        return torch.tanh(self.loc)
+
+    @property
+    def stddev(self) -> torch.Tensor:
+        return self.scale
+
+    def sample(self, sample_shape: torch.Size = torch.Size()) -> torch.Tensor:
+        return torch.tanh(self.base_dist.sample(sample_shape))
+
+    def rsample(self, sample_shape: torch.Size = torch.Size()) -> torch.Tensor:
+        return torch.tanh(self.base_dist.rsample(sample_shape))
+
+    def log_prob(self, value: torch.Tensor) -> torch.Tensor:
+        bounded = value.clamp(-1.0 + self._EPS, 1.0 - self._EPS)
+        pre_tanh = 0.5 * (
+            torch.log1p(bounded) - torch.log1p(-bounded)
+        )
+        log_det_jacobian = 2.0 * (
+            math.log(2.0)
+            - pre_tanh
+            - functional.softplus(-2.0 * pre_tanh)
+        )
+        return self.base_dist.log_prob(pre_tanh) - log_det_jacobian
+
+    def entropy(self) -> torch.Tensor:
+        return self.base_dist.entropy()
+
+
+class LearnedOptionActor(nn.Module):
+    """Shared recurrent Attention Option-Critic policy for every robot.
+
+    A compact Cyclamen manager memory helps generate state-dependent attention
+    masks. Each option then processes only ``h_omega(x) * x`` through a shared
+    sensor encoder and recurrent cell with option-specific memory. Separate
+    heads implement the local option value, intra-option policy, and termination
+    function for every option.
     """
 
     def __init__(
@@ -36,74 +109,181 @@ class LearnedOptionActor(nn.Module):
         hidden: int = 128,
         num_layers: int = 1,
         memory_size: int = 128,
+        option_hidden: int = 512,
+        option_num_layers: int = 2,
+        option_memory_size: int = 64,
+        initial_termination_probability: float = 0.05,
+        initial_log_std: float = -0.7,
+        min_log_std: float = -2.5,
+        max_log_std: float = 0.0,
+        option_value_temperature: float = 1.0,
     ):
         super().__init__()
         self.obs_dim = int(obs_dim)
         self.act_dim = int(act_dim)
         self.num_options = int(num_options)
         self.memory_size = int(memory_size)
+        self.option_memory_size = int(option_memory_size)
+        self.option_hidden = int(option_hidden)
+        self.option_num_layers = int(option_num_layers)
+        self.min_log_std = float(min_log_std)
+        self.max_log_std = float(max_log_std)
+        self.option_value_temperature = float(option_value_temperature)
         self.manager_obs_dim = 4 if self.obs_dim == 24 else self.obs_dim
+
         if self.obs_dim not in (4, 24):
             raise ValueError(
                 "LearnedOptionActor expects either the 4D Cyclamen input or "
                 f"the full 24D local sensor input, got {self.obs_dim}."
             )
+        if self.num_options <= 0:
+            raise ValueError("num_options must be positive")
+        if not 0.0 < initial_termination_probability < 1.0:
+            raise ValueError(
+                "initial_termination_probability must be strictly between 0 and 1"
+            )
+        if not self.min_log_std < self.max_log_std:
+            raise ValueError("min_log_std must be smaller than max_log_std")
+        if not self.min_log_std <= initial_log_std <= self.max_log_std:
+            raise ValueError(
+                "initial_log_std must lie inside [min_log_std, max_log_std]"
+            )
+        if self.option_value_temperature <= 0.0:
+            raise ValueError("option_value_temperature must be positive")
 
-        self.encoder = LinearEncoder(
+        self.manager_encoder = LinearEncoder(
             self.manager_obs_dim,
             num_layers,
             hidden,
             kernel_init="kaiming_normal",
         )
-        self.lstm, self.hidden_size = _mlagents_lstm(hidden, memory_size)
+        self.manager_lstm, self.manager_hidden_size = _mlagents_lstm(
+            hidden,
+            memory_size,
+        )
         self.attention_encoder = LinearEncoder(
             self.obs_dim,
             num_layers,
-            self.hidden_size,
+            self.manager_hidden_size,
             kernel_init="kaiming_normal",
-        )
-        self.option_encoder = LinearEncoder(
-            self.obs_dim,
-            num_layers,
-            self.hidden_size,
-            kernel_init="kaiming_normal",
-        )
-
-        self.option_head = _linear_layer(
-            self.hidden_size,
-            self.num_options,
-            kernel_init="kaiming_normal",
-            kernel_gain=0.1,
         )
         self.attention_head = _linear_layer(
-            self.hidden_size,
+            self.manager_hidden_size,
             self.num_options * self.obs_dim,
             kernel_init="kaiming_normal",
             kernel_gain=0.1,
         )
+
+        self.option_sensor_encoder = LinearEncoder(
+            self.obs_dim,
+            self.option_num_layers,
+            self.option_hidden,
+            kernel_init="kaiming_normal",
+        )
+        self.option_lstm, self.option_recurrent_size = _mlagents_lstm(
+            self.option_hidden,
+            self.option_memory_size,
+        )
+        self.option_output_encoder = LinearEncoder(
+            self.option_hidden + self.option_recurrent_size,
+            self.option_num_layers,
+            self.option_hidden,
+            kernel_init="kaiming_normal",
+        )
+
+        self.option_value_heads = nn.ModuleList([
+            _linear_layer(
+                self.option_hidden,
+                1,
+                kernel_init="kaiming_normal",
+                kernel_gain=0.1,
+            )
+            for _ in range(self.num_options)
+        ])
         self.action_heads = nn.ModuleList([
             _linear_layer(
-                self.hidden_size,
+                self.option_hidden,
                 self.act_dim,
                 kernel_init="kaiming_normal",
-                kernel_gain=0.2,
+                kernel_gain=0.1,
             )
             for _ in range(self.num_options)
         ])
         self.termination_heads = nn.ModuleList([
             _linear_layer(
-                self.hidden_size,
+                self.option_hidden,
                 1,
                 kernel_init="kaiming_normal",
-                kernel_gain=0.2,
+                kernel_gain=0.1,
             )
             for _ in range(self.num_options)
         ])
+        termination_bias = math.log(
+            initial_termination_probability
+            / (1.0 - initial_termination_probability)
+        )
         for head in self.termination_heads:
-            nn.init.constant_(head.bias, -1.0)
+            nn.init.constant_(head.bias, termination_bias)
 
-        # ML-Agents-style state-independent Gaussian scale, now per option.
-        self.log_std = nn.Parameter(torch.zeros(self.num_options, self.act_dim))
+        std_fraction = (
+            (float(initial_log_std) - self.min_log_std)
+            / (self.max_log_std - self.min_log_std)
+        )
+        std_fraction = min(max(std_fraction, 1e-6), 1.0 - 1e-6)
+        initial_std_logit = math.log(std_fraction / (1.0 - std_fraction))
+        self.log_std_logits = nn.Parameter(torch.full(
+            (self.num_options, self.act_dim),
+            initial_std_logit,
+        ))
+
+        # Packed public memory: one manager state plus one state per option.
+        self.hidden_size = (
+            self.manager_hidden_size
+            + self.num_options * self.option_recurrent_size
+        )
+
+    def option_log_stds(self) -> torch.Tensor:
+        fraction = torch.sigmoid(self.log_std_logits)
+        return self.min_log_std + (
+            self.max_log_std - self.min_log_std
+        ) * fraction
+
+    @classmethod
+    def from_checkpoint(
+        cls,
+        checkpoint: dict,
+        device: torch.device | str,
+    ) -> "LearnedOptionActor":
+        version = int(checkpoint.get("learned_option_critic_version", 0))
+        if version != LEARNED_OPTION_CRITIC_VERSION:
+            raise RuntimeError(
+                f"Checkpoint uses learned Option-Critic version {version}; "
+                f"the current actor expects version "
+                f"{LEARNED_OPTION_CRITIC_VERSION}. OC2 v2 requires fresh "
+                "training because its attention and action semantics changed."
+            )
+        actor = cls(
+            obs_dim=int(checkpoint["obs_dim"]),
+            act_dim=int(checkpoint.get("act_dim", 2)),
+            num_options=int(checkpoint["num_options"]),
+            hidden=int(checkpoint["hidden_dim"]),
+            num_layers=int(checkpoint["num_layers"]),
+            memory_size=int(checkpoint["memory_size"]),
+            option_hidden=int(checkpoint["option_hidden_dim"]),
+            option_num_layers=int(checkpoint["option_num_layers"]),
+            option_memory_size=int(checkpoint["option_memory_size"]),
+            initial_termination_probability=float(
+                checkpoint["initial_termination_probability"]
+            ),
+            initial_log_std=float(checkpoint["initial_log_std"]),
+            min_log_std=float(checkpoint["min_log_std"]),
+            max_log_std=float(checkpoint["max_log_std"]),
+            option_value_temperature=float(
+                checkpoint["option_value_temperature"]
+            ),
+        ).to(device)
+        actor.load_state_dict(checkpoint["actor"])
+        return actor
 
     def initial_state(
         self,
@@ -114,58 +294,48 @@ class LearnedOptionActor(nn.Module):
         c = torch.zeros(1, batch_size, self.hidden_size, device=device)
         return h, c
 
-    def _option_outputs(
+    def _unpack_state(
         self,
-        features: torch.Tensor,
-        observations: torch.Tensor,
+        state: tuple[torch.Tensor, torch.Tensor],
+        batch_size: int,
     ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
+        tuple[torch.Tensor, torch.Tensor],
+        tuple[torch.Tensor, torch.Tensor],
     ]:
-        leading_shape = features.shape[:-1]
-        sensor_context = self.attention_encoder(
-            observations.reshape(-1, self.obs_dim)
-        ).view(*leading_shape, self.hidden_size)
-        attentions = torch.sigmoid(
-            self.attention_head(features + sensor_context).view(
-                *leading_shape,
-                self.num_options,
-                self.obs_dim,
+        h, c = state
+        expected = (1, batch_size, self.hidden_size)
+        if tuple(h.shape) != expected or tuple(c.shape) != expected:
+            raise ValueError(
+                f"Expected packed recurrent state {expected}, got "
+                f"h={tuple(h.shape)} c={tuple(c.shape)}"
             )
+        manager_state = (
+            h[..., :self.manager_hidden_size].contiguous(),
+            c[..., :self.manager_hidden_size].contiguous(),
         )
-        attended_obs = observations.unsqueeze(-2) * attentions
-        attended = self.option_encoder(
-            attended_obs.reshape(-1, self.obs_dim)
-        ).view(
-            *leading_shape,
-            self.num_options,
-            -1,
+        option_h = h[..., self.manager_hidden_size:].reshape(
+            1,
+            batch_size * self.num_options,
+            self.option_recurrent_size,
         )
-        attended = attended + features.unsqueeze(-2)
+        option_c = c[..., self.manager_hidden_size:].reshape_as(option_h)
+        return manager_state, (option_h.contiguous(), option_c.contiguous())
 
-        action_means = torch.stack([
-            head(attended[..., option_id, :])
-            for option_id, head in enumerate(self.action_heads)
-        ], dim=-2)
-        termination_logits = torch.cat([
-            head(attended[..., option_id, :])
-            for option_id, head in enumerate(self.termination_heads)
-        ], dim=-1)
-        action_stds = self.log_std.exp().view(
-            *((1,) * len(leading_shape)),
-            self.num_options,
-            self.act_dim,
-        ).expand_as(action_means)
-        option_logits = self.option_head(features)
+    def _pack_state(
+        self,
+        manager_state: tuple[torch.Tensor, torch.Tensor],
+        option_state: tuple[torch.Tensor, torch.Tensor],
+        batch_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        option_h = option_state[0].reshape(
+            1,
+            batch_size,
+            self.num_options * self.option_recurrent_size,
+        )
+        option_c = option_state[1].reshape_as(option_h)
         return (
-            option_logits,
-            termination_logits,
-            action_means,
-            action_stds,
-            attentions,
+            torch.cat([manager_state[0], option_h], dim=-1),
+            torch.cat([manager_state[1], option_c], dim=-1),
         )
 
     def forward_sequence(
@@ -180,32 +350,105 @@ class LearnedOptionActor(nn.Module):
         torch.Tensor,
         tuple[torch.Tensor, torch.Tensor],
     ]:
-        """Evaluate a recurrent observation sequence.
-
-        Args:
-            obs_seq: ``(batch, time, obs_dim)``.
-
-        Returns:
-            Option logits, termination logits, action means, action standard
-            deviations, attention masks, and the next recurrent state.
-        """
+        """Evaluate ``(batch, time, obs_dim)`` recurrent observations."""
+        if obs_seq.ndim != 3 or obs_seq.shape[-1] != self.obs_dim:
+            raise ValueError(
+                f"Expected observations (batch, time, {self.obs_dim}), "
+                f"got {tuple(obs_seq.shape)}"
+            )
         batch_size, sequence_length = obs_seq.shape[:2]
+        if state is None:
+            state = self.initial_state(batch_size, obs_seq.device)
+        manager_state, option_state = self._unpack_state(state, batch_size)
+
         manager_obs = (
             obs_seq[..., 16:20]
             if self.obs_dim == 24
             else obs_seq
         )
-        encoded = self.encoder(
-            manager_obs.reshape(
-                batch_size * sequence_length,
-                self.manager_obs_dim,
-            )
+        manager_encoded = self.manager_encoder(
+            manager_obs.reshape(-1, self.manager_obs_dim)
         ).view(batch_size, sequence_length, -1)
-        if state is None:
-            state = self.initial_state(batch_size, obs_seq.device)
-        features, next_state = self.lstm(encoded, state)
-        outputs = self._option_outputs(features, obs_seq)
-        return (*outputs, next_state)
+        manager_features, next_manager_state = self.manager_lstm(
+            manager_encoded,
+            manager_state,
+        )
+        sensor_context = self.attention_encoder(
+            obs_seq.reshape(-1, self.obs_dim)
+        ).view(batch_size, sequence_length, self.manager_hidden_size)
+        attentions = torch.sigmoid(
+            self.attention_head(manager_features + sensor_context).view(
+                batch_size,
+                sequence_length,
+                self.num_options,
+                self.obs_dim,
+            )
+        )
+
+        attended_obs = obs_seq.unsqueeze(-2) * attentions
+        option_sequences = attended_obs.permute(0, 2, 1, 3).reshape(
+            batch_size * self.num_options,
+            sequence_length,
+            self.obs_dim,
+        )
+        option_encoded = self.option_sensor_encoder(
+            option_sequences.reshape(-1, self.obs_dim)
+        ).view(
+            batch_size * self.num_options,
+            sequence_length,
+            self.option_hidden,
+        )
+        option_recurrent, next_option_state = self.option_lstm(
+            option_encoded,
+            option_state,
+        )
+        option_context = torch.cat(
+            [option_encoded, option_recurrent],
+            dim=-1,
+        )
+        option_features = self.option_output_encoder(
+            option_context.reshape(
+                -1,
+                self.option_hidden + self.option_recurrent_size,
+            )
+        ).view(
+            batch_size,
+            self.num_options,
+            sequence_length,
+            self.option_hidden,
+        ).permute(0, 2, 1, 3).contiguous()
+
+        option_values = torch.cat([
+            head(option_features[..., option_id, :])
+            for option_id, head in enumerate(self.option_value_heads)
+        ], dim=-1)
+        action_means = torch.stack([
+            head(option_features[..., option_id, :])
+            for option_id, head in enumerate(self.action_heads)
+        ], dim=-2)
+        termination_logits = torch.cat([
+            head(option_features[..., option_id, :])
+            for option_id, head in enumerate(self.termination_heads)
+        ], dim=-1)
+        action_stds = self.option_log_stds().exp().view(
+            1,
+            1,
+            self.num_options,
+            self.act_dim,
+        ).expand_as(action_means)
+        next_state = self._pack_state(
+            next_manager_state,
+            next_option_state,
+            batch_size,
+        )
+        return (
+            option_values,
+            termination_logits,
+            action_means,
+            action_stds,
+            attentions,
+            next_state,
+        )
 
     def step(
         self,
@@ -244,10 +487,16 @@ class LearnedOptionActor(nn.Module):
         action_means: torch.Tensor,
         action_stds: torch.Tensor,
         options: torch.Tensor,
-    ) -> Normal:
+    ) -> SquashedNormal:
         means = self._gather_options(action_means, options)
         stds = self._gather_options(action_stds, options)
-        return Normal(means, stds)
+        return SquashedNormal(means, stds)
+
+    def option_dist(self, option_values: torch.Tensor) -> Categorical:
+        """Boltzmann policy over learned attended option values."""
+        return Categorical(
+            logits=option_values / self.option_value_temperature,
+        )
 
     @staticmethod
     def selected_termination_logits(
