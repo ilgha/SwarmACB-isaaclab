@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import importlib.util
 from pathlib import Path
 import sys
@@ -201,11 +202,63 @@ def main() -> int:
         "an inferior option is not encouraged to terminate",
     )
 
+    # PPO must compare every recurrent minibatch with one immutable policy
+    # snapshot taken at the beginning of the update.
+    reference_actor = copy.deepcopy(actor).eval()
+    reference_actor.requires_grad_(False)
+    replay_obs = torch.randn(4, 17, 24)
+    replay_state = actor.initial_state(4, replay_obs.device)
+    replay_state = tuple(torch.randn_like(item) for item in replay_state)
+    replay_options = torch.randint(0, 6, (4, 17))
+    with torch.no_grad():
+        current_replay = actor.forward_sequence(replay_obs, replay_state)
+        reference_replay = reference_actor.forward_sequence(
+            replay_obs,
+            tuple(item.clone() for item in replay_state),
+        )
+        replay_actions = actor.selected_action_dist(
+            current_replay[2], current_replay[3], replay_options
+        ).sample()
+        current_action_log_probs = actor.selected_action_dist(
+            current_replay[2], current_replay[3], replay_options
+        ).log_prob(replay_actions)
+        reference_action_log_probs = reference_actor.selected_action_dist(
+            reference_replay[2], reference_replay[3], replay_options
+        ).log_prob(replay_actions)
+        current_option_log_probs = actor.option_dist(
+            current_replay[0]
+        ).log_prob(replay_options)
+        reference_option_log_probs = reference_actor.option_dist(
+            reference_replay[0]
+        ).log_prob(replay_options)
+    _require(
+        torch.allclose(current_action_log_probs, reference_action_log_probs),
+        "frozen reference changed recurrent action log probabilities",
+    )
+    _require(
+        torch.allclose(current_option_log_probs, reference_option_log_probs),
+        "frozen reference changed recurrent option log probabilities",
+    )
+    reference_before = {
+        name: parameter.detach().clone()
+        for name, parameter in reference_actor.named_parameters()
+    }
+    with torch.no_grad():
+        next(actor.parameters()).add_(0.01)
+    _require(
+        all(
+            torch.equal(parameter, reference_before[name])
+            for name, parameter in reference_actor.named_parameters()
+        ),
+        "frozen PPO reference shares mutable actor parameters",
+    )
+
     print("OC2 architecture validation passed:")
     print("  option value, action, and termination backpropagate through attention")
     print("  recurrent memory is separated by option and packed for rollout storage")
     print("  tanh-squashed actions and corrected log probabilities are finite")
     print("  termination gradient has the Option-Critic continuation/switch signs")
+    print("  frozen recurrent PPO reference is exact and immutable")
     return 0
 
 

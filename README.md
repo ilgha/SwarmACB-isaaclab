@@ -203,13 +203,26 @@ PPO and selector entropy are evaluated only at sampled option boundaries.
 Pairwise attention cosine similarity is minimized to discourage option
 collapse, and a temporal attention loss discourages rapidly changing focus.
 
+OC2 freezes an exact recurrent actor snapshot at the beginning of every PPO
+update. Action and selector ratios are evaluated against that snapshot for all
+epochs, so minibatches cannot silently compare against a changing policy.
+Actor and centralized-critic parameters use separate Adam optimizers: the actor
+uses `actor_learning_rate: 0.0001` and gradient norm `1.0`, while the critics
+retain `learning_rate: 0.0003` and gradient norm `10.0`. `target_kl: 0.03`
+stops only the remaining actor minibatches if either policy leaves the trust
+region; centralized critic updates continue. Bounded log ratios and strict
+finite-gradient checks turn numerical corruption into an explicit error.
+
 For Phase 2 validation, monitor `Policy/Option Usage/*`,
 `Policy/Intra-Option Std/*`, `Policy/Mean Termination Probability`,
 `Policy/Termination Probability/*`, `Policy/Switch Rate`,
 `Policy/Option Switch Rate/*`, `Policy/Mean Option Duration Decisions`,
 `Policy/Local Option Value Spread`, `Policy/Wheel Action Saturation`, and the
-two attention losses. Comparable task reward alone is not sufficient evidence
-that distinct temporal options formed.
+two attention losses. `Diagnostics/Initial Policy KL` must be approximately
+zero, `Diagnostics/Max Policy KL` should normally remain near the configured
+target, and `Diagnostics/Actor Update Fraction` reveals any trust-region early
+stop. Comparable task reward alone is not sufficient evidence that distinct
+temporal options formed.
 
 ## Sensor Suite
 
@@ -302,6 +315,10 @@ Submit ten independent Phase 2 designs per mission on the cluster with
 ```bash
 sbatch scripts/hpc/train_oc2_dirgate.slurm
 ```
+
+The corrected launchers write to `OC2_<mission>_cyclamen_schema3_hpc_<seed>`
+run and checkpoint directories so their fresh experiments cannot mix with
+legacy OC2 TensorBoard events or checkpoints.
 
 Or override the task and variant from the command line:
 
@@ -531,6 +548,7 @@ behaviors:
     trainer_type: learned_option_critic
     hyperparameters:
       learning_rate: 0.0003
+      actor_learning_rate: 0.0001
       beta: 0.001
       intra_option_coef: 1.0
       selector_coef: 1.0
@@ -549,6 +567,8 @@ behaviors:
       min_log_std: -2.5
       max_log_std: 0.0
       max_grad_norm: 10.0
+      actor_max_grad_norm: 1.0
+      target_kl: 0.03
       option_value_temperature: 1.0
     network_settings:
       hidden_units: 128
@@ -574,10 +594,14 @@ Dandelion, Daisy, and Lily use `512 x 2`. OC2 keeps the `128 x 1` Cyclamen
 manager, but uses `512 x 2` learned motor paths and centralized critics because
 the fixed low-level modules no longer provide that capacity.
 
-OC2 version-1 checkpoints are intentionally rejected by the trainer and both
-viewers. They contain the old attention bypass, unbounded/clipped action policy,
-and incompatible recurrent state layout. Start every corrected OC2 experiment
-from fresh weights.
+The actor payload remains OC2 architecture version 2, so corrected checkpoints
+can be loaded by both viewers. Training checkpoints now use schema version 3
+for the frozen PPO reference contract and separate actor/critic optimizers.
+Version-1 actor checkpoints are rejected because they contain the old attention
+bypass and incompatible recurrent state. Earlier version-2 training runs used
+one joint optimizer and cannot be resumed safely under schema 3. Start this
+corrected OC2 training from fresh weights; schema-3 checkpoints can then be
+resumed normally with the original mission config and `max_steps`.
 
 Before submitting the full HPC matrix, run the dependency-light parity audit:
 
@@ -590,7 +614,7 @@ The first command validates all 35 YAML files, experiment budgets, resolved
 network sizes, recurrent semantics, and sensitive mission constants. The OC2
 validator additionally checks tensor shapes, recurrent step/sequence parity,
 attention gradients to all three option outputs, bounded-action probabilities,
-and the signs of the termination theorem.
+the signs of the termination theorem, and exact immutable frozen-policy replay.
 
 The HPC array launcher passes `SLURM_ARRAY_TASK_ID` as `--seed`, so the ten
 controllers use reproducible seeds 0 through 9. Training also follows the

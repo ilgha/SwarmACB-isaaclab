@@ -110,6 +110,9 @@ def load_config(path: str | Path) -> tuple[str, str, Any, dict[str, Any]]:
         "min_log_std": "min_log_std",
         "max_log_std": "max_log_std",
         "max_grad_norm": "max_grad_norm",
+        "actor_learning_rate": "actor_lr",
+        "actor_max_grad_norm": "actor_max_grad_norm",
+        "target_kl": "target_kl",
         "option_value_temperature": "option_value_temperature",
     }
     for yaml_key, config_key in option_critic_hyperparameters.items():
@@ -220,6 +223,9 @@ def print_config(run_name: str, variant: str, cfg: Any, env_ov: dict):
             print(
                 f"    option_temperature  : {cfg.option_value_temperature}"
             )
+            print(f"    actor_learning_rate : {cfg.actor_lr}")
+            print(f"    actor_max_grad_norm : {cfg.actor_max_grad_norm}")
+            print(f"    target_kl           : {cfg.target_kl}")
     print(f"  Network")
     print(f"    hidden_units        : {cfg.hidden_dim}")
     print(f"    num_layers          : {cfg.num_layers}")

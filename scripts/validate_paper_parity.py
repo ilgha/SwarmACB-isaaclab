@@ -142,6 +142,9 @@ def audit_config(
             "min_log_std": -2.5,
             "max_log_std": 0.0,
             "max_grad_norm": 10.0,
+            "actor_learning_rate": 0.0001,
+            "actor_max_grad_norm": 1.0,
+            "target_kl": 0.03,
             "option_value_temperature": 1.0,
         }
         for key, expected in learned_defaults.items():
