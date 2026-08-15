@@ -530,7 +530,8 @@ def main():
                     obs_stacked.shape[-1],
                 )
                 (
-                    option_values,
+                    selector_logits,
+                    _option_values,
                     termination_logits,
                     action_means,
                     action_stds,
@@ -541,9 +542,9 @@ def main():
                 memory_c = next_memory[1].detach()
 
                 if args.deterministic:
-                    proposed = option_values.argmax(dim=-1)
+                    proposed = selector_logits.argmax(dim=-1)
                 else:
-                    proposed = actor.option_dist(option_values).sample()
+                    proposed = actor.option_dist(selector_logits).sample()
                 proposed = proposed.view(num_envs, len(agents))
 
                 force_new = current_options < 0

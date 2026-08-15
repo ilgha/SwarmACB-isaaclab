@@ -1955,7 +1955,8 @@ def main():
                 with torch.no_grad():
                     if policy_meta["trainer_type"] == "learned_option_critic":
                         (
-                            option_values,
+                            selector_logits,
+                            _option_values,
                             termination_logits,
                             action_means,
                             action_stds,
@@ -1967,10 +1968,10 @@ def main():
                             policy_memory[1].detach(),
                         )
                         if args.deterministic:
-                            proposed = option_values.argmax(dim=-1)
+                            proposed = selector_logits.argmax(dim=-1)
                         else:
                             proposed = policy_actor.option_dist(
-                                option_values,
+                                selector_logits,
                             ).sample()
 
                         force_new = policy_current_options < 0

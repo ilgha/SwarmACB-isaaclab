@@ -101,11 +101,16 @@ def load_config(path: str | Path) -> tuple[str, str, Any, dict[str, Any]]:
         "selector_coef": "selector_coef",
         "local_option_value_coef": "local_option_value_coef",
         "option_entropy_coef": "option_entropy_coef",
+        "option_balance_coef": "option_balance_coef",
+        "option_balance_final_coef": "option_balance_final_coef",
         "action_baseline_coef": "action_baseline_coef",
         "option_baseline_coef": "option_baseline_coef",
         "attention_diversity_coef": "attention_diversity_coef",
         "attention_temporal_coef": "attention_temporal_coef",
         "initial_termination_probability": "initial_termination_probability",
+        "termination_prior_probability": "termination_prior_probability",
+        "termination_prior_coef": "termination_prior_coef",
+        "termination_prior_final_coef": "termination_prior_final_coef",
         "initial_log_std": "initial_log_std",
         "min_log_std": "min_log_std",
         "max_log_std": "max_log_std",
@@ -113,7 +118,14 @@ def load_config(path: str | Path) -> tuple[str, str, Any, dict[str, Any]]:
         "actor_learning_rate": "actor_lr",
         "actor_max_grad_norm": "actor_max_grad_norm",
         "target_kl": "target_kl",
-        "option_value_temperature": "option_value_temperature",
+        "adaptive_actor_lr": "adaptive_actor_lr",
+        "actor_lr_scale_min": "actor_lr_scale_min",
+        "actor_lr_decay_factor": "actor_lr_decay_factor",
+        "actor_lr_recovery_factor": "actor_lr_recovery_factor",
+        "fused_optimizer": "fused_optimizer",
+        "matmul_precision": "matmul_precision",
+        "option_value_temperature": "option_selector_temperature",
+        "option_selector_temperature": "option_selector_temperature",
     }
     for yaml_key, config_key in option_critic_hyperparameters.items():
         if hasattr(cfg, config_key):
@@ -210,6 +222,11 @@ def print_config(run_name: str, variant: str, cfg: Any, env_ov: dict):
             print(f"    action_baseline     : {cfg.action_baseline_coef}")
             print(f"    option_baseline     : {cfg.option_baseline_coef}")
             print(f"    option_entropy      : {cfg.option_entropy_coef}")
+            print(
+                "    option_balance      : "
+                f"{cfg.option_balance_coef} -> "
+                f"{cfg.option_balance_final_coef}"
+            )
             print(f"    attention_diversity : {cfg.attention_diversity_coef}")
             print(f"    attention_temporal  : {cfg.attention_temporal_coef}")
             print(
@@ -217,15 +234,25 @@ def print_config(run_name: str, variant: str, cfg: Any, env_ov: dict):
                 f"{cfg.initial_termination_probability}"
             )
             print(
+                "    termination_prior   : "
+                f"p={cfg.termination_prior_probability}, "
+                f"coef={cfg.termination_prior_coef} -> "
+                f"{cfg.termination_prior_final_coef}"
+            )
+            print(
                 f"    action_log_std      : {cfg.initial_log_std} "
                 f"[{cfg.min_log_std}, {cfg.max_log_std}]"
             )
             print(
-                f"    option_temperature  : {cfg.option_value_temperature}"
+                "    option_temperature  : "
+                f"{cfg.option_selector_temperature}"
             )
             print(f"    actor_learning_rate : {cfg.actor_lr}")
             print(f"    actor_max_grad_norm : {cfg.actor_max_grad_norm}")
             print(f"    target_kl           : {cfg.target_kl}")
+            print(f"    adaptive_actor_lr   : {cfg.adaptive_actor_lr}")
+            print(f"    fused_optimizer     : {cfg.fused_optimizer}")
+            print(f"    matmul_precision    : {cfg.matmul_precision}")
     print(f"  Network")
     print(f"    hidden_units        : {cfg.hidden_dim}")
     print(f"    num_layers          : {cfg.num_layers}")

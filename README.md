@@ -130,13 +130,14 @@ representation, continuous intra-option wheel policy, and termination
 function. `network_settings.num_options` controls their number; the initial
 benchmark uses six for a direct comparison with Phase 1.
 
-OC2 checkpoint version 2 implements the Attention Option-Critic dependency
+OC2 checkpoint version 3 implements the Attention Option-Critic dependency
 strictly. For robot `i` and option `omega`:
 
 ```text
 h_i,omega = attention_omega(x_i, manager_memory_i)
 x_i,omega = h_i,omega * x_i
 
+selector logits mu_i(omega | x_i),
 local option value q_i^Omega(x_i,omega),
 intra-option policy pi_i,omega(a_i | x_i), and
 termination beta_i,omega(x_i)
@@ -157,12 +158,19 @@ environment; no post-sampling clamp changes the action after its probability
 has been evaluated. The log standard deviation is bounded separately for each
 option.
 
-The policy over options is the Boltzmann distribution of the local attended
-option values. The selected local value is fitted to the same lambda return as
-the team critic, while the boundary-only selector update uses the collective
-counterfactual option advantage. Thus attention receives both option-evaluation
-and option-improvement gradients without exposing centralized state at
-execution time.
+The policy over options is a categorical attended selector. Its logits use a
+separate output head from the local attended option values: PPO policy updates
+therefore cannot be overwritten directly by a value-regression scale change.
+The selected local value remains an auxiliary lambda-return target, while the
+boundary-only selector update uses the collective counterfactual option
+advantage. Both heads still backpropagate through attention without exposing
+centralized state at execution time.
+
+This is an intentional collective extension rather than a verbatim copy of
+AOC: the original AOC implementation applies an epsilon-soft rule directly to
+`Q_Omega`, whereas OC2 retains OC1's learned counterfactual policy over options
+and trains it with PPO. Separating its policy logits from the auxiliary local
+value target is the standard actor-critic separation for that design choice.
 
 Training remains centralized and execution decentralized. One local value and
 three centralized critic roles separate the objectives:
@@ -194,31 +202,52 @@ L_beta = beta_i,omega(s') *
      Q_Omega(s', (omega_-i, omega')) + xi]
 ```
 
-There is one `beta_i,omega` output per option. The positive deliberation cost
-`xi` discourages unnecessary switching. OC2 initializes beta to `0.05` (about
-20 decisions or two simulated seconds on average at 10 Hz) and applies no
-termination-entropy bonus by default. This avoids the old version-1 equilibrium
-near beta `0.27`. The intra-option policy is updated every decision; selector
-PPO and selector entropy are evaluated only at sampled option boundaries.
-Pairwise attention cosine similarity is minimized to discourage option
-collapse, and a temporal attention loss discourages rapidly changing focus.
+There is one `beta_i,omega` output per option. OC2 initializes beta to `0.05`
+(about 20 decisions or two simulated seconds on average at 10 Hz). The default
+deliberation cost is zero because the old fixed `0.01` margin was much larger
+than the measured collective option advantages and forced beta to zero. A
+decaying binary-KL prior toward `0.05` supplies a non-vanishing recovery
+gradient if a termination sigmoid starts to saturate, while leaving the
+counterfactual arrival-state advantage as the primary termination objective.
+The intra-option policy is updated every decision; selector PPO and selector
+entropy are evaluated only at sampled option boundaries. Pairwise attention
+cosine similarity and temporal attention losses regularize the masks. A weak,
+decaying marginal option-balance loss prevents options from dying before they
+can specialize without requiring every state to use a uniform selector.
+These two anti-collapse terms are explicit training regularizers rather than
+part of the Option-Critic theorem and should be reported and ablated in the
+final experimental study.
 
 OC2 freezes an exact recurrent actor snapshot at the beginning of every PPO
 update. Action and selector ratios are evaluated against that snapshot for all
 epochs, so minibatches cannot silently compare against a changing policy.
 Actor and centralized-critic parameters use separate Adam optimizers: the actor
 uses `actor_learning_rate: 0.0001` and gradient norm `1.0`, while the critics
-retain `learning_rate: 0.0003` and gradient norm `10.0`. `target_kl: 0.03`
+retain `learning_rate: 0.0003` and gradient norm `10.0`. `target_kl: 0.01`
 stops only the remaining actor minibatches if either policy leaves the trust
-region; centralized critic updates continue. Bounded log ratios and strict
-finite-gradient checks turn numerical corruption into an explicit error.
+region; centralized critic updates continue. The actor learning-rate scale is
+reduced after an excessive-KL update and recovers gradually after quiet
+updates. Bounded log ratios and strict finite-gradient checks turn numerical
+corruption into an explicit error. CUDA runs use a 4096-sample minibatch,
+high-precision TF32 matrix multiplication, and fused Adam when supported;
+policy probabilities, log ratios, advantages, and termination losses remain
+FP32.
+
+Automatic mixed precision and `torch.compile` are deliberately not enabled by
+default. This trainer has variable-length recurrent minibatches and sensitive
+distribution/KL calculations; the new `Performance/*` telemetry should first
+show that optimizer compute, rather than simulation collection, is the actual
+bottleneck before adding either optimization to the controlled benchmark.
 
 For Phase 2 validation, monitor `Policy/Option Usage/*`,
 `Policy/Intra-Option Std/*`, `Policy/Mean Termination Probability`,
 `Policy/Termination Probability/*`, `Policy/Switch Rate`,
 `Policy/Option Switch Rate/*`, `Policy/Mean Option Duration Decisions`,
 `Policy/Local Option Value Spread`, `Policy/Wheel Action Saturation`, and the
-two attention losses. `Diagnostics/Initial Policy KL` must be approximately
+two attention losses. Also track `Policy/Effective Options`,
+`Policy/Termination Low Saturation`, and `Update/*`, which is written after
+every optimizer update rather than only at mission summary boundaries.
+`Diagnostics/Initial Policy KL` must be approximately
 zero, `Diagnostics/Max Policy KL` should normally remain near the configured
 target, and `Diagnostics/Actor Update Fraction` reveals any trust-region early
 stop. Comparable task reward alone is not sufficient evidence that distinct
@@ -316,7 +345,7 @@ Submit ten independent Phase 2 designs per mission on the cluster with
 sbatch scripts/hpc/train_oc2_dirgate.slurm
 ```
 
-The corrected launchers write to `OC2_<mission>_cyclamen_schema3_hpc_<seed>`
+The corrected launchers write to `OC2_<mission>_cyclamen_schema4_hpc_<seed>`
 run and checkpoint directories so their fresh experiments cannot mix with
 legacy OC2 TensorBoard events or checkpoints.
 
@@ -547,17 +576,23 @@ behaviors:
     variant: cyclamen
     trainer_type: learned_option_critic
     hyperparameters:
+      batch_size: 4096
       learning_rate: 0.0003
       actor_learning_rate: 0.0001
       beta: 0.001
       intra_option_coef: 1.0
       selector_coef: 1.0
-      local_option_value_coef: 0.5
+      local_option_value_coef: 0.1
       option_entropy_coef: 0.005
-      termination_penalty: 0.01
+      option_balance_coef: 0.001
+      option_balance_final_coef: 0.0001
+      termination_penalty: 0.0
       termination_coef: 1.0
       termination_entropy_coef: 0.0
       initial_termination_probability: 0.05
+      termination_prior_probability: 0.05
+      termination_prior_coef: 0.001
+      termination_prior_final_coef: 0.0001
       action_baseline_coef: 0.25
       option_value_coef: 0.5
       option_baseline_coef: 0.25
@@ -568,8 +603,11 @@ behaviors:
       max_log_std: 0.0
       max_grad_norm: 10.0
       actor_max_grad_norm: 1.0
-      target_kl: 0.03
-      option_value_temperature: 1.0
+      target_kl: 0.01
+      adaptive_actor_lr: true
+      fused_optimizer: true
+      matmul_precision: high
+      option_selector_temperature: 1.0
     network_settings:
       hidden_units: 128
       num_layers: 1
@@ -588,19 +626,18 @@ behaviors:
 
 Paper-parity version 4 remains the Unity-matched architecture for classical
 Cyclamen and Phase 1; the corrected research architecture is recorded
-separately as OC2 checkpoint version 2.
+separately as OC2 checkpoint version 3.
 Classical Cyclamen and fixed Option-Critic use a `128 x 1` actor/critic;
 Dandelion, Daisy, and Lily use `512 x 2`. OC2 keeps the `128 x 1` Cyclamen
 manager, but uses `512 x 2` learned motor paths and centralized critics because
 the fixed low-level modules no longer provide that capacity.
 
-The actor payload remains OC2 architecture version 2, so corrected checkpoints
-can be loaded by both viewers. Training checkpoints now use schema version 3
-for the frozen PPO reference contract and separate actor/critic optimizers.
-Version-1 actor checkpoints are rejected because they contain the old attention
-bypass and incompatible recurrent state. Earlier version-2 training runs used
-one joint optimizer and cannot be resumed safely under schema 3. Start this
-corrected OC2 training from fresh weights; schema-3 checkpoints can then be
+The actor payload is OC2 architecture version 3 and training checkpoints use
+schema version 4. Version 3 adds separate attended selector and local-value
+heads; schema 4 adds anti-collapse regularization, adaptive-KL learning-rate
+state, and optimizer metadata. The viewers still load architecture-version-2
+checkpoints for evaluation, but versions 1 and 2 cannot be resumed for version
+3/schema-4 training. Start from fresh weights; schema-4 checkpoints can then be
 resumed normally with the original mission config and `max_steps`.
 
 Before submitting the full HPC matrix, run the dependency-light parity audit:
@@ -613,7 +650,7 @@ python scripts/validate_oc2_architecture.py
 The first command validates all 35 YAML files, experiment budgets, resolved
 network sizes, recurrent semantics, and sensitive mission constants. The OC2
 validator additionally checks tensor shapes, recurrent step/sequence parity,
-attention gradients to all three option outputs, bounded-action probabilities,
+attention gradients to all four option outputs, bounded-action probabilities,
 the signs of the termination theorem, and exact immutable frozen-policy replay.
 
 The HPC array launcher passes `SLURM_ARRAY_TASK_ID` as `--seed`, so the ten

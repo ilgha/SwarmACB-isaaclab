@@ -7,7 +7,7 @@ behaviors:
     trainer_type: learned_option_critic
 
     hyperparameters:
-      batch_size: 2048
+      batch_size: 4096
       buffer_size: 20480
       learning_rate: 0.0003
       beta: 0.001
@@ -16,12 +16,17 @@ behaviors:
       num_epoch: 3
       intra_option_coef: 1.0
       selector_coef: 1.0
-      local_option_value_coef: 0.5
+      local_option_value_coef: 0.1
       option_entropy_coef: 0.005
-      termination_penalty: 0.01
+      option_balance_coef: 0.001
+      option_balance_final_coef: 0.0001
+      termination_penalty: 0.0
       termination_coef: 1.0
       termination_entropy_coef: 0.0
       initial_termination_probability: 0.05
+      termination_prior_probability: 0.05
+      termination_prior_coef: 0.001
+      termination_prior_final_coef: 0.0001
       value_coef: 0.5
       action_baseline_coef: 0.25
       option_value_coef: 0.5
@@ -34,8 +39,14 @@ behaviors:
       max_grad_norm: 10.0
       actor_learning_rate: 0.0001
       actor_max_grad_norm: 1.0
-      target_kl: 0.03
-      option_value_temperature: 1.0
+      target_kl: 0.01
+      adaptive_actor_lr: true
+      actor_lr_scale_min: 0.05
+      actor_lr_decay_factor: 1.5
+      actor_lr_recovery_factor: 1.05
+      fused_optimizer: true
+      matmul_precision: high
+      option_selector_temperature: 1.0
       learning_rate_schedule: linear
       epsilon_schedule: linear
       beta_schedule: linear

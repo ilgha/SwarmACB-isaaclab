@@ -21,7 +21,8 @@ from torch.distributions import Categorical, Normal
 from .poca_networks import LinearEncoder, _linear_layer, _mlagents_lstm
 
 
-LEARNED_OPTION_CRITIC_VERSION = 2
+LEARNED_OPTION_CRITIC_VERSION = 3
+SUPPORTED_LEARNED_OPTION_CRITIC_VERSIONS = (2, 3)
 
 
 def termination_objective(
@@ -97,8 +98,8 @@ class LearnedOptionActor(nn.Module):
     A compact Cyclamen manager memory helps generate state-dependent attention
     masks. Each option then processes only ``h_omega(x) * x`` through a shared
     sensor encoder and recurrent cell with option-specific memory. Separate
-    heads implement the local option value, intra-option policy, and termination
-    function for every option.
+    heads implement the selector policy, local option value, intra-option
+    policy, and termination function for every option.
     """
 
     def __init__(
@@ -116,7 +117,8 @@ class LearnedOptionActor(nn.Module):
         initial_log_std: float = -0.7,
         min_log_std: float = -2.5,
         max_log_std: float = 0.0,
-        option_value_temperature: float = 1.0,
+        option_selector_temperature: float = 1.0,
+        separate_selector: bool = True,
     ):
         super().__init__()
         self.obs_dim = int(obs_dim)
@@ -128,7 +130,10 @@ class LearnedOptionActor(nn.Module):
         self.option_num_layers = int(option_num_layers)
         self.min_log_std = float(min_log_std)
         self.max_log_std = float(max_log_std)
-        self.option_value_temperature = float(option_value_temperature)
+        self.option_selector_temperature = float(
+            option_selector_temperature
+        )
+        self.separate_selector = bool(separate_selector)
         self.manager_obs_dim = 4 if self.obs_dim == 24 else self.obs_dim
 
         if self.obs_dim not in (4, 24):
@@ -148,8 +153,8 @@ class LearnedOptionActor(nn.Module):
             raise ValueError(
                 "initial_log_std must lie inside [min_log_std, max_log_std]"
             )
-        if self.option_value_temperature <= 0.0:
-            raise ValueError("option_value_temperature must be positive")
+        if self.option_selector_temperature <= 0.0:
+            raise ValueError("option_selector_temperature must be positive")
 
         self.manager_encoder = LinearEncoder(
             self.manager_obs_dim,
@@ -200,6 +205,19 @@ class LearnedOptionActor(nn.Module):
             )
             for _ in range(self.num_options)
         ])
+        # The selector is a policy, whereas option values are regression
+        # targets. Keeping distinct output heads prevents value-scale drift
+        # from directly changing the categorical option policy.
+        if self.separate_selector:
+            self.selector_heads = nn.ModuleList([
+                _linear_layer(
+                    self.option_hidden,
+                    1,
+                    kernel_init="kaiming_normal",
+                    kernel_gain=0.01,
+                )
+                for _ in range(self.num_options)
+            ])
         self.action_heads = nn.ModuleList([
             _linear_layer(
                 self.option_hidden,
@@ -255,12 +273,11 @@ class LearnedOptionActor(nn.Module):
         device: torch.device | str,
     ) -> "LearnedOptionActor":
         version = int(checkpoint.get("learned_option_critic_version", 0))
-        if version != LEARNED_OPTION_CRITIC_VERSION:
+        if version not in SUPPORTED_LEARNED_OPTION_CRITIC_VERSIONS:
             raise RuntimeError(
                 f"Checkpoint uses learned Option-Critic version {version}; "
-                f"the current actor expects version "
-                f"{LEARNED_OPTION_CRITIC_VERSION}. OC2 v2 requires fresh "
-                "training because its attention and action semantics changed."
+                "the current actor supports versions "
+                f"{SUPPORTED_LEARNED_OPTION_CRITIC_VERSIONS}."
             )
         actor = cls(
             obs_dim=int(checkpoint["obs_dim"]),
@@ -278,9 +295,13 @@ class LearnedOptionActor(nn.Module):
             initial_log_std=float(checkpoint["initial_log_std"]),
             min_log_std=float(checkpoint["min_log_std"]),
             max_log_std=float(checkpoint["max_log_std"]),
-            option_value_temperature=float(
-                checkpoint["option_value_temperature"]
+            option_selector_temperature=float(
+                checkpoint.get(
+                    "option_selector_temperature",
+                    checkpoint.get("option_value_temperature", 1.0),
+                )
             ),
+            separate_selector=(version >= 3),
         ).to(device)
         actor.load_state_dict(checkpoint["actor"])
         return actor
@@ -343,6 +364,7 @@ class LearnedOptionActor(nn.Module):
         obs_seq: torch.Tensor,
         state: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[
+        torch.Tensor,
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
@@ -422,6 +444,16 @@ class LearnedOptionActor(nn.Module):
             head(option_features[..., option_id, :])
             for option_id, head in enumerate(self.option_value_heads)
         ], dim=-1)
+        if self.separate_selector:
+            selector_logits = torch.cat([
+                head(option_features[..., option_id, :])
+                for option_id, head in enumerate(self.selector_heads)
+            ], dim=-1)
+        else:
+            # Architecture-v2 checkpoints used local values as logits. Keep
+            # that exact execution path so completed legacy runs remain
+            # inspectable, while all new training uses the separate policy.
+            selector_logits = option_values
         action_means = torch.stack([
             head(option_features[..., option_id, :])
             for option_id, head in enumerate(self.action_heads)
@@ -442,6 +474,7 @@ class LearnedOptionActor(nn.Module):
             batch_size,
         )
         return (
+            selector_logits,
             option_values,
             termination_logits,
             action_means,
@@ -460,6 +493,7 @@ class LearnedOptionActor(nn.Module):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
+        torch.Tensor,
         tuple[torch.Tensor, torch.Tensor],
     ]:
         outputs = self.forward_sequence(obs.unsqueeze(1), state)
@@ -469,7 +503,8 @@ class LearnedOptionActor(nn.Module):
             outputs[2][:, 0],
             outputs[3][:, 0],
             outputs[4][:, 0],
-            outputs[5],
+            outputs[5][:, 0],
+            outputs[6],
         )
 
     @staticmethod
@@ -492,10 +527,10 @@ class LearnedOptionActor(nn.Module):
         stds = self._gather_options(action_stds, options)
         return SquashedNormal(means, stds)
 
-    def option_dist(self, option_values: torch.Tensor) -> Categorical:
-        """Boltzmann policy over learned attended option values."""
+    def option_dist(self, selector_logits: torch.Tensor) -> Categorical:
+        """Categorical policy over attended option-selector logits."""
         return Categorical(
-            logits=option_values / self.option_value_temperature,
+            logits=selector_logits / self.option_selector_temperature,
         )
 
     @staticmethod

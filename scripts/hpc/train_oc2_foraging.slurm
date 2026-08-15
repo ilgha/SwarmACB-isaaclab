@@ -15,4 +15,4 @@ set -euo pipefail
 # Train 10 independent learned-option Phase 2 runs on Foraging.
 PROJECT_DIR="${PROJECT_DIR:-/home/ulb/iridia_robo/igharbi/SwarmACB-isaaclab}"
 SCRIPT_DIR="$PROJECT_DIR/scripts/hpc"
-bash "$SCRIPT_DIR/run_training_common.sh" "configs/OC2_Foraging_cyclamen.yaml" "OC2_Foraging_cyclamen_schema3"
+bash "$SCRIPT_DIR/run_training_common.sh" "configs/OC2_Foraging_cyclamen.yaml" "OC2_Foraging_cyclamen_schema4"

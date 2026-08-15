@@ -10,6 +10,7 @@ import sys
 import types
 
 import torch
+import torch.nn.functional as functional
 
 
 def _load_module(name: str, path: Path):
@@ -74,8 +75,17 @@ def main() -> int:
     )
     obs = torch.randn(3, 5, 24)
     outputs = actor.forward_sequence(obs)
-    option_values, termination_logits, means, stds, attentions, state = outputs
+    (
+        selector_logits,
+        option_values,
+        termination_logits,
+        means,
+        stds,
+        attentions,
+        state,
+    ) = outputs
 
+    _require(selector_logits.shape == (3, 5, 6), "invalid selector shape")
     _require(option_values.shape == (3, 5, 6), "invalid option-value shape")
     _require(
         termination_logits.shape == (3, 5, 6),
@@ -106,27 +116,56 @@ def main() -> int:
         "initial_log_std": -0.7,
         "min_log_std": -2.5,
         "max_log_std": 0.0,
-        "option_value_temperature": 1.0,
+        "option_selector_temperature": 1.0,
         "actor": actor.state_dict(),
     }
     reloaded = networks.LearnedOptionActor.from_checkpoint(checkpoint, "cpu")
     with torch.no_grad():
         reloaded_outputs = reloaded.forward_sequence(obs)
-    for output_id in range(5):
+    for output_id in range(6):
         _require(
             torch.allclose(reloaded_outputs[output_id], outputs[output_id]),
             f"checkpoint roundtrip changed actor output {output_id}",
         )
 
+    legacy_actor = networks.LearnedOptionActor(
+        obs_dim=24,
+        act_dim=2,
+        num_options=6,
+        hidden=128,
+        num_layers=1,
+        memory_size=128,
+        option_hidden=64,
+        option_num_layers=2,
+        option_memory_size=64,
+        separate_selector=False,
+    )
+    legacy_checkpoint = dict(checkpoint)
+    legacy_checkpoint["learned_option_critic_version"] = 2
+    legacy_checkpoint["option_value_temperature"] = (
+        legacy_checkpoint.pop("option_selector_temperature")
+    )
+    legacy_checkpoint["actor"] = legacy_actor.state_dict()
+    loaded_legacy = networks.LearnedOptionActor.from_checkpoint(
+        legacy_checkpoint,
+        "cpu",
+    )
+    with torch.no_grad():
+        legacy_outputs = loaded_legacy.forward_sequence(obs)
+    _require(
+        torch.equal(legacy_outputs[0], legacy_outputs[1]),
+        "version-2 checkpoint no longer uses values as selector logits",
+    )
+
     step_state = actor.initial_state(3, obs.device)
-    step_outputs = [[] for _ in range(5)]
+    step_outputs = [[] for _ in range(6)]
     with torch.no_grad():
         for time_id in range(obs.shape[1]):
             current = actor.step(obs[:, time_id], step_state)
-            step_state = current[5]
-            for output_id in range(5):
+            step_state = current[6]
+            for output_id in range(6):
                 step_outputs[output_id].append(current[output_id])
-    for output_id in range(5):
+    for output_id in range(6):
         stacked = torch.stack(step_outputs[output_id], dim=1)
         _require(
             torch.allclose(stacked, outputs[output_id], atol=1e-5),
@@ -139,9 +178,10 @@ def main() -> int:
     )
 
     for output_id, label in (
-        (0, "option value/selector"),
-        (1, "termination"),
-        (2, "action"),
+        (0, "option selector"),
+        (1, "option value"),
+        (2, "termination"),
+        (3, "action"),
     ):
         gradient = _attention_gradient(actor, obs, output_id)
         _require(gradient > 0.0, f"{label} bypasses learned attention")
@@ -154,7 +194,12 @@ def main() -> int:
         closed_outputs = actor.forward_sequence(obs)[0]
     _require(
         not torch.allclose(open_outputs, closed_outputs, atol=1e-6),
-        "option value/selector is invariant to its attention mask",
+        "option selector is invariant to its attention mask",
+    )
+    _require(
+        actor.selector_heads[0].weight.data_ptr()
+        != actor.option_value_heads[0].weight.data_ptr(),
+        "selector and value outputs share the same head",
     )
 
     selected = torch.arange(3).view(3, 1).expand(3, 5) % 6
@@ -170,7 +215,7 @@ def main() -> int:
     )
     with torch.no_grad():
         initial_beta = torch.sigmoid(
-            initial_actor.forward_sequence(torch.zeros(2, 1, 24))[1]
+        initial_actor.forward_sequence(torch.zeros(2, 1, 24))[2]
         ).mean()
     _require(
         abs(float(initial_beta) - 0.05) < 1e-5,
@@ -202,6 +247,32 @@ def main() -> int:
         "an inferior option is not encouraged to terminate",
     )
 
+    saturated_logit = torch.tensor(-20.0, requires_grad=True)
+    prior_loss = functional.binary_cross_entropy_with_logits(
+        saturated_logit,
+        torch.tensor(0.05),
+    )
+    prior_loss.backward()
+    _require(
+        float(saturated_logit.grad) < -0.01,
+        "termination prior has no recovery gradient near beta=0",
+    )
+
+    collapsed_logits = torch.tensor(
+        [[4.0, 0.0, 0.0, 0.0, 0.0, 0.0]],
+        requires_grad=True,
+    )
+    collapsed_probs = collapsed_logits.softmax(dim=-1).mean(dim=0)
+    balance_loss = (
+        collapsed_probs
+        * (collapsed_probs.clamp_min(1e-8).log() + torch.log(torch.tensor(6.0)))
+    ).sum()
+    balance_loss.backward()
+    _require(
+        float(collapsed_logits.grad.abs().sum()) > 0.0,
+        "option balance has no gradient for a collapsed selector",
+    )
+
     # PPO must compare every recurrent minibatch with one immutable policy
     # snapshot taken at the beginning of the update.
     reference_actor = copy.deepcopy(actor).eval()
@@ -217,13 +288,13 @@ def main() -> int:
             tuple(item.clone() for item in replay_state),
         )
         replay_actions = actor.selected_action_dist(
-            current_replay[2], current_replay[3], replay_options
+            current_replay[3], current_replay[4], replay_options
         ).sample()
         current_action_log_probs = actor.selected_action_dist(
-            current_replay[2], current_replay[3], replay_options
+            current_replay[3], current_replay[4], replay_options
         ).log_prob(replay_actions)
         reference_action_log_probs = reference_actor.selected_action_dist(
-            reference_replay[2], reference_replay[3], replay_options
+            reference_replay[3], reference_replay[4], replay_options
         ).log_prob(replay_actions)
         current_option_log_probs = actor.option_dist(
             current_replay[0]
@@ -254,11 +325,13 @@ def main() -> int:
     )
 
     print("OC2 architecture validation passed:")
-    print("  option value, action, and termination backpropagate through attention")
+    print("  selector, option value, action, and termination use attention")
     print("  recurrent memory is separated by option and packed for rollout storage")
     print("  tanh-squashed actions and corrected log probabilities are finite")
     print("  termination gradient has the Option-Critic continuation/switch signs")
+    print("  anti-collapse priors retain gradients at degenerate policies")
     print("  frozen recurrent PPO reference is exact and immutable")
+    print("  legacy version-2 actors remain loadable for evaluation")
     return 0
 
 

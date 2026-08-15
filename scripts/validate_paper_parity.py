@@ -108,7 +108,12 @@ def audit_config(
     )
 
     hyper = block.get("hyperparameters", {})
-    audit.equal(f"{prefix}.batch_size", hyper.get("batch_size"), 2048)
+    expected_batch_size = 4096 if learned_oc else 2048
+    audit.equal(
+        f"{prefix}.batch_size",
+        hyper.get("batch_size"),
+        expected_batch_size,
+    )
     audit.equal(f"{prefix}.buffer_size", hyper.get("buffer_size"), 20480)
     audit.close(f"{prefix}.learning_rate", hyper.get("learning_rate"), learning_rate)
     audit.close(f"{prefix}.epsilon", hyper.get("epsilon"), 0.2)
@@ -128,12 +133,17 @@ def audit_config(
             "beta": 0.001,
             "intra_option_coef": 1.0,
             "selector_coef": 1.0,
-            "local_option_value_coef": 0.5,
+            "local_option_value_coef": 0.1,
             "option_entropy_coef": 0.005,
-            "termination_penalty": 0.01,
+            "option_balance_coef": 0.001,
+            "option_balance_final_coef": 0.0001,
+            "termination_penalty": 0.0,
             "termination_coef": 1.0,
             "termination_entropy_coef": 0.0,
             "initial_termination_probability": 0.05,
+            "termination_prior_probability": 0.05,
+            "termination_prior_coef": 0.001,
+            "termination_prior_final_coef": 0.0001,
             "action_baseline_coef": 0.25,
             "option_baseline_coef": 0.25,
             "attention_diversity_coef": 0.01,
@@ -144,11 +154,29 @@ def audit_config(
             "max_grad_norm": 10.0,
             "actor_learning_rate": 0.0001,
             "actor_max_grad_norm": 1.0,
-            "target_kl": 0.03,
-            "option_value_temperature": 1.0,
+            "target_kl": 0.01,
+            "actor_lr_scale_min": 0.05,
+            "actor_lr_decay_factor": 1.5,
+            "actor_lr_recovery_factor": 1.05,
+            "option_selector_temperature": 1.0,
         }
         for key, expected in learned_defaults.items():
             audit.close(f"{prefix}.{key}", hyper.get(key), expected)
+        audit.equal(
+            f"{prefix}.adaptive_actor_lr",
+            hyper.get("adaptive_actor_lr"),
+            True,
+        )
+        audit.equal(
+            f"{prefix}.fused_optimizer",
+            hyper.get("fused_optimizer"),
+            True,
+        )
+        audit.equal(
+            f"{prefix}.matmul_precision",
+            hyper.get("matmul_precision"),
+            "high",
+        )
         audit.equal(
             f"{prefix}.option_hidden_units",
             network.get("option_hidden_units"),
