@@ -3,10 +3,11 @@
 
 """Decentralized actor for collective Attention Option-Critic.
 
-Each learned option receives its own attended sensor stream. The policy over
-options, intra-option wheel policy, and termination function are all computed
-from that attended representation. The full observation can influence the
-attention masks, but there is no unmasked shortcut to any option output.
+Each learned option receives its own attended local sensor observation. Its
+option value, continuous two-wheel intra-option policy, and termination
+function are computed from that attended representation. New checkpoints
+follow Attention Option-Critic and select options epsilon-softly from the
+attended option values. There is no unmasked shortcut to any option output.
 """
 
 from __future__ import annotations
@@ -21,8 +22,8 @@ from torch.distributions import Categorical, Normal
 from .poca_networks import LinearEncoder, _linear_layer, _mlagents_lstm
 
 
-LEARNED_OPTION_CRITIC_VERSION = 3
-SUPPORTED_LEARNED_OPTION_CRITIC_VERSIONS = (2, 3)
+LEARNED_OPTION_CRITIC_VERSION = 4
+SUPPORTED_LEARNED_OPTION_CRITIC_VERSIONS = (2, 3, 4)
 
 
 def termination_objective(
@@ -98,7 +99,7 @@ class LearnedOptionActor(nn.Module):
     A compact Cyclamen manager memory helps generate state-dependent attention
     masks. Each option then processes only ``h_omega(x) * x`` through a shared
     sensor encoder and recurrent cell with option-specific memory. Separate
-    heads implement the selector policy, local option value, intra-option
+    heads implement the local option value, continuous intra-option wheel
     policy, and termination function for every option.
     """
 
@@ -113,12 +114,14 @@ class LearnedOptionActor(nn.Module):
         option_hidden: int = 512,
         option_num_layers: int = 2,
         option_memory_size: int = 64,
-        initial_termination_probability: float = 0.05,
+        initial_termination_probability: float = 0.27,
         initial_log_std: float = -0.7,
         min_log_std: float = -2.5,
         max_log_std: float = 0.0,
         option_selector_temperature: float = 1.0,
-        separate_selector: bool = True,
+        separate_selector: bool = False,
+        epsilon_greedy_selector: bool = True,
+        squash_actions: bool = False,
     ):
         super().__init__()
         self.obs_dim = int(obs_dim)
@@ -134,6 +137,8 @@ class LearnedOptionActor(nn.Module):
             option_selector_temperature
         )
         self.separate_selector = bool(separate_selector)
+        self.epsilon_greedy_selector = bool(epsilon_greedy_selector)
+        self.squash_actions = bool(squash_actions)
         self.manager_obs_dim = 4 if self.obs_dim == 24 else self.obs_dim
 
         if self.obs_dim not in (4, 24):
@@ -147,12 +152,13 @@ class LearnedOptionActor(nn.Module):
             raise ValueError(
                 "initial_termination_probability must be strictly between 0 and 1"
             )
-        if not self.min_log_std < self.max_log_std:
-            raise ValueError("min_log_std must be smaller than max_log_std")
-        if not self.min_log_std <= initial_log_std <= self.max_log_std:
-            raise ValueError(
-                "initial_log_std must lie inside [min_log_std, max_log_std]"
-            )
+        if self.squash_actions:
+            if not self.min_log_std < self.max_log_std:
+                raise ValueError("min_log_std must be smaller than max_log_std")
+            if not self.min_log_std <= initial_log_std <= self.max_log_std:
+                raise ValueError(
+                    "initial_log_std must lie inside [min_log_std, max_log_std]"
+                )
         if self.option_selector_temperature <= 0.0:
             raise ValueError("option_selector_temperature must be positive")
 
@@ -205,9 +211,9 @@ class LearnedOptionActor(nn.Module):
             )
             for _ in range(self.num_options)
         ])
-        # The selector is a policy, whereas option values are regression
-        # targets. Keeping distinct output heads prevents value-scale drift
-        # from directly changing the categorical option policy.
+        # Architecture version 3 used a separate PPO selector. It is retained
+        # only so completed legacy checkpoints remain playable; version 4
+        # follows AOC and selects epsilon-soft from option values directly.
         if self.separate_selector:
             self.selector_heads = nn.ModuleList([
                 _linear_layer(
@@ -243,16 +249,24 @@ class LearnedOptionActor(nn.Module):
         for head in self.termination_heads:
             nn.init.constant_(head.bias, termination_bias)
 
-        std_fraction = (
-            (float(initial_log_std) - self.min_log_std)
-            / (self.max_log_std - self.min_log_std)
-        )
-        std_fraction = min(max(std_fraction, 1e-6), 1.0 - 1e-6)
-        initial_std_logit = math.log(std_fraction / (1.0 - std_fraction))
-        self.log_std_logits = nn.Parameter(torch.full(
-            (self.num_options, self.act_dim),
-            initial_std_logit,
-        ))
+        if self.squash_actions:
+            std_fraction = (
+                (float(initial_log_std) - self.min_log_std)
+                / (self.max_log_std - self.min_log_std)
+            )
+            std_fraction = min(max(std_fraction, 1e-6), 1.0 - 1e-6)
+            initial_std_logit = math.log(std_fraction / (1.0 - std_fraction))
+            self.log_std_logits = nn.Parameter(torch.full(
+                (self.num_options, self.act_dim),
+                initial_std_logit,
+            ))
+        else:
+            # Match ML-Agents' continuous actor: state-independent log sigma,
+            # with one independently learned pair for every option.
+            self.log_std = nn.Parameter(torch.full(
+                (self.num_options, self.act_dim),
+                float(initial_log_std),
+            ))
 
         # Packed public memory: one manager state plus one state per option.
         self.hidden_size = (
@@ -261,6 +275,8 @@ class LearnedOptionActor(nn.Module):
         )
 
     def option_log_stds(self) -> torch.Tensor:
+        if not self.squash_actions:
+            return self.log_std
         fraction = torch.sigmoid(self.log_std_logits)
         return self.min_log_std + (
             self.max_log_std - self.min_log_std
@@ -279,6 +295,18 @@ class LearnedOptionActor(nn.Module):
                 "the current actor supports versions "
                 f"{SUPPORTED_LEARNED_OPTION_CRITIC_VERSIONS}."
             )
+        if bool(checkpoint.get("discrete", False)):
+            raise RuntimeError(
+                "This checkpoint selects predefined behavior modules. "
+                "OC2 is defined as six learned continuous intra-option "
+                "wheel policies, so that experimental checkpoint is not "
+                "compatible with LearnedOptionActor."
+            )
+        action_distribution = checkpoint.get(
+            "action_distribution",
+            "tanh_squashed_normal" if version <= 3 else "mlagents_normal",
+        )
+        squash_actions = action_distribution == "tanh_squashed_normal"
         actor = cls(
             obs_dim=int(checkpoint["obs_dim"]),
             act_dim=int(checkpoint.get("act_dim", 2)),
@@ -301,7 +329,9 @@ class LearnedOptionActor(nn.Module):
                     checkpoint.get("option_value_temperature", 1.0),
                 )
             ),
-            separate_selector=(version >= 3),
+            separate_selector=(version == 3),
+            epsilon_greedy_selector=(version >= 4),
+            squash_actions=squash_actions,
         ).to(device)
         actor.load_state_dict(checkpoint["actor"])
         return actor
@@ -450,9 +480,9 @@ class LearnedOptionActor(nn.Module):
                 for option_id, head in enumerate(self.selector_heads)
             ], dim=-1)
         else:
-            # Architecture-v2 checkpoints used local values as logits. Keep
-            # that exact execution path so completed legacy runs remain
-            # inspectable, while all new training uses the separate policy.
+            # AOC uses attended option values directly for epsilon-soft option
+            # selection. Architecture-v2 checkpoints also shared this output,
+            # but interpreted it through a softmax distribution.
             selector_logits = option_values
         action_means = torch.stack([
             head(option_features[..., option_id, :])
@@ -522,16 +552,64 @@ class LearnedOptionActor(nn.Module):
         action_means: torch.Tensor,
         action_stds: torch.Tensor,
         options: torch.Tensor,
-    ) -> SquashedNormal:
+    ) -> Normal | SquashedNormal:
         means = self._gather_options(action_means, options)
         stds = self._gather_options(action_stds, options)
-        return SquashedNormal(means, stds)
+        if self.squash_actions:
+            return SquashedNormal(means, stds)
+        return Normal(means, stds)
 
-    def option_dist(self, selector_logits: torch.Tensor) -> Categorical:
-        """Categorical policy over attended option-selector logits."""
-        return Categorical(
-            logits=selector_logits / self.option_selector_temperature,
+    def option_dist(
+        self,
+        option_scores: torch.Tensor,
+        epsilon: float = 0.0,
+    ) -> Categorical:
+        """Return the call-and-return policy over options.
+
+        Attention Option-Critic uses an epsilon-soft policy over learned
+        ``Q_Omega`` values. Versions 2 and 3 used softmax logits; retaining
+        that path keeps their completed checkpoints playable without using it
+        for new training.
+        """
+        if not self.epsilon_greedy_selector:
+            return Categorical(
+                logits=option_scores / self.option_selector_temperature,
+            )
+        epsilon = float(epsilon)
+        if not 0.0 <= epsilon <= 1.0:
+            raise ValueError("option epsilon must lie in [0, 1]")
+        num_options = option_scores.shape[-1]
+        probs = torch.full_like(option_scores, epsilon / num_options)
+        greedy = option_scores.argmax(dim=-1, keepdim=True)
+        probs.scatter_add_(
+            -1,
+            greedy,
+            torch.full_like(greedy, 1.0 - epsilon, dtype=probs.dtype),
         )
+        return Categorical(probs=probs)
+
+    def option_state_value(
+        self,
+        option_scores: torch.Tensor,
+        option_values: torch.Tensor,
+        epsilon: float = 0.0,
+    ) -> torch.Tensor:
+        """Evaluate ``V_Omega`` under the epsilon-soft option policy.
+
+        The termination-gradient theorem compares continuation with the value
+        of reselecting through ``pi_Omega``. The policy probabilities come from
+        the decentralized attended scores, while ``option_values`` may be the
+        centralized counterfactual values used only during training.
+        """
+        if option_scores.shape != option_values.shape:
+            raise ValueError(
+                "option scores and values must have the same shape, got "
+                f"{tuple(option_scores.shape)} and {tuple(option_values.shape)}"
+            )
+        return (
+            self.option_dist(option_scores, epsilon=epsilon).probs
+            * option_values
+        ).sum(dim=-1)
 
     @staticmethod
     def selected_termination_logits(

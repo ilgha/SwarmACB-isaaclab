@@ -10,7 +10,6 @@ import sys
 import types
 
 import torch
-import torch.nn.functional as functional
 
 
 def _load_module(name: str, path: Path):
@@ -68,10 +67,11 @@ def main() -> int:
         option_hidden=64,
         option_num_layers=2,
         option_memory_size=64,
-        initial_termination_probability=0.05,
-        initial_log_std=-0.7,
+        initial_termination_probability=0.27,
+        initial_log_std=0.0,
         min_log_std=-2.5,
         max_log_std=0.0,
+        squash_actions=False,
     )
     obs = torch.randn(3, 5, 24)
     outputs = actor.forward_sequence(obs)
@@ -79,8 +79,8 @@ def main() -> int:
         selector_logits,
         option_values,
         termination_logits,
-        means,
-        stds,
+        action_means,
+        action_stds,
         attentions,
         state,
     ) = outputs
@@ -88,11 +88,22 @@ def main() -> int:
     _require(selector_logits.shape == (3, 5, 6), "invalid selector shape")
     _require(option_values.shape == (3, 5, 6), "invalid option-value shape")
     _require(
+        torch.equal(selector_logits, option_values),
+        "new AOC actor does not expose Q_Omega for option selection",
+    )
+    _require(
         termination_logits.shape == (3, 5, 6),
         "invalid termination-logit shape",
     )
-    _require(means.shape == (3, 5, 6, 2), "invalid action-mean shape")
-    _require(stds.shape == means.shape, "invalid action-std shape")
+    _require(
+        action_means.shape == (3, 5, 6, 2),
+        "invalid intra-option wheel-mean shape",
+    )
+    _require(
+        action_stds.shape == (3, 5, 6, 2)
+        and bool((action_stds > 0).all()),
+        "invalid intra-option wheel-standard-deviation output",
+    )
     _require(attentions.shape == (3, 5, 6, 24), "invalid attention shape")
     _require(
         state[0].shape == (1, 3, actor.hidden_size),
@@ -104,6 +115,8 @@ def main() -> int:
             networks.LEARNED_OPTION_CRITIC_VERSION
         ),
         "obs_dim": 24,
+        "discrete": False,
+        "num_actions": 2,
         "act_dim": 2,
         "num_options": 6,
         "hidden_dim": 128,
@@ -112,11 +125,13 @@ def main() -> int:
         "option_hidden_dim": 64,
         "option_num_layers": 2,
         "option_memory_size": 64,
-        "initial_termination_probability": 0.05,
-        "initial_log_std": -0.7,
+        "initial_termination_probability": 0.27,
+        "initial_log_std": 0.0,
         "min_log_std": -2.5,
         "max_log_std": 0.0,
         "option_selector_temperature": 1.0,
+        "action_distribution": "mlagents_normal",
+        "action_transform": "clip_minus3_3_divide3",
         "actor": actor.state_dict(),
     }
     reloaded = networks.LearnedOptionActor.from_checkpoint(checkpoint, "cpu")
@@ -138,20 +153,31 @@ def main() -> int:
         option_hidden=64,
         option_num_layers=2,
         option_memory_size=64,
+        initial_log_std=-0.7,
         separate_selector=False,
+        epsilon_greedy_selector=False,
+        squash_actions=True,
     )
-    legacy_checkpoint = dict(checkpoint)
-    legacy_checkpoint["learned_option_critic_version"] = 2
-    legacy_checkpoint["option_value_temperature"] = (
-        legacy_checkpoint.pop("option_selector_temperature")
-    )
-    legacy_checkpoint["actor"] = legacy_actor.state_dict()
+    legacy_checkpoint = {
+        **checkpoint,
+        "learned_option_critic_version": 2,
+        "obs_dim": 24,
+        "discrete": False,
+        "num_actions": 2,
+        "act_dim": 2,
+        "option_value_temperature": 1.0,
+        "initial_log_std": -0.7,
+        "action_distribution": "tanh_squashed_normal",
+        "action_transform": "identity_normalized",
+        "actor": legacy_actor.state_dict(),
+    }
     loaded_legacy = networks.LearnedOptionActor.from_checkpoint(
         legacy_checkpoint,
         "cpu",
     )
+    legacy_obs = torch.randn(3, 5, 24)
     with torch.no_grad():
-        legacy_outputs = loaded_legacy.forward_sequence(obs)
+        legacy_outputs = loaded_legacy.forward_sequence(legacy_obs)
     _require(
         torch.equal(legacy_outputs[0], legacy_outputs[1]),
         "version-2 checkpoint no longer uses values as selector logits",
@@ -178,7 +204,6 @@ def main() -> int:
     )
 
     for output_id, label in (
-        (0, "option selector"),
         (1, "option value"),
         (2, "termination"),
         (3, "action"),
@@ -189,44 +214,95 @@ def main() -> int:
     with torch.no_grad():
         actor.attention_head.weight.zero_()
         actor.attention_head.bias.fill_(12.0)
-        open_outputs = actor.forward_sequence(obs)[0]
+        open_outputs = actor.forward_sequence(obs)[1]
         actor.attention_head.bias.fill_(-12.0)
-        closed_outputs = actor.forward_sequence(obs)[0]
+        closed_outputs = actor.forward_sequence(obs)[1]
     _require(
         not torch.allclose(open_outputs, closed_outputs, atol=1e-6),
-        "option selector is invariant to its attention mask",
+        "option values are invariant to their attention masks",
     )
     _require(
-        actor.selector_heads[0].weight.data_ptr()
-        != actor.option_value_heads[0].weight.data_ptr(),
-        "selector and value outputs share the same head",
+        not hasattr(actor, "selector_heads"),
+        "paper-aligned actor still contains a separate selector head",
+    )
+
+    option_scores = torch.tensor([[3.0, 2.0, 1.0, 0.0, -1.0, -2.0]])
+    epsilon_probs = actor.option_dist(option_scores, epsilon=0.2).probs
+    expected_probs = torch.full_like(option_scores, 0.2 / 6.0)
+    expected_probs[0, 0] += 0.8
+    _require(
+        torch.allclose(epsilon_probs, expected_probs),
+        "epsilon-soft Q_Omega policy has incorrect probabilities",
+    )
+    _require(
+        torch.allclose(
+            actor.option_dist(option_scores, epsilon=1.0).probs,
+            torch.full_like(option_scores, 1.0 / 6.0),
+        ),
+        "initial option exploration is not uniform",
+    )
+    counterfactual_values = torch.tensor([[12.0, 6.0, 3.0, 0.0, -3.0, -6.0]])
+    epsilon_value = actor.option_state_value(
+        option_scores,
+        counterfactual_values,
+        epsilon=0.2,
+    )
+    expected_value = (expected_probs * counterfactual_values).sum(dim=-1)
+    _require(
+        torch.allclose(epsilon_value, expected_value),
+        "V_Omega is not the epsilon-soft option-policy expectation",
+    )
+    _require(
+        not torch.allclose(epsilon_value, counterfactual_values.max(dim=-1).values),
+        "termination reselection silently uses a hard maximum",
     )
 
     selected = torch.arange(3).view(3, 1).expand(3, 5) % 6
-    action_dist = actor.selected_action_dist(means, stds, selected)
+    action_dist = actor.selected_action_dist(
+        action_means,
+        action_stds,
+        selected,
+    )
     actions = action_dist.sample()
     log_probs = action_dist.log_prob(actions)
-    _require(bool((actions.abs() < 1.0).all()), "squashed actions left [-1, 1]")
+    _require(
+        isinstance(action_dist, torch.distributions.Normal),
+        "new OC2 intra-option policy is not a diagonal Gaussian",
+    )
+    _require(
+        actions.shape == (3, 5, 2),
+        "learned intra-option policy did not produce two wheel commands",
+    )
     _require(bool(torch.isfinite(log_probs).all()), "non-finite action log probability")
+    _require(
+        not torch.allclose(action_means[..., 0, :], action_means[..., 1, :]),
+        "different options share an identical wheel-policy output",
+    )
+    normalized_actions = actions.clamp(-3.0, 3.0) / 3.0
+    _require(
+        bool((normalized_actions.abs() <= 1.0).all()),
+        "OC2 actuator transform produced an invalid wheel command",
+    )
 
     initial_actor = networks.LearnedOptionActor(
         24, 2, 6,
-        initial_termination_probability=0.05,
+        initial_termination_probability=0.27,
+        initial_log_std=0.0,
     )
     with torch.no_grad():
         initial_beta = torch.sigmoid(
-        initial_actor.forward_sequence(torch.zeros(2, 1, 24))[2]
+            initial_actor.forward_sequence(torch.zeros(2, 1, 24))[2]
         ).mean()
     _require(
-        abs(float(initial_beta) - 0.05) < 1e-5,
-        f"termination initialization is {float(initial_beta):.6f}, not 0.05",
+        abs(float(initial_beta) - 0.27) < 1e-5,
+        f"termination initialization is {float(initial_beta):.6f}, not 0.27",
     )
 
     good_logit = torch.tensor(0.0, requires_grad=True)
     good_loss = networks.termination_objective(
         good_logit.sigmoid(),
         torch.tensor(1.0),
-        0.01,
+        0.0,
         torch.tensor(1.0),
     )
     good_loss.backward()
@@ -238,39 +314,13 @@ def main() -> int:
     bad_loss = networks.termination_objective(
         bad_logit.sigmoid(),
         torch.tensor(-1.0),
-        0.01,
+        0.0,
         torch.tensor(1.0),
     )
     bad_loss.backward()
     _require(
         float(bad_logit.grad) < 0.0,
         "an inferior option is not encouraged to terminate",
-    )
-
-    saturated_logit = torch.tensor(-20.0, requires_grad=True)
-    prior_loss = functional.binary_cross_entropy_with_logits(
-        saturated_logit,
-        torch.tensor(0.05),
-    )
-    prior_loss.backward()
-    _require(
-        float(saturated_logit.grad) < -0.01,
-        "termination prior has no recovery gradient near beta=0",
-    )
-
-    collapsed_logits = torch.tensor(
-        [[4.0, 0.0, 0.0, 0.0, 0.0, 0.0]],
-        requires_grad=True,
-    )
-    collapsed_probs = collapsed_logits.softmax(dim=-1).mean(dim=0)
-    balance_loss = (
-        collapsed_probs
-        * (collapsed_probs.clamp_min(1e-8).log() + torch.log(torch.tensor(6.0)))
-    ).sum()
-    balance_loss.backward()
-    _require(
-        float(collapsed_logits.grad.abs().sum()) > 0.0,
-        "option balance has no gradient for a collapsed selector",
     )
 
     # PPO must compare every recurrent minibatch with one immutable policy
@@ -297,10 +347,10 @@ def main() -> int:
             reference_replay[3], reference_replay[4], replay_options
         ).log_prob(replay_actions)
         current_option_log_probs = actor.option_dist(
-            current_replay[0]
+            current_replay[1], epsilon=0.2,
         ).log_prob(replay_options)
         reference_option_log_probs = reference_actor.option_dist(
-            reference_replay[0]
+            reference_replay[1], epsilon=0.2,
         ).log_prob(replay_options)
     _require(
         torch.allclose(current_action_log_probs, reference_action_log_probs),
@@ -325,11 +375,13 @@ def main() -> int:
     )
 
     print("OC2 architecture validation passed:")
-    print("  selector, option value, action, and termination use attention")
+    print("  Q_Omega, action, and termination outputs use attention")
+    print("  option choice is epsilon-soft over attended Q_Omega values")
+    print("  V_Omega uses the epsilon-soft policy expectation, not a hard max")
     print("  recurrent memory is separated by option and packed for rollout storage")
-    print("  tanh-squashed actions and corrected log probabilities are finite")
+    print("  all six intra-option policies learn two continuous wheel commands")
+    print("  new policies use the ML-Agents Gaussian and actuator transform")
     print("  termination gradient has the Option-Critic continuation/switch signs")
-    print("  anti-collapse priors retain gradients at degenerate policies")
     print("  frozen recurrent PPO reference is exact and immutable")
     print("  legacy version-2 actors remain loadable for evaluation")
     return 0

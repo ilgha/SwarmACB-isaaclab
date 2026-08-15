@@ -1593,6 +1593,16 @@ def _load_policy_actor(
         "num_options": num_options,
         "act_dim": act_dim,
         "memory_size": memory_size,
+        "option_epsilon": float(
+            ckpt.get(
+                "current_option_epsilon",
+                ckpt.get("option_epsilon_final", 0.1),
+            )
+        ),
+        "action_transform": ckpt.get(
+            "action_transform",
+            "identity_normalized",
+        ),
     }
     return actor, meta
 
@@ -1955,8 +1965,8 @@ def main():
                 with torch.no_grad():
                     if policy_meta["trainer_type"] == "learned_option_critic":
                         (
-                            selector_logits,
-                            _option_values,
+                            _selector_logits,
+                            option_values,
                             termination_logits,
                             action_means,
                             action_stds,
@@ -1968,10 +1978,13 @@ def main():
                             policy_memory[1].detach(),
                         )
                         if args.deterministic:
-                            proposed = selector_logits.argmax(dim=-1)
+                            proposed = option_values.argmax(dim=-1)
                         else:
                             proposed = policy_actor.option_dist(
-                                selector_logits,
+                                option_values,
+                                epsilon=float(
+                                    policy_meta["option_epsilon"]
+                                ),
                             ).sample()
 
                         force_new = policy_current_options < 0
@@ -1996,14 +2009,20 @@ def main():
                             action_stds,
                             policy_current_options,
                         )
-                        normalized_actions = (
+                        wheel_actions = (
                             action_dist.mean
                             if args.deterministic
                             else action_dist.sample()
                         )
-                        wheel_actions = normalized_actions.view(
-                            1, N, 2,
-                        ).cpu()
+                        action_transform = policy_meta["action_transform"]
+                        if action_transform == "clip_minus3_3_divide3":
+                            wheel_actions = wheel_actions.clamp(-3.0, 3.0) / 3.0
+                        elif action_transform != "identity_normalized":
+                            raise RuntimeError(
+                                "Unsupported learned Option-Critic action "
+                                f"transform {action_transform!r}."
+                            )
+                        wheel_actions = wheel_actions.view(1, N, 2).cpu()
                         policy_left_cmd = (
                             wheel_actions[:, :, 0] * env.max_speed
                         )

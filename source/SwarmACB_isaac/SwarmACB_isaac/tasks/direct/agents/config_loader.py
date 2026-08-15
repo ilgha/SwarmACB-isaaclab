@@ -126,6 +126,9 @@ def load_config(path: str | Path) -> tuple[str, str, Any, dict[str, Any]]:
         "matmul_precision": "matmul_precision",
         "option_value_temperature": "option_selector_temperature",
         "option_selector_temperature": "option_selector_temperature",
+        "option_epsilon_start": "option_epsilon_start",
+        "option_epsilon_final": "option_epsilon_final",
+        "option_epsilon_decay_fraction": "option_epsilon_decay_fraction",
     }
     for yaml_key, config_key in option_critic_hyperparameters.items():
         if hasattr(cfg, config_key):
@@ -139,6 +142,11 @@ def load_config(path: str | Path) -> tuple[str, str, Any, dict[str, Any]]:
     cfg.lr_schedule = hypers.get("learning_rate_schedule", "constant")
     cfg.eps_schedule = hypers.get("epsilon_schedule", "constant")
     cfg.beta_schedule = hypers.get("beta_schedule", "constant")
+    if hasattr(cfg, "option_epsilon_schedule"):
+        cfg.option_epsilon_schedule = hypers.get(
+            "option_epsilon_schedule",
+            cfg.option_epsilon_schedule,
+        )
 
     # Unity passes one NetworkSettings object to actor and critic. Optional
     # critic_settings values override that shared architecture explicitly.
@@ -233,24 +241,43 @@ def print_config(run_name: str, variant: str, cfg: Any, env_ov: dict):
                 "    initial_termination : "
                 f"{cfg.initial_termination_probability}"
             )
+            if (
+                cfg.termination_prior_coef == 0.0
+                and cfg.termination_prior_final_coef == 0.0
+            ):
+                print("    termination_prior   : disabled")
+            else:
+                print(
+                    "    termination_prior   : "
+                    f"p={cfg.termination_prior_probability}, "
+                    f"coef={cfg.termination_prior_coef} -> "
+                    f"{cfg.termination_prior_final_coef}"
+                )
             print(
-                "    termination_prior   : "
-                f"p={cfg.termination_prior_probability}, "
-                f"coef={cfg.termination_prior_coef} -> "
-                f"{cfg.termination_prior_final_coef}"
+                "    learned_options     : "
+                f"{cfg.num_options} continuous wheel policies"
             )
             print(
-                f"    action_log_std      : {cfg.initial_log_std} "
-                f"[{cfg.min_log_std}, {cfg.max_log_std}]"
+                "    action_log_std      : "
+                f"{cfg.initial_log_std} (one learned pair per option)"
             )
             print(
-                "    option_temperature  : "
-                f"{cfg.option_selector_temperature}"
+                "    option_exploration  : "
+                f"epsilon={cfg.option_epsilon_start} -> "
+                f"{cfg.option_epsilon_final} "
+                f"({cfg.option_epsilon_schedule}, first "
+                f"{100.0 * cfg.option_epsilon_decay_fraction:g}% of training)"
             )
             print(f"    actor_learning_rate : {cfg.actor_lr}")
             print(f"    actor_max_grad_norm : {cfg.actor_max_grad_norm}")
             print(f"    target_kl           : {cfg.target_kl}")
             print(f"    adaptive_actor_lr   : {cfg.adaptive_actor_lr}")
+            print(
+                "    actor_lr_scale      : "
+                f"min={cfg.actor_lr_scale_min}, "
+                f"decay={cfg.actor_lr_decay_factor}, "
+                f"recovery={cfg.actor_lr_recovery_factor}"
+            )
             print(f"    fused_optimizer     : {cfg.fused_optimizer}")
             print(f"    matmul_precision    : {cfg.matmul_precision}")
     print(f"  Network")

@@ -7,46 +7,44 @@ behaviors:
     trainer_type: learned_option_critic
 
     hyperparameters:
-      batch_size: 4096
+      batch_size: 2048
       buffer_size: 20480
       learning_rate: 0.0003
-      beta: 0.001
+      beta: 0.005
       epsilon: 0.2
       lambd: 0.95
       num_epoch: 3
       intra_option_coef: 1.0
-      selector_coef: 1.0
-      local_option_value_coef: 0.1
-      option_entropy_coef: 0.005
-      option_balance_coef: 0.001
-      option_balance_final_coef: 0.0001
+      selector_coef: 0.0
+      local_option_value_coef: 0.5
+      option_entropy_coef: 0.0
+      option_balance_coef: 0.0
+      option_balance_final_coef: 0.0
       termination_penalty: 0.0
       termination_coef: 1.0
       termination_entropy_coef: 0.0
-      initial_termination_probability: 0.05
+      initial_termination_probability: 0.27
       termination_prior_probability: 0.05
-      termination_prior_coef: 0.001
-      termination_prior_final_coef: 0.0001
+      termination_prior_coef: 0.0
+      termination_prior_final_coef: 0.0
       value_coef: 0.5
       action_baseline_coef: 0.25
       option_value_coef: 0.5
       option_baseline_coef: 0.25
-      attention_diversity_coef: 0.01
-      attention_temporal_coef: 0.01
-      initial_log_std: -0.7
-      min_log_std: -2.5
-      max_log_std: 0.0
+      attention_diversity_coef: 0.002
+      attention_temporal_coef: 0.001
+      initial_log_std: 0.0
       max_grad_norm: 10.0
-      actor_learning_rate: 0.0001
+      actor_learning_rate: 0.0003
       actor_max_grad_norm: 1.0
       target_kl: 0.01
-      adaptive_actor_lr: true
-      actor_lr_scale_min: 0.05
-      actor_lr_decay_factor: 1.5
-      actor_lr_recovery_factor: 1.05
+      adaptive_actor_lr: false
       fused_optimizer: true
       matmul_precision: high
-      option_selector_temperature: 1.0
+      option_epsilon_start: 1.0
+      option_epsilon_final: 0.1
+      option_epsilon_schedule: linear
+      option_epsilon_decay_fraction: 0.1
       learning_rate_schedule: linear
       epsilon_schedule: linear
       beta_schedule: linear
@@ -54,17 +52,17 @@ behaviors:
     network_settings:
       hidden_units: 128
       num_layers: 1
-      option_hidden_units: 512
-      option_num_layers: 2
+      option_hidden_units: 128
+      option_num_layers: 1
       num_options: 6
       memory:
         memory_size: 128
-        option_memory_size: 64
+        option_memory_size: 128
         sequence_length: 128
 
     critic_settings:
-      hidden_units: 512
-      num_layers: 2
+      hidden_units: 128
+      num_layers: 1
       num_heads: 4
 
     reward_signals:

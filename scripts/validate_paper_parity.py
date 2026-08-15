@@ -108,7 +108,7 @@ def audit_config(
     )
 
     hyper = block.get("hyperparameters", {})
-    expected_batch_size = 4096 if learned_oc else 2048
+    expected_batch_size = 2048
     audit.equal(
         f"{prefix}.batch_size",
         hyper.get("batch_size"),
@@ -130,42 +130,44 @@ def audit_config(
         audit.equal(f"{prefix}.num_options", network.get("num_options"), 6)
     if learned_oc:
         learned_defaults = {
-            "beta": 0.001,
+            "beta": 0.005,
             "intra_option_coef": 1.0,
-            "selector_coef": 1.0,
-            "local_option_value_coef": 0.1,
-            "option_entropy_coef": 0.005,
-            "option_balance_coef": 0.001,
-            "option_balance_final_coef": 0.0001,
+            "selector_coef": 0.0,
+            "local_option_value_coef": 0.5,
+            "option_entropy_coef": 0.0,
+            "option_balance_coef": 0.0,
+            "option_balance_final_coef": 0.0,
             "termination_penalty": 0.0,
             "termination_coef": 1.0,
             "termination_entropy_coef": 0.0,
-            "initial_termination_probability": 0.05,
+            "initial_termination_probability": 0.27,
             "termination_prior_probability": 0.05,
-            "termination_prior_coef": 0.001,
-            "termination_prior_final_coef": 0.0001,
+            "termination_prior_coef": 0.0,
+            "termination_prior_final_coef": 0.0,
             "action_baseline_coef": 0.25,
             "option_baseline_coef": 0.25,
-            "attention_diversity_coef": 0.01,
-            "attention_temporal_coef": 0.01,
-            "initial_log_std": -0.7,
-            "min_log_std": -2.5,
-            "max_log_std": 0.0,
+            "attention_diversity_coef": 0.002,
+            "attention_temporal_coef": 0.001,
+            "initial_log_std": 0.0,
             "max_grad_norm": 10.0,
-            "actor_learning_rate": 0.0001,
+            "actor_learning_rate": 0.0003,
             "actor_max_grad_norm": 1.0,
             "target_kl": 0.01,
-            "actor_lr_scale_min": 0.05,
-            "actor_lr_decay_factor": 1.5,
-            "actor_lr_recovery_factor": 1.05,
-            "option_selector_temperature": 1.0,
+            "option_epsilon_start": 1.0,
+            "option_epsilon_final": 0.1,
+            "option_epsilon_decay_fraction": 0.1,
         }
         for key, expected in learned_defaults.items():
             audit.close(f"{prefix}.{key}", hyper.get(key), expected)
         audit.equal(
             f"{prefix}.adaptive_actor_lr",
             hyper.get("adaptive_actor_lr"),
-            True,
+            False,
+        )
+        audit.equal(
+            f"{prefix}.option_epsilon_schedule",
+            hyper.get("option_epsilon_schedule"),
+            "linear",
         )
         audit.equal(
             f"{prefix}.fused_optimizer",
@@ -180,12 +182,12 @@ def audit_config(
         audit.equal(
             f"{prefix}.option_hidden_units",
             network.get("option_hidden_units"),
-            512,
+            128,
         )
         audit.equal(
             f"{prefix}.option_num_layers",
             network.get("option_num_layers"),
-            2,
+            1,
         )
     if memory is None:
         audit.equal(f"{prefix}.memory", network.get("memory"), None)
@@ -197,7 +199,7 @@ def audit_config(
             audit.equal(
                 f"{prefix}.option_memory_size",
                 memory_block.get("option_memory_size"),
-                64,
+                128,
             )
 
     # Exercise the exact dependency-free resolver used by config_loader.py.
@@ -215,9 +217,9 @@ def audit_config(
     if is_oc:
         resolved.num_options = 6
     if learned_oc:
-        resolved.option_hidden_dim = 512
-        resolved.option_num_layers = 2
-        resolved.option_memory_size = 64
+        resolved.option_hidden_dim = 128
+        resolved.option_num_layers = 1
+        resolved.option_memory_size = 128
     network_config.apply_network_settings(
         resolved,
         network,
@@ -227,8 +229,8 @@ def audit_config(
     )
     audit.equal(f"{prefix}.resolved_actor_hidden", resolved.hidden_dim, hidden)
     audit.equal(f"{prefix}.resolved_actor_layers", resolved.num_layers, layers)
-    expected_critic_hidden = 512 if learned_oc else hidden
-    expected_critic_layers = 2 if learned_oc else layers
+    expected_critic_hidden = hidden
+    expected_critic_layers = layers
     audit.equal(
         f"{prefix}.resolved_critic_hidden",
         resolved.critic_hidden_dim,
@@ -254,17 +256,17 @@ def audit_config(
         audit.equal(
             f"{prefix}.resolved_option_hidden",
             resolved.option_hidden_dim,
-            512,
+            128,
         )
         audit.equal(
             f"{prefix}.resolved_option_layers",
             resolved.option_num_layers,
-            2,
+            1,
         )
         audit.equal(
             f"{prefix}.resolved_option_memory",
             resolved.option_memory_size,
-            64,
+            128,
         )
 
     reward = block.get("reward_signals", {}).get("extrinsic", {})

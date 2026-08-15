@@ -329,6 +329,11 @@ def main():
         env_cfg.update_variant(variant)
     checkpoint_trainer_type = ckpt_meta.get("trainer_type", "poca")
     if checkpoint_trainer_type == "learned_option_critic":
+        if bool(ckpt_meta.get("discrete", False)):
+            raise RuntimeError(
+                "This checkpoint selects predefined behavior modules and is "
+                "not a valid OC2 learned-options checkpoint."
+            )
         if not hasattr(env_cfg, "use_continuous_actions"):
             raise ValueError(
                 f"Task {task_id} does not expose the continuous primitive "
@@ -377,6 +382,11 @@ def main():
     num_layers = ckpt.get("num_layers", 2)
     num_actions = ckpt.get("num_actions", 6)
     num_options = ckpt.get("num_options", num_actions)
+    option_epsilon = float(ckpt.get(
+        "current_option_epsilon",
+        ckpt.get("option_epsilon_final", 0.1),
+    ))
+    action_transform = ckpt.get("action_transform", "identity_normalized")
     recurrent = bool(ckpt.get("recurrent", False))
     memory_size = checkpoint_memory_size(ckpt)
     if (
@@ -530,8 +540,8 @@ def main():
                     obs_stacked.shape[-1],
                 )
                 (
-                    selector_logits,
-                    _option_values,
+                    _selector_logits,
+                    option_values,
                     termination_logits,
                     action_means,
                     action_stds,
@@ -542,9 +552,12 @@ def main():
                 memory_c = next_memory[1].detach()
 
                 if args.deterministic:
-                    proposed = selector_logits.argmax(dim=-1)
+                    proposed = option_values.argmax(dim=-1)
                 else:
-                    proposed = actor.option_dist(selector_logits).sample()
+                    proposed = actor.option_dist(
+                        option_values,
+                        epsilon=option_epsilon,
+                    ).sample()
                 proposed = proposed.view(num_envs, len(agents))
 
                 force_new = current_options < 0
@@ -573,12 +586,19 @@ def main():
                     action_stds,
                     current_options.reshape(-1),
                 )
-                normalized_actions = (
+                raw_actions = (
                     action_dist.mean
                     if args.deterministic
                     else action_dist.sample()
                 )
-                all_actions = normalized_actions.view(
+                if action_transform == "clip_minus3_3_divide3":
+                    raw_actions = raw_actions.clamp(-3.0, 3.0) / 3.0
+                elif action_transform != "identity_normalized":
+                    raise RuntimeError(
+                        "Unsupported learned Option-Critic action transform "
+                        f"{action_transform!r}."
+                    )
+                all_actions = raw_actions.view(
                     num_envs,
                     len(agents),
                     act_dim,
