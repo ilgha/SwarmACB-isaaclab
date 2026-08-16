@@ -347,6 +347,16 @@ to `OC2-2_<mission>_cyclamen_aoc_hpc_<seed>`. For example:
 sbatch scripts/hpc/train_oc2_2_dirgate.slurm
 ```
 
+HPC training uses the base Isaac Sim SIF plus the bound repository and
+`.syslibs`; it does not mount the legacy ext3 overlay by default. This avoids
+intermittent `fuse2fs failed to mount ... in 10s` failures when many array jobs
+start together. The common launcher retries failures that happen before the
+container command starts (five attempts by default), while Python or training
+failures are reported immediately and are never restarted. Override the launch
+policy with `APPTAINER_LAUNCH_ATTEMPTS` and `APPTAINER_RETRY_DELAY`. A custom
+image that genuinely needs the old overlay can opt in with
+`HPC_USE_OVERLAY=1` and, optionally, `OVERLAY=/path/to/overlay.img`.
+
 Or override the task and variant from the command line:
 
 ```bash
@@ -641,11 +651,12 @@ python scripts/validate_paper_parity.py
 python scripts/validate_oc2_architecture.py
 ```
 
-The first command validates all 35 YAML files, experiment budgets, resolved
+The first command validates all 40 YAML files, experiment budgets, resolved
 network sizes, recurrent semantics, and sensitive mission constants. The OC2
 validator additionally checks tensor shapes, recurrent step/sequence parity,
-attention gradients to all option outputs, six continuous wheel policies,
-the signs of the termination theorem, and exact immutable frozen-policy replay.
+attention gradients to all option outputs, two- and six-option continuous wheel
+policies, the signs of the termination theorem, and exact immutable
+frozen-policy replay.
 
 The HPC array launcher passes `SLURM_ARRAY_TASK_ID` as `--seed`, so the ten
 controllers use reproducible seeds 0 through 9. Training also follows the
