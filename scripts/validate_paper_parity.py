@@ -86,6 +86,7 @@ def audit_config(
     audit: Audit,
     network_config,
     learned_oc: bool = False,
+    num_options: int = 6,
 ) -> None:
     run_name, block = one_behavior(path, audit)
     prefix = path.name
@@ -127,7 +128,11 @@ def audit_config(
     audit.equal(f"{prefix}.hidden_units", network.get("hidden_units"), hidden)
     audit.equal(f"{prefix}.num_layers", network.get("num_layers"), layers)
     if is_oc:
-        audit.equal(f"{prefix}.num_options", network.get("num_options"), 6)
+        audit.equal(
+            f"{prefix}.num_options",
+            network.get("num_options"),
+            num_options,
+        )
     if learned_oc:
         learned_defaults = {
             "beta": 0.005,
@@ -215,7 +220,7 @@ def audit_config(
         sequence_length=128,
     )
     if is_oc:
-        resolved.num_options = 6
+        resolved.num_options = num_options
     if learned_oc:
         resolved.option_hidden_dim = 128
         resolved.option_num_layers = 1
@@ -251,7 +256,11 @@ def audit_config(
             memory[1],
         )
     if is_oc:
-        audit.equal(f"{prefix}.resolved_num_options", resolved.num_options, 6)
+        audit.equal(
+            f"{prefix}.resolved_num_options",
+            resolved.num_options,
+            num_options,
+        )
     if learned_oc:
         audit.equal(
             f"{prefix}.resolved_option_hidden",
@@ -455,6 +464,18 @@ def main() -> int:
             audit,
             network_config,
             learned_oc=True,
+        )
+        two_option_filename = f"OC2-2_{mission}_cyclamen.yaml"
+        expected_files.add(two_option_filename)
+        audit_config(
+            config_dir / two_option_filename,
+            mission,
+            "cyclamen",
+            True,
+            audit,
+            network_config,
+            learned_oc=True,
+            num_options=2,
         )
 
     actual_files = {path.name for path in config_dir.glob("*.yaml")}

@@ -128,9 +128,11 @@ working name `OC2_cyclamen`. Phase 1 treats each behavior module as one fixed
 option. Phase 2 removes those predefined modules from the action path and
 learns every option end to end from sensors to the two wheel commands.
 `network_settings.num_options` controls the number of learned options; the
-initial benchmark learns six. The `cyclamen` name denotes the recurrent,
-decentralized actor and collective counterfactual lineage, not reuse of
-Cyclamen's behavior modules.
+original OC2 benchmark learns six. `OC2-2` is the controlled two-option
+ablation: it changes only `num_options` while preserving the architecture,
+optimizer, exploration schedule, mission budget, and counterfactual losses.
+The `cyclamen` name denotes the recurrent, decentralized actor and collective
+counterfactual lineage, not reuse of Cyclamen's behavior modules.
 
 OC2 architecture version 4 follows Attention Option-Critic (AOC). For robot
 `i` and option `omega`:
@@ -317,6 +319,16 @@ python scripts/train.py --config configs/OC2_Foraging_cyclamen.yaml --headless
 python scripts/train.py --config configs/OC2_Sheltering_cyclamen.yaml --headless
 ```
 
+Run the otherwise identical two-option ablation with the `OC2-2` configs:
+
+```bash
+python scripts/train.py --config configs/OC2-2_DirGate_cyclamen.yaml --headless
+python scripts/train.py --config configs/OC2-2_XOR_cyclamen.yaml --headless
+python scripts/train.py --config configs/OC2-2_Homing_cyclamen.yaml --headless
+python scripts/train.py --config configs/OC2-2_Foraging_cyclamen.yaml --headless
+python scripts/train.py --config configs/OC2-2_Sheltering_cyclamen.yaml --headless
+```
+
 Submit ten independent Phase 2 designs per mission on the cluster with
 `scripts/hpc/train_oc2_<mission>.slurm`, for example:
 
@@ -327,6 +339,13 @@ sbatch scripts/hpc/train_oc2_dirgate.slurm
 The corrected launchers write to `OC2_<mission>_cyclamen_aoc_hpc_<seed>`
 run and checkpoint directories so their fresh experiments cannot mix with
 legacy OC2 TensorBoard events or checkpoints.
+
+The OC2-2 launchers follow `scripts/hpc/train_oc2_2_<mission>.slurm` and write
+to `OC2-2_<mission>_cyclamen_aoc_hpc_<seed>`. For example:
+
+```bash
+sbatch scripts/hpc/train_oc2_2_dirgate.slurm
+```
 
 Or override the task and variant from the command line:
 
@@ -546,7 +565,9 @@ behaviors:
 ```
 
 Learned-option Phase 2 configs use `trainer_type: learned_option_critic`.
-`num_options` controls the number of policies learned from scratch:
+`num_options` controls the number of policies learned from scratch. The
+six-option OC2 configs set it to `6`; the controlled OC2-2 configs set it to
+`2` and leave every other field unchanged:
 
 ```yaml
 behaviors:

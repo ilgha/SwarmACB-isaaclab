@@ -374,12 +374,53 @@ def main() -> int:
         "frozen PPO reference shares mutable actor parameters",
     )
 
+    # The OC2-2 experiment is an option-count ablation of this same actor,
+    # not a separate algorithm or checkpoint schema.
+    two_option_actor = networks.LearnedOptionActor(
+        obs_dim=24,
+        act_dim=2,
+        num_options=2,
+        hidden=128,
+        num_layers=1,
+        memory_size=128,
+        option_hidden=128,
+        option_num_layers=1,
+        option_memory_size=128,
+        initial_termination_probability=0.27,
+        initial_log_std=0.0,
+        squash_actions=False,
+    )
+    with torch.no_grad():
+        two_option_outputs = two_option_actor.forward_sequence(obs)
+    _require(
+        two_option_outputs[1].shape == (3, 5, 2),
+        "OC2-2 produced an invalid option-value shape",
+    )
+    _require(
+        two_option_outputs[2].shape == (3, 5, 2),
+        "OC2-2 produced an invalid termination shape",
+    )
+    _require(
+        two_option_outputs[3].shape == (3, 5, 2, 2),
+        "OC2-2 did not produce two independent two-wheel policies",
+    )
+    two_option_scores = torch.tensor([[2.0, -1.0]])
+    two_option_probs = two_option_actor.option_dist(
+        two_option_scores,
+        epsilon=0.2,
+    ).probs
+    _require(
+        torch.allclose(two_option_probs, torch.tensor([[0.9, 0.1]])),
+        "OC2-2 epsilon-soft option probabilities are incorrect",
+    )
+
     print("OC2 architecture validation passed:")
     print("  Q_Omega, action, and termination outputs use attention")
     print("  option choice is epsilon-soft over attended Q_Omega values")
     print("  V_Omega uses the epsilon-soft policy expectation, not a hard max")
     print("  recurrent memory is separated by option and packed for rollout storage")
     print("  all six intra-option policies learn two continuous wheel commands")
+    print("  the same architecture resolves correctly for the OC2-2 ablation")
     print("  new policies use the ML-Agents Gaussian and actuator transform")
     print("  termination gradient has the Option-Critic continuation/switch signs")
     print("  frozen recurrent PPO reference is exact and immutable")
