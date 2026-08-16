@@ -48,9 +48,13 @@ trap 'rm -f "$START_MARKER"' EXIT
 APPTAINER_ARGS=(
     exec
     --nv
+    --cleanenv
     --writable-tmpfs
     --bind "$PROJECT_DIR:$PROJECT_DIR"
+    # ACCEPT_EULA is retained for container compatibility; Isaac Sim's Python
+    # bootstrap specifically checks OMNI_KIT_ACCEPT_EULA.
     --env ACCEPT_EULA=Y
+    --env OMNI_KIT_ACCEPT_EULA=YES
     --env "HPC_START_MARKER=$START_MARKER"
     --env "SWARM_PROJECT_DIR=$PROJECT_DIR"
     --env "SWARM_CONFIG_PATH=$CONFIG_PATH"
@@ -58,6 +62,10 @@ APPTAINER_ARGS=(
     --env "SWARM_CHECKPOINT_DIR=$CHECKPOINT_DIR"
     --env "SWARM_SEED=$RUN_SUFFIX"
 )
+
+if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+    APPTAINER_ARGS+=(--env "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES")
+fi
 
 OVERLAY_DESCRIPTION="disabled"
 case "$HPC_USE_OVERLAY" in
@@ -117,7 +125,8 @@ for ((attempt = 1; attempt <= APPTAINER_LAUNCH_ATTEMPTS; attempt++)); do
     echo "[HPC] Starting Apptainer (attempt $attempt/$APPTAINER_LAUNCH_ATTEMPTS)..."
 
     set +e
-    apptainer "${APPTAINER_ARGS[@]}" "$CONTAINER" bash -lc "$CONTAINER_COMMAND"
+    apptainer "${APPTAINER_ARGS[@]}" "$CONTAINER" \
+        bash --noprofile --norc -c "$CONTAINER_COMMAND"
     status=$?
     set -e
 

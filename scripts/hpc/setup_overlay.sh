@@ -23,12 +23,15 @@ echo "Persistent overlay: disabled"
 
 apptainer exec \
     --nv \
+    --cleanenv \
     --writable-tmpfs \
     --bind "$PROJECT_DIR:$PROJECT_DIR" \
+    --env ACCEPT_EULA=Y \
+    --env OMNI_KIT_ACCEPT_EULA=YES \
     --env "SWARM_PROJECT_DIR=$PROJECT_DIR" \
     --env "SWARM_LIBDIR=$LIBDIR" \
     "$CONTAINER" \
-    bash -lc '
+    bash --noprofile --norc -c '
         set -euo pipefail
         libpath="$SWARM_LIBDIR/usr/lib/x86_64-linux-gnu"
 

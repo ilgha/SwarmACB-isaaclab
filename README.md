@@ -352,9 +352,11 @@ HPC training uses the base Isaac Sim SIF plus the bound repository and
 intermittent `fuse2fs failed to mount ... in 10s` failures when many array jobs
 start together. The common launcher retries failures that happen before the
 container command starts (five attempts by default), while Python or training
-failures are reported immediately and are never restarted. Override the launch
-policy with `APPTAINER_LAUNCH_ATTEMPTS` and `APPTAINER_RETRY_DELAY`. A custom
-image that genuinely needs the old overlay can opt in with
+failures are reported immediately and are never restarted. It also uses a clean
+container environment, preserves the allocated CUDA device, and accepts the
+Omniverse Kit EULA through `OMNI_KIT_ACCEPT_EULA`. Override the launch policy
+with `APPTAINER_LAUNCH_ATTEMPTS` and `APPTAINER_RETRY_DELAY`. A custom image
+that genuinely needs the old overlay can opt in with
 `HPC_USE_OVERLAY=1` and, optionally, `OVERLAY=/path/to/overlay.img`.
 
 Or override the task and variant from the command line:
