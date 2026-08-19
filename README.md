@@ -427,10 +427,10 @@ the default is stochastic playback, matching `scripts/play.py`.
 
 GUI playback keeps normal viewport fidelity by default: native resolution,
 scene materials, a 60 Hz swarm animation, and the terminal/editor status HUD.
-The lightweight viewer evaluates policies and sensor-dependent modules at the
-Unity-matching control frequency, normally 10 Hz, while retaining the last
-command between decisions. Sensor debug geometry is also refreshed at 10 Hz
-instead of rebuilding it every rendered frame.
+The lightweight viewer advances robot motion at 10 Hz. Policies make a new
+decision at 2 Hz, matching Unity's five-update `DecisionRequester` period, and
+the selected action is retained between decisions. Sensor debug geometry is
+refreshed at 10 Hz instead of rebuilding it every rendered frame.
 
 The default `--gui-performance-preset same` disables VSync/rate-limit sleeps and
 RTX eco mode without changing materials or resolution. The lightweight viewer
@@ -535,21 +535,22 @@ behaviors:
     time_horizon: 1000
     environment:
       num_envs: 5
-      decision_period: 1
+      decision_period: 5
       episode_length_s: 180.0
 ```
 
-The paper-parity clock is 10 Hz: Isaac runs with `dt: 0.1`, `decimation: 1`,
-and `decision_period: 1`. This gives 1200 decisions in a 120 s episode and
-1800 in a 180 s episode. It also makes Cyclamen's 128-sample recurrent window
-span 12.8 s, as reported in the paper. The `DecisionPeriod: 5` serialized in
-the available Unity prefab conflicts with all three paper constraints and is
-therefore treated as stale scene metadata.
+For paper-runtime parity, one Isaac environment update reproduces one Unity
+`FixedUpdate` displacement and the policy action is retained for five updates.
+This matches the serialized Epuck `DecisionRequester` (`DecisionPeriod: 5`) and
+the archived training logs, which report 239/359 completed policy decisions for
+1200/1800-update episodes. The `dt: 0.1` value keeps the benchmark's displayed
+duration at 120/180 seconds; `decision_period` controls the learned MDP cadence,
+not the number of environment updates.
 
 `max_steps` counts individual robot decisions, as ML-Agents does. With 20
-robots, five parallel environments, and 5000 total episodes, use 120,000,000
-for 120 s missions (Directional Gate and Homing) and 180,000,000 for 180 s
-missions (XOR, Foraging, and Sheltering).
+robots, five parallel environments, and 5000 episode cycles per environment,
+use 120,000,000 for 120 s missions (Directional Gate and Homing) and
+180,000,000 for 180 s missions (XOR, Foraging, and Sheltering).
 
 Fixed-option Option-Critic configs use the same layout with
 `trainer_type: option_critic`:
@@ -637,8 +638,8 @@ behaviors:
       num_heads: 4
 ```
 
-Paper-parity version 4 remains the Unity-matched architecture for classical
-Cyclamen and Phase 1. OC2 architecture version 4 is its hierarchical extension:
+Paper-parity version 5 is the Unity-matched timing and architecture for
+classical Cyclamen and Phase 1. OC2 architecture version 4 is its hierarchical extension:
 all actor, option, and critic paths use `128 x 1`, and learned intra-option
 policies independently produce the two primitive wheel commands. No predefined
 Cyclamen behavior module is called by OC2. Training checkpoints use schema

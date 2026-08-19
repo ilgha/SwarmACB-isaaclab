@@ -64,5 +64,5 @@ behaviors:
     # ── Environment (SwarmACB extensions) ───────────────────────
     environment:
       num_envs: 5               # parallel environments
-      decision_period: 1        # one decision per 0.1 s step (paper: 10 Hz)
+      decision_period: 5        # Unity DecisionRequester: one decision per 5 motion updates
       episode_length_s: 120.0   # seconds per episode

@@ -139,7 +139,8 @@ class LearnedOptionCriticConfig:
     seed: int = 0
 
     # Environment stepping.
-    decision_period: int = 1
+    # Preserve the five-update action period of the Unity Epuck prefab.
+    decision_period: int = 5
     reward_strength: float = 1.0
 
     # Networks.
@@ -2262,6 +2263,14 @@ class LearnedOptionCriticTrainer:
                 f"version {self.TRAINING_CHECKPOINT_VERSION}. The corrected "
                 "Attention Option-Critic objective requires a fresh training "
                 "run."
+            )
+        parity_version = int(checkpoint.get("paper_parity_version", 0))
+        if parity_version != PAPER_PARITY_VERSION:
+            raise RuntimeError(
+                f"Refusing to resume a parity-v{parity_version} OC2 "
+                f"checkpoint with the parity-v{PAPER_PARITY_VERSION} trainer. "
+                "The environment cadence or training semantics differ; start "
+                "a fresh run."
             )
         if (
             bool(checkpoint.get("discrete", False))

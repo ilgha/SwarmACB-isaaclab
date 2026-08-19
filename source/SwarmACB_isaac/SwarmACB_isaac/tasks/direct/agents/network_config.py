@@ -8,7 +8,7 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 
-PAPER_PARITY_VERSION = 4
+PAPER_PARITY_VERSION = 5
 
 
 def apply_network_settings(

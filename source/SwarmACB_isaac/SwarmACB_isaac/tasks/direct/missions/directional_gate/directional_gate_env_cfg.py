@@ -139,7 +139,8 @@ class DirectionalGateEnvCfg(DirectMARLEnvCfg):
     # Unity-style spawning rectangle, scaled by 0.1 from scene units.
     spawn_area_center: tuple = (0.0, 0.0)
     spawn_area_size: tuple = (2.4, 2.4)
-    spawn_circle_radius: float = 0.0
+    # DirGateEnvController rejects samples outside its 12-unit circle.
+    spawn_circle_radius: float = 1.2
     spawn_max_attempts: int = 100
 
     # Optional GUI sensor visualization for manual IsaacSim inspection.

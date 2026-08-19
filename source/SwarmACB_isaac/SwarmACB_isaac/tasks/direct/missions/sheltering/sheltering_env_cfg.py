@@ -18,6 +18,7 @@ class ShelteringEnvCfg(DirectionalGateEnvCfg):
     has_light: bool = True
     light_position: tuple = (0.0, -1.5, 0.0)
     spawn_area_size: tuple = (1.8, 1.8)
+    spawn_circle_radius: float = 0.0
 
     # Three-walled 0.50 m x 0.30 m shelter centered in the arena.
     # The south side is open and faces the red light.

@@ -43,5 +43,5 @@ behaviors:
 
     environment:
       num_envs: 5
-      decision_period: 1
+      decision_period: 5
       episode_length_s: 120.0

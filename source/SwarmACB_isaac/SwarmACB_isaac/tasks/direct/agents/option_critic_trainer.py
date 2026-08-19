@@ -76,7 +76,8 @@ class FixedOptionCriticConfig:
     seed: int = 0
 
     # Environment stepping
-    decision_period: int = 1
+    # Preserve the five-update action period of the Unity Epuck prefab.
+    decision_period: int = 5
     reward_strength: float = 1.0
 
     # Network

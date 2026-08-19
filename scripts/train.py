@@ -124,7 +124,7 @@ def main():
         cfg = POCAConfig(
             hidden_dim=args.hidden_dim or hd,
             num_layers=args.num_layers or nl,
-            decision_period=args.decision_period or 1,
+            decision_period=args.decision_period or 5,
             recurrent=(variant == "cyclamen"),
         )
         cfg.log_dir = f"runs/{run_name}"

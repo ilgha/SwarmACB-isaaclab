@@ -287,7 +287,7 @@ def audit_config(
     audit.equal(f"{prefix}.checkpoint_interval", block.get("checkpoint_interval"), interval)
 
     audit.equal(f"{prefix}.num_envs", environment.get("num_envs"), 5)
-    audit.equal(f"{prefix}.decision_period", environment.get("decision_period"), 1)
+    audit.equal(f"{prefix}.decision_period", environment.get("decision_period"), 5)
     audit.close(f"{prefix}.episode_length_s", environment.get("episode_length_s"), duration)
 
 
@@ -318,7 +318,7 @@ def function_call_count(path: Path, function_name: str) -> int:
 
 
 def audit_network_resolution(root: Path, network_config, audit: Audit) -> None:
-    audit.equal("paper parity version", network_config.PAPER_PARITY_VERSION, 4)
+    audit.equal("paper parity version", network_config.PAPER_PARITY_VERSION, 5)
 
     loader = (
         root
@@ -353,6 +353,50 @@ def audit_network_resolution(root: Path, network_config, audit: Audit) -> None:
     audit.equal("explicit critic heads override", override.critic_num_heads, 2)
 
 
+def audit_experiment_accounting(audit: Audit) -> None:
+    """Verify ML-Agents decision and episode accounting from the paper runs."""
+    motion_hz = 10
+    decision_period = 5
+    agents_per_env = 20
+    num_envs = 5
+    target_episode_cycles = 5000
+    buffer_size = 20_480
+
+    for mission, (_task, duration, max_steps, _interval) in MISSIONS.items():
+        motion_updates = int(duration * motion_hz)
+        decisions_per_episode = motion_updates // decision_period
+        total_decisions_per_cycle = (
+            decisions_per_episode * agents_per_env * num_envs
+        )
+        episode_cycles = max_steps // total_decisions_per_cycle
+
+        audit.equal(
+            f"{mission}.motion_updates_per_episode",
+            motion_updates,
+            1200 if duration == 120.0 else 1800,
+        )
+        audit.equal(
+            f"{mission}.decisions_per_robot_episode",
+            decisions_per_episode,
+            240 if duration == 120.0 else 360,
+        )
+        audit.equal(
+            f"{mission}.episode_cycles_per_environment",
+            episode_cycles,
+            target_episode_cycles,
+        )
+        audit.equal(
+            f"{mission}.first_update_experiences",
+            total_decisions_per_cycle,
+            24_000 if duration == 120.0 else 36_000,
+        )
+        audit.equal(
+            f"{mission}.episode_cycle_exceeds_buffer",
+            total_decisions_per_cycle > buffer_size,
+            True,
+        )
+
+
 def audit_environment_sources(root: Path, audit: Audit) -> None:
     missions = root / "source/SwarmACB_isaac/SwarmACB_isaac/tasks/direct/missions"
     directional = class_constants(
@@ -369,6 +413,7 @@ def audit_environment_sources(root: Path, audit: Audit) -> None:
         "rab_range": 0.60,
         "rab_loss_probability": 0.85,
         "light_position": (0.0, -1.5, 0.0),
+        "spawn_circle_radius": 1.2,
     }
     for name, expected in source_expectations.items():
         if isinstance(expected, tuple):
@@ -393,6 +438,7 @@ def audit_environment_sources(root: Path, audit: Audit) -> None:
             {
                 "episode_length_s": 180.0,
                 "spawn_area_size": (1.8, 1.8),
+                "spawn_circle_radius": 0.0,
                 "food_radius": 0.15,
                 "food_centers": ((-0.75, 0.0), (0.75, 0.0)),
                 "nest_top_y": -0.58,
@@ -404,9 +450,20 @@ def audit_environment_sources(root: Path, audit: Audit) -> None:
             {
                 "episode_length_s": 180.0,
                 "spawn_area_size": (1.8, 1.8),
+                "spawn_circle_radius": 0.0,
                 "shelter_center": (0.0, 0.0),
                 "shelter_size": (0.5, 0.3),
                 "light_position": (0.0, -1.5, 0.0),
+            },
+        ),
+        "xor_aggregation/xor_aggregation_env_cfg.py": (
+            "XorAggregationEnvCfg",
+            {
+                "episode_length_s": 180.0,
+                "spawn_area_size": (2.4, 2.4),
+                "spawn_circle_radius": 1.2,
+                "target_centers": ((-0.5, 0.0), (0.5, 0.0)),
+                "target_radius": 0.3,
             },
         ),
     }
@@ -430,6 +487,7 @@ def main() -> int:
     audit = Audit()
     network_config = load_network_config_module(root)
     audit_network_resolution(root, network_config, audit)
+    audit_experiment_accounting(audit)
 
     expected_files: set[str] = set()
     for mission in MISSIONS:
@@ -492,7 +550,11 @@ def main() -> int:
         f"Paper-parity audit passed: {len(expected_files)} configs, "
         f"{audit.checks} checks."
     )
-    print("Clock: 10 Hz | robots: 20 | envs: 5 | episodes/design: 5000")
+    print(
+        "Motion clock: 10 Hz | action period: 5 updates | "
+        "robots: 20 | envs: 5 | episode cycles/env: 5000"
+    )
+    print("PPO update: one complete episode cycle | 24k/36k experiences")
     print(
         f"Fresh paper-parity-v{network_config.PAPER_PARITY_VERSION} checkpoints "
         "are required for comparison."

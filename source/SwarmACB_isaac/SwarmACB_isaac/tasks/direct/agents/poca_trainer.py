@@ -76,7 +76,8 @@ class POCAConfig:
     seed: int = 0
 
     # Decision period
-    decision_period: int = 1
+    # The Unity Epuck prefab requests a policy decision every five motion updates.
+    decision_period: int = 5
 
     # Reward
     reward_strength: float = 1.0     # multiplier on extrinsic reward
@@ -371,13 +372,31 @@ class POCATrainer:
         # Print param count & batch info
         actor_params = sum(p.numel() for p in self.actor.parameters())
         critic_params = sum(p.numel() for p in self.critic.parameters())
-        rollout_experiences = c.horizon * self.num_envs * self.num_agents
+        episode_decisions = (
+            self.unwrapped.max_episode_length + self.decision_period - 1
+        ) // self.decision_period
+        if c.horizon >= episode_decisions:
+            experiences_per_episode_cycle = (
+                episode_decisions * self.num_envs * self.num_agents
+            )
+            cycles_per_update = max(
+                1,
+                c.buffer_size_hint // experiences_per_episode_cycle + 1,
+            )
+            rollout_experiences = (
+                cycles_per_update * experiences_per_episode_cycle
+            )
+            rollout_label = "expected update"
+        else:
+            rollout_experiences = c.horizon * self.num_envs * self.num_agents
+            rollout_label = "horizon segment"
         n_batches = (rollout_experiences + c.mini_batch_size - 1) // c.mini_batch_size
         print(f"[POCA] Actor params: {actor_params:,}  "
               f"Critic params: {critic_params:,}")
         print(f"[POCA] Mini-batch: {c.mini_batch_size} focal-agent transitions  "
               f"[{n_batches} batches/epoch x {c.num_epochs} epochs "
-              f"= {n_batches * c.num_epochs} updates/rollout]")
+              f"= {n_batches * c.num_epochs} optimizer steps/{rollout_label}; "
+              f"{rollout_experiences:,} samples]")
         print(f"[POCA] TensorBoard -> {c.log_dir}")
 
     # ──────────────────────────────────────────────────────────────
@@ -431,13 +450,12 @@ class POCATrainer:
         This matches ML-Agents' DecisionRequester behaviour:
         - Agent makes ONE decision (samples action from policy)
         - Environment is stepped decision_period times with that action
-        - Velocity is set ONCE on the first step; physics runs naturally after
+        - OnActionReceived receives the retained action on every update
         - Rewards are accumulated over all sub-steps
         - ONE transition is recorded in the buffer per decision
 
-        Without this, the buffer would store freshly-sampled actions that
-        the env never executed (it was using cached actions from 5 steps ago),
-        breaking the action↔reward correspondence that PPO requires.
+        Sampling every update instead would define a different, five-times
+        faster control MDP than the archived Unity experiments.
         """
         if reset_buffer:
             self.buffer.reset()
@@ -536,8 +554,8 @@ class POCATrainer:
                 env_actions = all_actions
 
             # ── step environment decision_period times ────────────
-            # Same action for all sub-steps; env applies velocity
-            # only on the first sub-step (decision step), then coasts.
+            # Same retained action for all sub-steps, matching
+            # TakeActionsBetweenDecisions on Unity's DecisionRequester.
             action_dict = {a: env_actions[:, i] for i, a in enumerate(agents)}
             accumulated_reward = torch.zeros(self.num_envs, device=self.device)
             last_done = torch.zeros(self.num_envs, device=self.device)
