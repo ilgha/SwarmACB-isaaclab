@@ -24,6 +24,7 @@ class LearnedOptionRolloutBuffer:
         gamma: float,
         lam: float,
         device: torch.device | str,
+        num_options: int = 6,
     ):
         self.horizon = int(horizon)
         self.num_envs = int(num_envs)
@@ -31,6 +32,7 @@ class LearnedOptionRolloutBuffer:
         self.obs_dim = int(obs_dim)
         self.state_dim = int(state_dim)
         self.act_dim = int(act_dim)
+        self.num_options = int(num_options)
         self.memory_size = int(memory_size)
         self.critic_memory_size = int(critic_memory_size)
         self.gamma = float(gamma)
@@ -47,6 +49,13 @@ class LearnedOptionRolloutBuffer:
 
         self.options = torch.zeros(
             time, envs, agents, dtype=torch.long, device=device,
+        )
+        self.next_options = torch.zeros_like(self.options)
+        self.next_option_probs = torch.zeros(
+            time, envs, agents, self.num_options, device=device,
+        )
+        self.next_options_valid = torch.zeros(
+            time, envs, dtype=torch.bool, device=device,
         )
         self.option_log_probs = torch.zeros(time, envs, agents, device=device)
         self.local_option_values = torch.zeros(time, envs, agents, device=device)
@@ -165,6 +174,9 @@ class LearnedOptionRolloutBuffer:
         self.critic_states[t] = critic_states
         self.next_critic_states[t] = next_critic_states
         self.options[t] = options.long()
+        self.next_options[t].zero_()
+        self.next_option_probs[t].zero_()
+        self.next_options_valid[t].zero_()
         self.option_log_probs[t] = option_log_probs
         self.local_option_values[t] = local_option_values
         self.option_masks[t] = option_masks
@@ -197,10 +209,27 @@ class LearnedOptionRolloutBuffer:
         self.option_baseline_memory_c[t] = option_baseline_memory_c
         self.ptr += 1
 
+    def set_next_options(
+        self,
+        t: int,
+        options: torch.Tensor,
+        selector_probs: torch.Tensor,
+    ):
+        """Record arrival choices, excluding observations from auto-reset episodes."""
+        if not 0 <= t < self.ptr:
+            raise IndexError(f"No rollout transition at index {t}")
+        active = ~self.dones[t].bool()
+        self.next_options[t] = torch.where(active[:, None], options, 0)
+        self.next_option_probs[t] = torch.where(
+            active[:, None, None], selector_probs, 0.0,
+        )
+        self.next_options_valid[t] = active
+
     def compute_returns_and_advantages(
         self,
-        last_team_value: torch.Tensor,
+        last_option_value: torch.Tensor,
     ):
+        """On-policy lambda returns on the augmented (state, joint option) process."""
         if self.ptr <= 0:
             return
 
@@ -210,7 +239,7 @@ class LearnedOptionRolloutBuffer:
         bootstrap_last = torch.where(
             done_last.bool(),
             boundary_last,
-            last_team_value,
+            last_option_value,
         )
         self.returns[last] = (
             self.rewards[last] + self.gamma * bootstrap_last
@@ -218,12 +247,12 @@ class LearnedOptionRolloutBuffer:
         for t in reversed(range(last)):
             done = self.dones[t]
             continuation = (
-                (1.0 - self.lam) * self.team_values[t + 1]
+                (1.0 - self.lam) * self.joint_option_values[t + 1]
                 + self.lam * self.returns[t + 1]
             )
             boundary = self.timeouts[t] * self.timeout_values[t]
             self.returns[t] = self.rewards[t] + self.gamma * (
-                (1.0 - done) * continuation + done * boundary
+                torch.where(done.bool(), boundary, continuation)
             )
 
         targets = self.returns[:self.ptr].unsqueeze(-1)
@@ -243,6 +272,9 @@ class LearnedOptionRolloutBuffer:
         time = self.ptr
         if time <= 0:
             return
+        missing = ~self.dones[:time].bool() & ~self.next_options_valid[:time]
+        if missing.any():
+            raise RuntimeError("OC2 rollout is missing next-option behavior context")
 
         envs, agents = self.num_envs, self.num_agents
         length = max(1, min(int(sequence_length), time))
@@ -317,6 +349,8 @@ class LearnedOptionRolloutBuffer:
                 "next_critic_states": stack_group("next_critic_states"),
                 "options": stack_focal("options"),
                 "critic_options": stack_group("options"),
+                "next_critic_options": stack_group("next_options"),
+                "next_option_probs": stack_focal("next_option_probs"),
                 "old_option_log_probs": stack_focal("option_log_probs"),
                 "old_local_option_values": stack_focal(
                     "local_option_values"

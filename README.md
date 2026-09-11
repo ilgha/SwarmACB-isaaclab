@@ -82,7 +82,7 @@ new intra-option motor policies yet. It learns:
 
 - a shared recurrent local policy over the six fixed options
 - a shared local per-option termination model
-- a centralized permutation-invariant team-value critic, `V(s)`
+- an auxiliary centralized permutation-invariant team-value critic, `V(s)`
 - a centralized permutation-invariant collective option critic,
   `Q_Omega(s, omega_vector)`
 - a centralized POCA-style counterfactual baseline for each robot
@@ -98,28 +98,60 @@ robot `i`, all peers keep their active modules fixed. The selector PPO advantage
 uses the learned POCA-style approximation:
 
 ```text
-A_i(s, omega_vector) = lambda_return(s) - b_i(s, omega_-i)
+A_i(s, omega_vector) = G_t - b_i(s, omega_-i)
 ```
 
-The termination update follows the Option-Critic arrival-state theorem. For the
-option vector executed at time `t`, the critic evaluates each of robot `i`'s six
-replacement options at `s_t+1` while the other robots' options stay fixed:
+**OC1 training schema 8** uses option-conditioned lambda returns, like corrected
+OC2. The next joint option vector is sampled from each robot's independent
+continue/reselect decision:
 
 ```text
-V_i(s_t+1, omega_-i) =
-  sum_omega_i pi_O(omega_i | h_i,t+1)
-    Q_Omega(s_t+1, (omega_-i, omega_i))
+T_i(k | h_i,t+1, omega_i) = (1 - beta_i,omega_i) * 1[k = omega_i]
+                          + beta_i,omega_i * pi_O(k | h_i,t+1)
+omega'_i ~ T_i
+G_t = r_t + gamma * [(1 - lambda) * Q_Omega(s_t+1, omega') + lambda * G_(t+1)]
+```
 
-A_i^term(s_t+1, omega_vector) =
-  Q_Omega(s_t+1, omega_vector) - V_i(s_t+1, omega_-i)
+The actual next choice is used within a rollout. Cutoffs use a virtual sample
+without advancing live recurrent memory; further collection replaces it with
+the actual next choice. Time limits bootstrap from captured pre-reset local
+observations and critic state, while true terminals do not bootstrap. The
+state-only `V(s)` remains an auxiliary value head, not the return bootstrap.
+
+For termination, the critic evaluates robot `i`'s six alternatives at `s_t+1`
+while holding its peers' **next sampled options** `omega'_-i` fixed. The focal
+selector probabilities are stored from collection, not recomputed after PPO
+updates. This is a sampled swarm extension of the arrival-state advantage:
+
+```text
+V_i(s_t+1, omega'_-i) = sum_k pi_O(k | h_i,t+1) *
+  Q_Omega(s_t+1, (omega'_-i, k))
+
+A_i^term = Q_Omega(s_t+1, (omega'_-i, omega_i)) - V_i(s_t+1, omega'_-i)
 ```
 
 The termination loss uses `A_i^term + xi`, where `xi` is configured as
 `termination_penalty`. A small positive value encourages temporally extended
-options. The six-way replacement calculation is linear in robots and options;
-it does not enumerate the collective joint-option space. Option selection
-remains a recurrent PPO policy trained at option boundaries, which is an
-SMDP-level policy-over-options implementation.
+options. The advantage is detached, and terminal transitions are masked out.
+The replacement calculation enumerates only six focal alternatives, not the
+collective joint-option space. Option selection remains a recurrent PPO policy
+trained at option boundaries.
+
+The six behavior modules, networks, PPO selector, regularization, and all five
+mission configurations are unchanged. Manager architecture version 7 remains
+playable; training schema 8 identifies the corrected targets. Older training
+checkpoints are rejected for resume, but their managers remain usable in play
+and evaluation scripts. Run from fresh weights in new output directories:
+
+```bash
+python scripts/train.py --config configs/OC_DirGate_cyclamen.yaml --headless --log_dir runs/OC_DirGate_cyclamen_v8_local --checkpoint_dir checkpoints/OC_DirGate_cyclamen_v8_local
+```
+
+The five `scripts/hpc/train_oc_<mission>.slurm` launchers now write to
+`OC_<mission>_cyclamen_v8_hpc_<seed>` to preserve the earlier OC1 results.
+These version numbers are specific to each trainer: corrected OC1 uses schema
+8, and corrected OC2 uses schema 7. Compare fresh seeds for both methods;
+corrected training signals do not guarantee a higher score or diverse options.
 
 ## Learned Option-Critic Phase 2
 
@@ -134,7 +166,7 @@ optimizer, exploration schedule, mission budget, and counterfactual losses.
 The `cyclamen` name denotes the recurrent, decentralized actor and collective
 counterfactual lineage, not reuse of Cyclamen's behavior modules.
 
-OC2 architecture version 4 follows Attention Option-Critic (AOC). For robot
+OC2 architecture version 4 is derived from Attention Option-Critic (AOC). For robot
 `i` and option `omega`:
 
 ```text
@@ -166,7 +198,7 @@ three centralized critic roles separate the objectives:
 
 ```text
 Q_i^Omega(x_i, omega_i)              local attended option value (execution)
-V(s)                                 team value for lambda returns
+V(s)                                auxiliary team value (not a bootstrap)
 b_i^U((s, omega), a_-i)              wheel-action counterfactual baseline
 Q_Omega(s, omega_vector),
 b_i^Omega(s, omega_-i)               collective option value and baseline
@@ -180,17 +212,54 @@ A_i^U       = lambda_return - b_i^U((s, omega), a_-i)
 Q_i target  = lambda_return
 ```
 
-The arrival-state termination loss uses the AOC option advantage while keeping
-all peer options fixed. The decentralized epsilon-soft option policy supplies
-the probabilities and the centralized critic supplies the candidate values:
+Schema-7 training uses **option-conditioned lambda returns**. Given the current
+joint option vector `omega`, each robot independently continues or reselects at
+the next observation. Its arrival distribution is:
 
 ```text
-V_i^Omega(s') = sum_omega' pi_i^Omega(omega' | x_i') *
-  Q_Omega(s', (omega_-i, omega'))
+T_i(k | x_i', omega_i) = (1 - beta_i,omega_i(x_i')) * 1[k = omega_i]
+                        + beta_i,omega_i(x_i') * pi_i^Omega(k | x_i')
+
+omega'_i ~ T_i
+G_t = r_t + gamma * [(1 - lambda) * Q_Omega(s', omega') + lambda * G_(t+1)]
+```
+
+Inside a rollout, `omega'` is the actual next joint choice. At its cutoff, a
+virtual arrival choice bootstraps the return without advancing the actor or
+critic memory. If collection continues before optimization, the actual next
+choice replaces that virtual sample. A time limit bootstraps from captured
+**pre-reset** sensors and critic state; a true terminal transition does not
+bootstrap. This retains the existing time-limit-as-interruption convention.
+
+The old option-blind `V(s')` bootstrap could blend the values of options that
+have different futures despite identical current observations. It no longer
+defines the return target. `V(s)` remains an auxiliary regression/diagnostic
+head, so the actor and critic architectures are unchanged.
+
+Termination compares the focal robot's alternatives while holding its peers'
+**next** sampled options fixed, not their options before arrival. The stored
+behavior selector supplies the focal probabilities, and the centralized critic
+supplies the candidate values:
+
+```text
+V_i^Omega(s', omega'_-i) = sum_k pi_i^Omega(k | x_i') *
+  Q_Omega(s', (omega'_-i, k))
 
 L_beta = beta_i,omega(s') *
-  [Q_Omega(s', omega_vector) - V_i^Omega(s')]
+  [Q_Omega(s', (omega'_-i, omega_i)) - V_i^Omega(s', omega'_-i)]
 ```
+
+Only the focal robot's alternatives are enumerated. Sampling the peers gives
+an estimate of their arrival expectation without enumerating `K^N` joint
+choices. The advantage is detached for the beta gradient, and terminal/reset
+transitions are excluded from this loss.
+
+This is an **AOC-derived swarm method, not a verbatim AOC reproduction**:
+[AOC equations (3)-(6)](https://arxiv.org/html/2201.02628v1) motivate the arrival
+value and termination advantage. Here the extension uses a centralized
+joint-option critic, counterfactual wheel credit, recurrent local sensors,
+continuous actions, and sampled on-policy lambda returns. AOC's Algorithm 1
+instead uses a greedy-max off-policy bootstrap; these are distinct choices.
 
 There is one termination function per learned option. Beta starts at `0.27`,
 matching Phase 1's `sigmoid(-1)` initialization; this avoids the weak gradient
@@ -229,10 +298,22 @@ For Phase 2 validation, monitor `Policy/Option Usage/*`,
 `Diagnostics/Initial Policy KL` must be approximately zero. Comparable task
 reward alone is not sufficient evidence that distinct temporal options formed.
 
-Version-4 actor and schema-6 training checkpoints identify this corrected AOC
-manager and continuous action space. Version-2 and version-3 squashed-wheel OC2
-checkpoints remain playable for diagnosis, but cannot be resumed into this
-algorithm.
+Version-4 actors are unchanged; **schema-7 training checkpoints** identify the
+corrected return and termination context. Older training checkpoints, including
+schema 6, cannot resume this objective. Their actors remain playable for
+comparison. Start a fresh six-option run, without `--checkpoint`:
+
+```bash
+python scripts/train.py --config configs/OC2_Foraging_cyclamen.yaml --headless --log_dir runs/OC2_Foraging_cyclamen_aoc_v7_local --checkpoint_dir checkpoints/OC2_Foraging_cyclamen_aoc_v7_local
+```
+
+Use a new output directory for each repeat. All OC2/OC2-2 mission configs retain
+their previous capacities, hyperparameters, reward, sensors, and wheel mapping;
+Classical Cyclamen is unchanged; OC1 receives the matching schema-8 corrections
+described above. No OC2-mini has been added. These corrections remove specific
+inconsistencies, but do not guarantee diverse
+options. Compare multiple fresh seeds on both reward and the existing forced
+option/termination ablations before drawing that conclusion.
 
 ## Sensor Suite
 
@@ -336,12 +417,12 @@ Submit ten independent Phase 2 designs per mission on the cluster with
 sbatch scripts/hpc/train_oc2_dirgate.slurm
 ```
 
-The corrected launchers write to `OC2_<mission>_cyclamen_aoc_hpc_<seed>`
+The corrected launchers write to `OC2_<mission>_cyclamen_aoc_v7_hpc_<seed>`
 run and checkpoint directories so their fresh experiments cannot mix with
 legacy OC2 TensorBoard events or checkpoints.
 
 The OC2-2 launchers follow `scripts/hpc/train_oc2_2_<mission>.slurm` and write
-to `OC2-2_<mission>_cyclamen_aoc_hpc_<seed>`. For example:
+to `OC2-2_<mission>_cyclamen_aoc_v7_hpc_<seed>`. For example:
 
 ```bash
 sbatch scripts/hpc/train_oc2_2_dirgate.slurm
@@ -643,15 +724,17 @@ classical Cyclamen and Phase 1. OC2 architecture version 4 is its hierarchical e
 all actor, option, and critic paths use `128 x 1`, and learned intra-option
 policies independently produce the two primitive wheel commands. No predefined
 Cyclamen behavior module is called by OC2. Training checkpoints use schema
-version 6. Version-2 and version-3 squashed-wheel actors can still be viewed,
-but cannot be resumed as version-4/schema-6 training. Start corrected OC2 runs
-from fresh weights and keep them in the `_aoc_hpc_` run directories.
+version 7. Older actors can still be viewed, but older training schemas cannot
+be resumed as version-4/schema-7 training. Start corrected OC2 runs from fresh
+weights and keep them in the `_aoc_v7_hpc_` run directories.
 
 Before submitting the full HPC matrix, run the dependency-light parity audit:
 
 ```bash
 python scripts/validate_paper_parity.py
 python scripts/validate_oc2_architecture.py
+python scripts/validate_oc2_training.py
+python scripts/validate_oc1_training.py
 ```
 
 The first command validates all 40 YAML files, experiment budgets, resolved
@@ -660,6 +743,14 @@ validator additionally checks tensor shapes, recurrent step/sequence parity,
 attention gradients to all option outputs, two- and six-option continuous wheel
 policies, the signs of the termination theorem, and exact immutable
 frozen-policy replay.
+The training regression tests additionally exercise option-conditioned returns,
+next-peer termination credit, timeouts versus true terminals, pre-reset sensor
+capture, recurrent cutoffs, real optimizer updates with 20 robots and two/six
+options in a synthetic environment, and checkpoint compatibility. These checks
+do not substitute for an Isaac Sim smoke run or a multi-seed learning experiment.
+The OC1 tests cover the corresponding fixed-module update, detached termination
+credit, old-manager playback compatibility, and agreement with OC2's corrected
+return operator.
 
 The HPC array launcher passes `SLURM_ARRAY_TASK_ID` as `--seed`, so the ten
 controllers use reproducible seeds 0 through 9. Training also follows the

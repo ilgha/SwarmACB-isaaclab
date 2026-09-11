@@ -8,7 +8,7 @@ and one continuous two-wheel policy per option. Centralized training preserves
 the SwarmACB counterfactual construction at two levels:
 
 * primitive-action credit holds every peer option and wheel action fixed;
-* option credit holds every peer option fixed.
+* arrival-state termination credit holds sampled next peer options fixed.
 
 Only the local actor is needed for decentralized execution.
 """
@@ -25,13 +25,14 @@ from tqdm import tqdm
 import torch
 import torch.nn.functional as functional
 import torch.optim as optim
-from torch.distributions import Bernoulli
+from torch.distributions import Bernoulli, Categorical
 from torch.utils.tensorboard import SummaryWriter
 
 from .learned_option_critic_buffer import LearnedOptionRolloutBuffer
 from .learned_option_critic_networks import (
     LEARNED_OPTION_CRITIC_VERSION,
     LearnedOptionActor,
+    option_transition_probs,
     termination_objective,
 )
 from .network_config import PAPER_PARITY_VERSION
@@ -171,7 +172,7 @@ class LearnedOptionCriticTrainer:
     """Train learned continuous options with collective counterfactual credit."""
 
     CHECKPOINT_VERSION = LEARNED_OPTION_CRITIC_VERSION
-    TRAINING_CHECKPOINT_VERSION = 6
+    TRAINING_CHECKPOINT_VERSION = 7
 
     def __init__(
         self,
@@ -218,6 +219,7 @@ class LearnedOptionCriticTrainer:
         self.state_dim = 5
         self.option_state_dim = self.state_dim + self.cfg.num_options
         self.decision_period = int(self.cfg.decision_period)
+        self.unwrapped.capture_terminal_policy_observations = True
 
         if self.obs_dim != 24:
             raise ValueError(
@@ -337,7 +339,7 @@ class LearnedOptionCriticTrainer:
             squash_actions=False,
         ).to(self.device)
 
-        # V(s): state-only team value used for lambda returns.
+        # Auxiliary V(s) for diagnostics; return bootstraps use joint-option Q.
         self.team_critic = POCACritic(
             self.state_dim,
             1,
@@ -519,6 +521,7 @@ class LearnedOptionCriticTrainer:
             gamma=cfg.gamma,
             lam=cfg.lam,
             device=self.device,
+            num_options=cfg.num_options,
         )
 
         self.global_step = 0
@@ -527,6 +530,12 @@ class LearnedOptionCriticTrainer:
         self.writer.add_text(
             "hyperparameters",
             "\n".join(f"{key}: {value}" for key, value in vars(cfg).items()),
+            0,
+        )
+        self.writer.add_text(
+            "OC2/Training Semantics",
+            f"schema={self.TRAINING_CHECKPOINT_VERSION}; "
+            "bootstrap=sampled_joint_option_q; termination=next_peer_options",
             0,
         )
         self._episode_reward_acc = torch.zeros(
@@ -608,6 +617,34 @@ class LearnedOptionCriticTrainer:
         return torch.cat([states, self._encode_options(options)], dim=-1)
 
     @torch.no_grad()
+    def _bootstrap_option_value(
+        self,
+        obs: torch.Tensor,
+        states: torch.Tensor,
+        previous_options: torch.Tensor,
+        actor_memory: tuple[torch.Tensor, torch.Tensor],
+        option_memory: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sample U at an arrival state without advancing any live recurrent state.
+
+        Sampling the joint transition is linear in swarm size, unlike enumerating
+        K**N combinations. This is an on-policy SARSA bootstrap, not AOC's max target.
+        """
+        outputs = self.actor.step(obs.reshape(-1, self.obs_dim), actor_memory)
+        selector_probs = self.actor.option_dist(
+            outputs[1], epsilon=self.current_option_epsilon,
+        ).probs.view(*previous_options.shape, self.cfg.num_options)
+        beta = self.actor.selected_termination_logits(
+            outputs[2], previous_options.clamp_min(0).reshape(-1),
+        ).sigmoid().view_as(previous_options)
+        arrival_probs = option_transition_probs(selector_probs, beta, previous_options)
+        next_options = Categorical(probs=arrival_probs).sample()
+        value = self.option_critic.joint_action_pass(
+            states, self._encode_options(next_options), memory=option_memory,
+        ).squeeze(-1)
+        return value, next_options, selector_probs
+
+    @torch.no_grad()
     def collect_rollout(
         self,
         obs_dict: dict,
@@ -682,6 +719,12 @@ class LearnedOptionCriticTrainer:
                 proposed,
                 self.current_options,
             )
+            if self.buffer.ptr:
+                # Replace a previous cutoff's virtual sample when collection resumes.
+                self.buffer.set_next_options(
+                    self.buffer.ptr - 1, self.current_options,
+                    option_dist.probs.view(self.num_envs, self.num_agents, -1),
+                )
             option_log_probs = torch.where(
                 option_mask,
                 proposed_logp,
@@ -841,11 +884,23 @@ class LearnedOptionCriticTrainer:
                     truncated[agents[0]].float(),
                 )
 
-            terminal_state = self.unwrapped.completed_terminal_critic_state
-            timeout_value = self.team_critic.critic_pass(
-                terminal_state,
-                (self.team_memory_h, self.team_memory_c),
-            ).squeeze(-1) * last_timeout
+            timeout_value = torch.zeros_like(last_timeout)
+            timeout_mask = last_timeout.bool()
+            if timeout_mask.any():
+                terminal_obs = self.unwrapped.completed_terminal_policy_observations
+                if terminal_obs is None:
+                    raise RuntimeError("OC2 timeout is missing pre-reset policy observations")
+                terminal_state = self.unwrapped.completed_terminal_critic_state
+                timeout_agents = timeout_mask[:, None].expand(
+                    self.num_envs, self.num_agents,
+                ).reshape(-1)
+                terminal_value, _, _ = self._bootstrap_option_value(
+                    terminal_obs[timeout_mask], terminal_state[timeout_mask],
+                    self.current_options[timeout_mask],
+                    (self.actor_memory_h[:, timeout_agents], self.actor_memory_c[:, timeout_agents]),
+                    (self.option_joint_memory_h[:, timeout_mask], self.option_joint_memory_c[:, timeout_mask]),
+                )
+                timeout_value[timeout_mask] = terminal_value
 
             next_obs = torch.stack(
                 [obs_dict[agent] for agent in agents],
@@ -946,11 +1001,15 @@ class LearnedOptionCriticTrainer:
             self.global_step += self.num_envs * self.num_agents
 
         last_state = self.unwrapped.get_critic_state()
-        last_team_value = self.team_critic.critic_pass(
-            last_state,
-            (self.team_memory_h, self.team_memory_c),
-        ).squeeze(-1)
-        self.buffer.compute_returns_and_advantages(last_team_value)
+        last_obs = torch.stack([obs_dict[agent] for agent in agents], dim=1)
+        last_option_value, next_options, next_probs = self._bootstrap_option_value(
+            last_obs, last_state, self.current_options,
+            (self.actor_memory_h, self.actor_memory_c),
+            (self.option_joint_memory_h, self.option_joint_memory_c),
+        )
+        if self.buffer.ptr:
+            self.buffer.set_next_options(self.buffer.ptr - 1, next_options, next_probs)
+        self.buffer.compute_returns_and_advantages(last_option_value)
         return obs_dict
 
     @staticmethod
@@ -1143,7 +1202,7 @@ class LearnedOptionCriticTrainer:
         )
         (
             _next_selector_logits,
-            next_option_values,
+            _next_option_values,
             next_termination_logits,
             _next_action_means,
             _next_action_stds,
@@ -1279,9 +1338,8 @@ class LearnedOptionCriticTrainer:
             flat_loss_mask,
         )
 
-        # Arrival-state termination theorem. Peers keep their active options
-        # while the focal robot compares continuation with V_Omega: the
-        # epsilon-soft policy expectation over its counterfactual alternatives.
+        # Arrival-state counterfactual advantage, averaged over the behavior
+        # selector for the focal robot and sampled next options for its peers.
         with torch.no_grad():
             next_joint_memory = (
                 batch["next_option_joint_memory_h"].reshape(
@@ -1293,25 +1351,25 @@ class LearnedOptionCriticTrainer:
                     -1,
                 ).unsqueeze(0),
             )
-            next_q_current = self.option_critic.joint_action_pass(
-                flat_next_states,
-                encoded_joint_options,
-                memory=next_joint_memory,
-            ).squeeze(-1)
+            # Peers have reached s' and independently continued/reselected. Hold
+            # those sampled choices fixed while enumerating only the focal robot.
             next_alternatives = (
                 self.option_critic.focal_discrete_counterfactual_values(
                     flat_next_states,
-                    flat_joint_options,
+                    batch["next_critic_options"].reshape(-1, self.num_agents),
                     focal_ids,
                     self.cfg.num_options,
                     memory=next_joint_memory,
                 )
             )
-            next_reselection = self.actor.option_state_value(
-                next_option_values,
-                next_alternatives,
-                epsilon=self.current_option_epsilon,
-            )
+            next_q_current = next_alternatives.gather(
+                -1, options.reshape(-1, 1),
+            ).squeeze(-1)
+            # Use the behavior selector, not a mixture of old peer choices and
+            # selector probabilities changed by preceding PPO minibatches.
+            next_reselection = (
+                next_alternatives * batch["next_option_probs"].reshape(-1, self.cfg.num_options)
+            ).sum(-1)
             termination_advantage = (
                 next_q_current - next_reselection
             ).view(batch_size, sequence_length)
@@ -2146,6 +2204,8 @@ class LearnedOptionCriticTrainer:
             "option_critic_phase": 2,
             "learned_option_critic_version": self.CHECKPOINT_VERSION,
             "training_checkpoint_version": self.TRAINING_CHECKPOINT_VERSION,
+            "return_bootstrap": "sampled_joint_option_q",
+            "termination_peer_context": "next_behavior_options",
             "paper_parity_version": PAPER_PARITY_VERSION,
             "fixed_options": False,
             "learned_options": True,

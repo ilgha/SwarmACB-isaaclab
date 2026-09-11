@@ -28,6 +28,7 @@ class FixedOptionRolloutBuffer:
         gamma: float,
         lam: float,
         device: torch.device | str,
+        num_options: int = 6,
     ):
         self.horizon = horizon
         self.num_envs = num_envs
@@ -39,6 +40,7 @@ class FixedOptionRolloutBuffer:
         self.gamma = gamma
         self.lam = lam
         self.device = device
+        self.num_options = int(num_options)
 
         T, E, N = horizon, num_envs, num_agents
         self.obs = torch.zeros(T, E, N, obs_dim, device=device)
@@ -46,6 +48,9 @@ class FixedOptionRolloutBuffer:
         self.critic_states = torch.zeros(T, E, N, state_dim, device=device)
         self.next_critic_states = torch.zeros(T, E, N, state_dim, device=device)
         self.options = torch.zeros(T, E, N, dtype=torch.long, device=device)
+        self.next_options = torch.zeros_like(self.options)
+        self.next_option_probs = torch.zeros(T, E, N, self.num_options, device=device)
+        self.next_options_valid = torch.zeros(T, E, dtype=torch.bool, device=device)
         self.option_log_probs = torch.zeros(T, E, N, device=device)
         self.option_masks = torch.zeros(T, E, N, device=device)
         self.beta_probs = torch.zeros(T, E, N, device=device)
@@ -115,6 +120,9 @@ class FixedOptionRolloutBuffer:
         self.critic_states[t] = critic_states
         self.next_critic_states[t] = next_critic_states
         self.options[t] = options.long()
+        self.next_options[t].zero_()
+        self.next_option_probs[t].zero_()
+        self.next_options_valid[t].zero_()
         self.option_log_probs[t] = option_log_probs
         self.option_masks[t] = option_masks
         self.beta_probs[t] = beta_probs
@@ -139,27 +147,43 @@ class FixedOptionRolloutBuffer:
         self.baseline_memory_c[t] = baseline_memory_c
         self.ptr += 1
 
-    def compute_returns_and_advantages(self, last_team_value: torch.Tensor):
-        """Compute lambda returns and per-robot counterfactual advantages."""
+    def set_next_options(
+        self,
+        t: int,
+        options: torch.Tensor,
+        selector_probs: torch.Tensor,
+    ):
+        """Record arrival choices without crossing auto-reset episode boundaries."""
+        if not 0 <= t < self.ptr:
+            raise IndexError(f"No rollout transition at index {t}")
+        active = ~self.dones[t].bool()
+        self.next_options[t] = torch.where(active[:, None], options, 0)
+        self.next_option_probs[t] = torch.where(
+            active[:, None, None], selector_probs, 0.0,
+        )
+        self.next_options_valid[t] = active
+
+    def compute_returns_and_advantages(self, last_option_value: torch.Tensor):
+        """On-policy lambda returns on the augmented (state, joint option) process."""
         if self.ptr <= 0:
             return
 
         last = self.ptr - 1
         done_last = self.dones[last]
         boundary_last = self.timeouts[last] * self.timeout_values[last]
-        bootstrap_last = torch.where(done_last.bool(), boundary_last, last_team_value)
+        bootstrap_last = torch.where(done_last.bool(), boundary_last, last_option_value)
         self.returns[last] = self.rewards[last] + self.gamma * bootstrap_last
         for t in reversed(range(last)):
             done = self.dones[t]
             continuation = (
-                (1.0 - self.lam) * self.team_values[t + 1]
+                (1.0 - self.lam) * self.joint_option_values[t + 1]
                 + self.lam * self.returns[t + 1]
             )
             boundary = self.timeouts[t] * self.timeout_values[t]
             self.returns[t] = (
                 self.rewards[t]
                 + self.gamma
-                * ((1.0 - done) * continuation + done * boundary)
+                * torch.where(done.bool(), boundary, continuation)
             )
 
         self.advantages[: self.ptr] = (
@@ -171,6 +195,9 @@ class FixedOptionRolloutBuffer:
         T, E, N = self.ptr, self.num_envs, self.num_agents
         if T <= 0:
             return
+        missing = ~self.dones[:T].bool() & ~self.next_options_valid[:T]
+        if missing.any():
+            raise RuntimeError("OC1 rollout is missing next-option behavior context")
         L = max(1, min(int(sequence_length), T))
         chunks: list[tuple[int, int, int, int]] = []
         for env_id in range(E):
@@ -225,6 +252,8 @@ class FixedOptionRolloutBuffer:
                 "next_critic_states": stack_group("next_critic_states"),
                 "options": stack_focal("options"),
                 "critic_options": stack_group("options"),
+                "next_critic_options": stack_group("next_options"),
+                "next_option_probs": stack_focal("next_option_probs"),
                 "old_option_log_probs": stack_focal("option_log_probs"),
                 "option_masks": stack_focal("option_masks"),
                 "advantages": stack_focal("advantages"),
@@ -331,6 +360,8 @@ class FixedOptionRolloutBuffer:
                     "next_critic_states": stack_group("next_critic_states"),
                     "options": stack_focal("options"),
                     "critic_options": stack_group("options"),
+                    "next_critic_options": stack_group("next_options"),
+                    "next_option_probs": stack_focal("next_option_probs"),
                     "old_option_log_probs": stack_focal("option_log_probs"),
                     "option_masks": stack_focal("option_masks"),
                     "advantages": stack_focal("advantages"),

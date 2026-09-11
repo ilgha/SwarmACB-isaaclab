@@ -20,4 +20,4 @@ set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-/home/ulb/iridia_robo/igharbi/SwarmACB-isaaclab}"
 SCRIPT_DIR="$PROJECT_DIR/scripts/hpc"
-bash "$SCRIPT_DIR/run_training_common.sh" "configs/OC_DirGate_cyclamen.yaml" "OC_DirGate_cyclamen"
+bash "$SCRIPT_DIR/run_training_common.sh" "configs/OC_DirGate_cyclamen.yaml" "OC_DirGate_cyclamen_v8"

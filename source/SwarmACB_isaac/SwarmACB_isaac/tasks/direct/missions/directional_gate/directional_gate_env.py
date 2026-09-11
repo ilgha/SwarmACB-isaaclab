@@ -67,6 +67,9 @@ class DirectionalGateEnv(DirectMARLEnv):
         # ``step``. Keep the true final centralized state so interrupted Unity
         # trajectories can bootstrap from s_{t+1}, rather than from the reset.
         self.completed_terminal_critic_state = torch.zeros(E, N, 5, device=dev)
+        # Option-Critic needs local terminal observations to sample continuation.
+        self.capture_terminal_policy_observations = False
+        self.completed_terminal_policy_observations = None
 
         # ── Precompute arena wall segments ────────────────────────
         self.arena_wall_segments = self._build_wall_segments()
@@ -1203,6 +1206,14 @@ class DirectionalGateEnv(DirectMARLEnv):
         if time_out.any():
             terminal_state = self.get_critic_state()
             self.completed_terminal_critic_state[time_out] = terminal_state[time_out]
+            if self.capture_terminal_policy_observations:
+                observations = self._get_observations()
+                terminal_obs = torch.stack(
+                    [observations[agent] for agent in self.cfg.possible_agents], dim=1,
+                )
+                if self.completed_terminal_policy_observations is None:
+                    self.completed_terminal_policy_observations = torch.zeros_like(terminal_obs)
+                self.completed_terminal_policy_observations[time_out] = terminal_obs[time_out]
 
         terminated = {agent: torch.zeros_like(time_out) for agent in self.cfg.possible_agents}
         truncated = {agent: time_out for agent in self.cfg.possible_agents}

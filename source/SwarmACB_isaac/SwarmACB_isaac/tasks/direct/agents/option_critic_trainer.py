@@ -99,6 +99,9 @@ class FixedOptionCriticConfig:
 class FixedOptionCriticTrainer:
     """Learn decentralized option control from collective critic signals."""
 
+    CHECKPOINT_VERSION = 7
+    TRAINING_CHECKPOINT_VERSION = 8
+
     def __init__(self, env, cfg: FixedOptionCriticConfig | None = None):
         self.env = env
         self.cfg = cfg or FixedOptionCriticConfig()
@@ -135,6 +138,7 @@ class FixedOptionCriticTrainer:
         self.state_dim = 5
         c = self.cfg
         self.decision_period = c.decision_period
+        self.unwrapped.capture_terminal_policy_observations = True
 
         print(
             f"[FixedOC] envs={self.num_envs}  agents={self.num_agents}  "
@@ -219,6 +223,7 @@ class FixedOptionCriticTrainer:
             gamma=c.gamma,
             lam=c.lam,
             device=self.device,
+            num_options=c.num_options,
         )
 
         self.global_step = 0
@@ -226,6 +231,12 @@ class FixedOptionCriticTrainer:
         self.writer = SummaryWriter(log_dir=c.log_dir)
         hp_text = "\n".join(f"{k}: {v}" for k, v in vars(c).items())
         self.writer.add_text("hyperparameters", hp_text, 0)
+        self.writer.add_text(
+            "OC1/Training Semantics",
+            f"schema={self.TRAINING_CHECKPOINT_VERSION}; "
+            "bootstrap=sampled_joint_option_q; termination=next_peer_options",
+            0,
+        )
 
         self._episode_reward_acc = torch.zeros(self.num_envs, device=self.device)
         self._episode_step_count = torch.zeros(self.num_envs, device=self.device)
@@ -256,6 +267,39 @@ class FixedOptionCriticTrainer:
             options.long(),
             num_classes=self.cfg.num_options,
         ).float()
+
+    @torch.no_grad()
+    def _bootstrap_option_value(
+        self,
+        obs: torch.Tensor,
+        states: torch.Tensor,
+        previous_options: torch.Tensor,
+        manager_memory: tuple[torch.Tensor, torch.Tensor],
+        joint_memory: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sample call-and-return continuation without advancing live memory.
+
+        A virtual next joint choice estimates the on-policy arrival value U.
+        The actual rollout uses the same independent selector/Bernoulli draws.
+        """
+        logits, beta_logits, _ = self.manager.step(
+            obs.reshape(-1, self.obs_dim), manager_memory,
+        )
+        selector = self.manager.get_option_dist(logits)
+        termination = self.manager.get_termination_dist(
+            beta_logits, previous_options.clamp_min(0).reshape(-1),
+        )
+        proposed = selector.sample().view_as(previous_options)
+        reselect = termination.sample().bool().view_as(previous_options)
+        next_options = torch.where(
+            reselect | (previous_options < 0), proposed, previous_options,
+        )
+        value = self.critic.joint_action_pass(
+            states, self._encode_options_for_critic(next_options), memory=joint_memory,
+        ).squeeze(-1)
+        return value, next_options, selector.probs.view(
+            *previous_options.shape, self.cfg.num_options,
+        )
 
     @torch.no_grad()
     def collect_rollout(
@@ -307,6 +351,12 @@ class FixedOptionCriticTrainer:
                 proposed_options,
                 self.current_options,
             )
+            if self.buffer.ptr:
+                # Replace a previous cutoff's virtual sample when collection resumes.
+                self.buffer.set_next_options(
+                    self.buffer.ptr - 1, self.current_options,
+                    option_dist.probs.view(self.num_envs, self.num_agents, -1),
+                )
 
             option_logp = torch.where(
                 option_mask.bool(),
@@ -368,11 +418,29 @@ class FixedOptionCriticTrainer:
                     last_timeout, truncated_dict[agents[0]].float(),
                 )
 
-            terminal_state = self.unwrapped.completed_terminal_critic_state
-            timeout_value = self.critic.critic_pass(
-                terminal_state,
-                (self.value_memory_h, self.value_memory_c),
-            ).squeeze(-1) * last_timeout
+            timeout_value = torch.zeros_like(last_timeout)
+            timeout_mask = last_timeout.bool()
+            if timeout_mask.any():
+                terminal_obs = self.unwrapped.completed_terminal_policy_observations
+                if terminal_obs is None:
+                    raise RuntimeError("OC1 timeout is missing pre-reset policy observations")
+                terminal_state = self.unwrapped.completed_terminal_critic_state
+                timeout_agents = timeout_mask[:, None].expand(
+                    self.num_envs, self.num_agents,
+                ).reshape(-1)
+                terminal_value, _, _ = self._bootstrap_option_value(
+                    terminal_obs[timeout_mask], terminal_state[timeout_mask],
+                    self.current_options[timeout_mask],
+                    (
+                        self.manager_memory_h[:, timeout_agents],
+                        self.manager_memory_c[:, timeout_agents],
+                    ),
+                    (
+                        self.joint_memory_h[:, timeout_mask],
+                        self.joint_memory_c[:, timeout_mask],
+                    ),
+                )
+                timeout_value[timeout_mask] = terminal_value
 
             next_obs_stacked = torch.stack([obs_dict[a] for a in agents], dim=1)
             if next_obs_stacked.ndim == 5:
@@ -449,11 +517,15 @@ class FixedOptionCriticTrainer:
             self.global_step += self.num_envs * self.num_agents
 
         last_state = self.unwrapped.get_critic_state()
-        last_value = self.critic.critic_pass(
-            last_state,
-            (self.value_memory_h, self.value_memory_c),
-        ).squeeze(-1)
-        self.buffer.compute_returns_and_advantages(last_value)
+        last_obs = torch.stack([obs_dict[agent] for agent in agents], dim=1)
+        last_option_value, next_options, next_probs = self._bootstrap_option_value(
+            last_obs, last_state, self.current_options,
+            (self.manager_memory_h, self.manager_memory_c),
+            (self.joint_memory_h, self.joint_memory_c),
+        )
+        if self.buffer.ptr:
+            self.buffer.set_next_options(self.buffer.ptr - 1, next_options, next_probs)
+        self.buffer.compute_returns_and_advantages(last_option_value)
         return obs_dict
 
     def _compute_sequence_losses(
@@ -528,14 +600,13 @@ class FixedOptionCriticTrainer:
         next_h = batch["next_memory_h"].reshape(B * L, -1)
         next_c = batch["next_memory_c"].reshape(B * L, -1)
         (
-            next_option_logits,
+            _next_option_logits,
             next_termination_logits,
             _next_state,
         ) = self.manager.step(
             next_obs_seq,
             (next_h.unsqueeze(0).detach(), next_c.unsqueeze(0).detach()),
         )
-        next_option_logits = next_option_logits.view(B, L, self.cfg.num_options)
         next_termination_logits = next_termination_logits.view(B, L, self.cfg.num_options)
 
         next_beta_logits = next_termination_logits.gather(
@@ -607,27 +678,24 @@ class FixedOptionCriticTrainer:
             flat_loss_mask,
         )
 
-        # The termination theorem is evaluated after entering s'. For robot i,
-        # continuation uses the current collective joint-option value while
-        # reselection marginalizes only i's alternatives and holds peers fixed.
+        # At arrival, hold the peers' sampled next options fixed. Enumerate
+        # the focal robot's alternatives using its stored behavior selector.
         with torch.no_grad():
             next_joint_memory = (
                 batch["next_joint_memory_h"].reshape(B * L, -1).unsqueeze(0),
                 batch["next_joint_memory_c"].reshape(B * L, -1).unsqueeze(0),
             )
-            next_q_current = self.critic.joint_action_pass(
-                flat_next_states,
-                critic_options,
-                memory=next_joint_memory,
-            ).squeeze(-1)
             next_counterfactual_values = self.critic.focal_discrete_counterfactual_values(
                 flat_next_states,
-                flat_critic_option_ids,
+                batch["next_critic_options"].reshape(B * L, N),
                 focal_ids,
                 self.cfg.num_options,
                 memory=next_joint_memory,
             )
-            next_selector_probs = torch.softmax(next_option_logits, dim=-1).reshape(
+            next_q_current = next_counterfactual_values.gather(
+                -1, options.reshape(-1, 1),
+            ).squeeze(-1)
+            next_selector_probs = batch["next_option_probs"].reshape(
                 B * L,
                 self.cfg.num_options,
             )
@@ -890,7 +958,10 @@ class FixedOptionCriticTrainer:
     def save_checkpoint(self, path):
         torch.save({
             "trainer_type": "option_critic",
-            "option_critic_version": 7,
+            "option_critic_version": self.CHECKPOINT_VERSION,
+            "training_checkpoint_version": self.TRAINING_CHECKPOINT_VERSION,
+            "return_bootstrap": "sampled_joint_option_q",
+            "termination_peer_context": "next_behavior_options",
             "paper_parity_version": PAPER_PARITY_VERSION,
             "fixed_options": True,
             "collective_counterfactual": True,
@@ -923,6 +994,16 @@ class FixedOptionCriticTrainer:
 
     def load_checkpoint(self, path):
         ckpt = torch.load(path, map_location=self.device)
+        if ckpt.get("trainer_type") != "option_critic":
+            raise RuntimeError("Expected a fixed-module OC1 training checkpoint")
+        training_version = int(ckpt.get("training_checkpoint_version", 0))
+        if training_version != self.TRAINING_CHECKPOINT_VERSION:
+            raise RuntimeError(
+                f"OC1 training schema {training_version} is incompatible with "
+                f"schema {self.TRAINING_CHECKPOINT_VERSION}. Corrected option "
+                "returns and termination credit require a fresh training run. "
+                "Older managers remain usable for playback."
+            )
         parity_version = int(ckpt.get("paper_parity_version", 0))
         if parity_version != PAPER_PARITY_VERSION:
             raise RuntimeError(
@@ -936,7 +1017,7 @@ class FixedOptionCriticTrainer:
             self.optimizer.load_state_dict(ckpt["optimizer"])
         except RuntimeError as exc:
             raise RuntimeError(
-                "Checkpoint architecture does not match Option-Critic version 7. "
+                f"Checkpoint architecture does not match Option-Critic version {self.CHECKPOINT_VERSION}. "
                 "Legacy checkpoints remain available for evaluation; retraining "
                 "must start fresh."
             ) from exc

@@ -15,4 +15,4 @@ set -euo pipefail
 # Train 10 independent two-option AOC runs on XOR-Aggregation.
 PROJECT_DIR="${PROJECT_DIR:-/home/ulb/iridia_robo/igharbi/SwarmACB-isaaclab}"
 SCRIPT_DIR="$PROJECT_DIR/scripts/hpc"
-bash "$SCRIPT_DIR/run_training_common.sh" "configs/OC2-2_XOR_cyclamen.yaml" "OC2-2_XOR_cyclamen_aoc"
+bash "$SCRIPT_DIR/run_training_common.sh" "configs/OC2-2_XOR_cyclamen.yaml" "OC2-2_XOR_cyclamen_aoc_v7"

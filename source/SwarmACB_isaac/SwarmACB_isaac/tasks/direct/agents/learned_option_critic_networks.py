@@ -26,6 +26,19 @@ LEARNED_OPTION_CRITIC_VERSION = 4
 SUPPORTED_LEARNED_OPTION_CRITIC_VERSIONS = (2, 3, 4)
 
 
+def option_transition_probs(
+    selector_probs: torch.Tensor,
+    termination_probs: torch.Tensor,
+    previous_options: torch.Tensor,
+) -> torch.Tensor:
+    """Call-and-return arrival distribution; -1 denotes a fresh episode."""
+    continuing = functional.one_hot(
+        previous_options.clamp_min(0).long(), selector_probs.shape[-1],
+    ).to(selector_probs.dtype)
+    beta = torch.where(previous_options < 0, 1.0, termination_probs).unsqueeze(-1)
+    return (1.0 - beta) * continuing + beta * selector_probs
+
+
 def termination_objective(
     termination_probability: torch.Tensor,
     option_advantage: torch.Tensor,
