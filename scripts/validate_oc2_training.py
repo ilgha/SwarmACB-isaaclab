@@ -154,11 +154,12 @@ class TrainerTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="oc2_training_test_")
         self.addCleanup(self.temp.cleanup)
 
-    def trainer(self, options=2, agents=20):
+    def trainer(self, options=2, agents=20, reactive=False):
         cfg = TRAINING.LearnedOptionCriticConfig(
             num_options=options, hidden_dim=32, option_hidden_dim=32,
             num_layers=1, option_num_layers=1, memory_size=16, option_memory_size=16,
             critic_hidden_dim=32, critic_num_heads=4, decision_period=1,
+            reactive_intra_options=reactive,
             horizon=6, sequence_length=4, mini_batch_size=160, num_epochs=1,
             option_epsilon_schedule="constant", total_timesteps=1000,
             fused_optimizer=False, matmul_precision="highest",

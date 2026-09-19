@@ -23,7 +23,8 @@ from .poca_networks import LinearEncoder, _linear_layer, _mlagents_lstm
 
 
 LEARNED_OPTION_CRITIC_VERSION = 4
-SUPPORTED_LEARNED_OPTION_CRITIC_VERSIONS = (2, 3, 4)
+REACTIVE_OPTION_CRITIC_VERSION = 5
+SUPPORTED_LEARNED_OPTION_CRITIC_VERSIONS = (2, 3, 4, 5)
 
 
 def option_transition_probs(
@@ -114,6 +115,10 @@ class LearnedOptionActor(nn.Module):
     sensor encoder and recurrent cell with option-specific memory. Separate
     heads implement the local option value, continuous intra-option wheel
     policy, and termination function for every option.
+
+    OC2-mini (``reactive_intra_options``) uses memoryless masks and motor
+    features. Only option values and terminations consume recurrent features;
+    there is no global manager LSTM in this variant.
     """
 
     def __init__(
@@ -135,6 +140,7 @@ class LearnedOptionActor(nn.Module):
         separate_selector: bool = False,
         epsilon_greedy_selector: bool = True,
         squash_actions: bool = False,
+        reactive_intra_options: bool = False,
     ):
         super().__init__()
         self.obs_dim = int(obs_dim)
@@ -152,6 +158,7 @@ class LearnedOptionActor(nn.Module):
         self.separate_selector = bool(separate_selector)
         self.epsilon_greedy_selector = bool(epsilon_greedy_selector)
         self.squash_actions = bool(squash_actions)
+        self.reactive_intra_options = bool(reactive_intra_options)
         self.manager_obs_dim = 4 if self.obs_dim == 24 else self.obs_dim
 
         if self.obs_dim not in (4, 24):
@@ -175,24 +182,33 @@ class LearnedOptionActor(nn.Module):
         if self.option_selector_temperature <= 0.0:
             raise ValueError("option_selector_temperature must be positive")
 
-        self.manager_encoder = LinearEncoder(
-            self.manager_obs_dim,
-            num_layers,
-            hidden,
-            kernel_init="kaiming_normal",
-        )
-        self.manager_lstm, self.manager_hidden_size = _mlagents_lstm(
-            hidden,
-            memory_size,
-        )
+        if self.reactive_intra_options:
+            if self.memory_size <= 0 or self.memory_size % 2:
+                raise ValueError("ML-Agents memory_size must be a positive even integer")
+            if separate_selector or not epsilon_greedy_selector or squash_actions:
+                raise ValueError("OC2-mini requires epsilon-soft Q selection and normal wheel actions")
+            self.manager_hidden_size = 0
+        else:
+            self.manager_encoder = LinearEncoder(
+                self.manager_obs_dim,
+                num_layers,
+                hidden,
+                kernel_init="kaiming_normal",
+            )
+            self.manager_lstm, self.manager_hidden_size = _mlagents_lstm(
+                hidden,
+                memory_size,
+            )
+        # Keep the attention network width identical in full OC2 and mini.
+        self.attention_hidden_size = self.memory_size // 2
         self.attention_encoder = LinearEncoder(
             self.obs_dim,
             num_layers,
-            self.manager_hidden_size,
+            self.attention_hidden_size,
             kernel_init="kaiming_normal",
         )
         self.attention_head = _linear_layer(
-            self.manager_hidden_size,
+            self.attention_hidden_size,
             self.num_options * self.obs_dim,
             kernel_init="kaiming_normal",
             kernel_gain=0.1,
@@ -281,7 +297,7 @@ class LearnedOptionActor(nn.Module):
                 float(initial_log_std),
             ))
 
-        # Packed public memory: one manager state plus one state per option.
+        # Mini omits the global state; per-option memory still serves Q/beta.
         self.hidden_size = (
             self.manager_hidden_size
             + self.num_options * self.option_recurrent_size
@@ -294,6 +310,12 @@ class LearnedOptionActor(nn.Module):
         return self.min_log_std + (
             self.max_log_std - self.min_log_std
         ) * fraction
+
+    def flatten_recurrent_parameters(self) -> None:
+        """Repack LSTM weights after cloning either actor architecture."""
+        for module in self.modules():
+            if isinstance(module, nn.LSTM):
+                module.flatten_parameters()
 
     @classmethod
     def from_checkpoint(
@@ -345,6 +367,7 @@ class LearnedOptionActor(nn.Module):
             separate_selector=(version == 3),
             epsilon_greedy_selector=(version >= 4),
             squash_actions=squash_actions,
+            reactive_intra_options=(version == REACTIVE_OPTION_CRITIC_VERSION),
         ).to(device)
         actor.load_state_dict(checkpoint["actor"])
         return actor
@@ -426,23 +449,25 @@ class LearnedOptionActor(nn.Module):
             state = self.initial_state(batch_size, obs_seq.device)
         manager_state, option_state = self._unpack_state(state, batch_size)
 
-        manager_obs = (
-            obs_seq[..., 16:20]
-            if self.obs_dim == 24
-            else obs_seq
-        )
-        manager_encoded = self.manager_encoder(
-            manager_obs.reshape(-1, self.manager_obs_dim)
-        ).view(batch_size, sequence_length, -1)
-        manager_features, next_manager_state = self.manager_lstm(
-            manager_encoded,
-            manager_state,
-        )
         sensor_context = self.attention_encoder(
             obs_seq.reshape(-1, self.obs_dim)
-        ).view(batch_size, sequence_length, self.manager_hidden_size)
+        ).view(batch_size, sequence_length, self.attention_hidden_size)
+        if self.reactive_intra_options:
+            # A recurrent mask would leak history into otherwise reactive wheels.
+            attention_context = sensor_context
+            next_manager_state = manager_state
+        else:
+            manager_obs = obs_seq[..., 16:20] if self.obs_dim == 24 else obs_seq
+            manager_encoded = self.manager_encoder(
+                manager_obs.reshape(-1, self.manager_obs_dim)
+            ).view(batch_size, sequence_length, -1)
+            manager_features, next_manager_state = self.manager_lstm(
+                manager_encoded,
+                manager_state,
+            )
+            attention_context = manager_features + sensor_context
         attentions = torch.sigmoid(
-            self.attention_head(manager_features + sensor_context).view(
+            self.attention_head(attention_context).view(
                 batch_size,
                 sequence_length,
                 self.num_options,
@@ -497,8 +522,14 @@ class LearnedOptionActor(nn.Module):
             # selection. Architecture-v2 checkpoints also shared this output,
             # but interpreted it through a softmax distribution.
             selector_logits = option_values
+        if self.reactive_intra_options:
+            motor_features = option_encoded.view(
+                batch_size, self.num_options, sequence_length, self.option_hidden,
+            ).permute(0, 2, 1, 3)
+        else:
+            motor_features = option_features
         action_means = torch.stack([
-            head(option_features[..., option_id, :])
+            head(motor_features[..., option_id, :])
             for option_id, head in enumerate(self.action_heads)
         ], dim=-2)
         termination_logits = torch.cat([

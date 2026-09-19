@@ -289,6 +289,9 @@ def print_config(run_name: str, variant: str, cfg: Any, env_ov: dict):
     if hasattr(cfg, "option_hidden_dim"):
         print(f"    option_hidden       : {cfg.option_hidden_dim}")
         print(f"    option_layers       : {cfg.option_num_layers}")
+        if getattr(cfg, "reactive_intra_options", False):
+            print("    actor_mode          : OC2-mini (reactive masks and wheel policies)")
+            print("    recurrent_outputs   : option values and termination only")
     if hasattr(cfg, "num_options"):
         option_label = (
             "learned_options"

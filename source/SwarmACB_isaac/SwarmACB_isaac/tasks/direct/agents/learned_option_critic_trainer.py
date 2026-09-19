@@ -31,6 +31,7 @@ from torch.utils.tensorboard import SummaryWriter
 from .learned_option_critic_buffer import LearnedOptionRolloutBuffer
 from .learned_option_critic_networks import (
     LEARNED_OPTION_CRITIC_VERSION,
+    REACTIVE_OPTION_CRITIC_VERSION,
     LearnedOptionActor,
     option_transition_probs,
     termination_objective,
@@ -157,6 +158,7 @@ class LearnedOptionCriticConfig:
     option_hidden_dim: int = 512
     option_num_layers: int = 2
     option_memory_size: int = 64
+    reactive_intra_options: bool = False
     initial_termination_probability: float = 0.27
     initial_log_std: float = 0.0
     min_log_std: float = -2.5
@@ -173,6 +175,13 @@ class LearnedOptionCriticTrainer:
 
     CHECKPOINT_VERSION = LEARNED_OPTION_CRITIC_VERSION
     TRAINING_CHECKPOINT_VERSION = 7
+
+    @property
+    def checkpoint_version(self) -> int:
+        return (
+            REACTIVE_OPTION_CRITIC_VERSION
+            if self.cfg.reactive_intra_options else self.CHECKPOINT_VERSION
+        )
 
     def __init__(
         self,
@@ -337,7 +346,14 @@ class LearnedOptionCriticTrainer:
             separate_selector=False,
             epsilon_greedy_selector=True,
             squash_actions=False,
+            reactive_intra_options=cfg.reactive_intra_options,
         ).to(self.device)
+        if cfg.reactive_intra_options:
+            print(
+                "[LearnedOC] OC2-mini: reactive attention and wheel policies; "
+                f"motor MLP={cfg.option_num_layers}x{cfg.option_hidden_dim}; "
+                "per-option memory serves Q and termination only"
+            )
 
         # Auxiliary V(s) for diagnostics; return bootstraps use joint-option Q.
         self.team_critic = POCACritic(
@@ -417,8 +433,7 @@ class LearnedOptionCriticTrainer:
         # the trust-region reference without changing the behavior weights.
         self.reference_actor = copy.deepcopy(self.actor).eval()
         self.reference_actor.requires_grad_(False)
-        self.reference_actor.manager_lstm.flatten_parameters()
-        self.reference_actor.option_lstm.flatten_parameters()
+        self.reference_actor.flatten_recurrent_parameters()
 
         actor_batch = self.num_envs * self.num_agents
         self.actor_memory_h, self.actor_memory_c = self.actor.initial_state(
@@ -535,6 +550,8 @@ class LearnedOptionCriticTrainer:
         self.writer.add_text(
             "OC2/Training Semantics",
             f"schema={self.TRAINING_CHECKPOINT_VERSION}; "
+            f"actor_architecture={self.checkpoint_version}; "
+            f"reactive_intra_options={cfg.reactive_intra_options}; "
             "bootstrap=sampled_joint_option_q; termination=next_peer_options",
             0,
         )
@@ -556,11 +573,14 @@ class LearnedOptionCriticTrainer:
             f"[LearnedOC] Actor params: "
             f"{sum(p.numel() for p in self.actor.parameters()):,}"
         )
-        print(
-            f"[LearnedOC] Manager={cfg.hidden_dim}x{cfg.num_layers}, "
-            f"motor={cfg.option_hidden_dim}x{cfg.option_num_layers}, "
-            f"packed_memory={self.actor.hidden_size}"
-        )
+        if not cfg.reactive_intra_options:
+            print(
+                f"[LearnedOC] Manager={cfg.hidden_dim}x{cfg.num_layers}, "
+                f"motor={cfg.option_hidden_dim}x{cfg.option_num_layers}, "
+                f"packed_memory={self.actor.hidden_size}"
+            )
+        else:
+            print(f"[LearnedOC] Q/termination packed_memory={self.actor.hidden_size}")
         print(
             "[LearnedOC] Critic params: "
             f"team={sum(p.numel() for p in self.team_critic.parameters()):,}  "
@@ -1545,8 +1565,7 @@ class LearnedOptionCriticTrainer:
         cfg = self.cfg
         self.reference_actor.load_state_dict(self.actor.state_dict())
         self.reference_actor.eval()
-        self.reference_actor.manager_lstm.flatten_parameters()
-        self.reference_actor.option_lstm.flatten_parameters()
+        self.reference_actor.flatten_recurrent_parameters()
 
         for _epoch in range(cfg.num_epochs):
             for batch in self.buffer.get_sequence_batches(
@@ -2202,7 +2221,8 @@ class LearnedOptionCriticTrainer:
         torch.save({
             "trainer_type": "learned_option_critic",
             "option_critic_phase": 2,
-            "learned_option_critic_version": self.CHECKPOINT_VERSION,
+            "learned_option_critic_version": self.checkpoint_version,
+            "reactive_intra_options": self.cfg.reactive_intra_options,
             "training_checkpoint_version": self.TRAINING_CHECKPOINT_VERSION,
             "return_bootstrap": "sampled_joint_option_q",
             "termination_peer_context": "next_behavior_options",
@@ -2306,12 +2326,12 @@ class LearnedOptionCriticTrainer:
         version = int(
             checkpoint.get("learned_option_critic_version", 0)
         )
-        if version != self.CHECKPOINT_VERSION:
+        if version != self.checkpoint_version:
             raise RuntimeError(
                 f"Checkpoint uses learned Option-Critic version {version}; "
-                f"this trainer expects version {self.CHECKPOINT_VERSION}. "
-                "The paper-aligned epsilon-soft Q_Omega manager requires "
-                "fresh training."
+                f"this trainer expects version {self.checkpoint_version}. "
+                "OC2 and OC2-mini have different actor architectures; use "
+                "the matching config to resume, or start fresh training."
             )
         training_version = int(
             checkpoint.get("training_checkpoint_version", 0)

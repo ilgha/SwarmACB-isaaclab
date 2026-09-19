@@ -310,10 +310,91 @@ python scripts/train.py --config configs/OC2_Foraging_cyclamen.yaml --headless -
 Use a new output directory for each repeat. All OC2/OC2-2 mission configs retain
 their previous capacities, hyperparameters, reward, sensors, and wheel mapping;
 Classical Cyclamen is unchanged; OC1 receives the matching schema-8 corrections
-described above. No OC2-mini has been added. These corrections remove specific
+described above. These corrections remove specific
 inconsistencies, but do not guarantee diverse
 options. Compare multiple fresh seeds on both reward and the existing forced
 option/termination ablations before drawing that conclusion.
+
+## OC2-mini: Reactive Learned Options
+
+`OC2-mini_cyclamen` is a separate capacity-reduction experiment, not a
+replacement for OC2. It still learns **six continuous two-wheel options**;
+it never selects the predefined Cyclamen behavior modules.
+
+Set `network_settings.reactive_intra_options: true` to select this architecture:
+
+- **Attention:** current 24-channel local sensors -> feedforward attention
+  encoder -> six sigmoid masks. No recurrent state enters these masks.
+- **Motor policies:** masked sensors -> shared 128-unit Swish layer -> one
+  two-wheel Gaussian mean head per option, plus learned per-option log standard
+  deviations. There is no LSTM or recurrent fusion layer in the motor path.
+- **Option values and termination:** the same masked sensor encoding ->
+  per-option LSTM state -> feedforward fusion -> separate Q and beta heads.
+  Epsilon-soft Q selection and call-and-return execution are unchanged.
+  All option memories update on each decision, as in full OC2.
+
+The global manager LSTM is absent in mini. `option_memory_size: 128` still means
+64 hidden + 64 cell values per option, **used only by Q and termination**, not
+by the wheel policies. `memory_size: 128` retains the centralized critics'
+memory size and the attention encoder width (64). Thus identical current
+observations always give identical wheel distributions for a fixed option,
+regardless of history; history can still affect which option runs and when it
+terminates. Temporal attention regularization is a training loss, not runtime
+memory. The original full OC2 architecture and old playback remain supported.
+
+The five `configs/OC2-mini_<Mission>_cyclamen.yaml` files keep OC2's width,
+optimizer, counterfactual critics, attention losses, control cadence, rewards,
+and mission-specific training budgets. Removing recurrence also removes the
+motor path's recurrent fusion layer; this is **not** a parameter-count-matched
+recurrence-only ablation. We do not additionally shrink the width or tune the
+learning settings at the same time.
+
+Start a fresh local run, for example:
+
+```bash
+python scripts/train.py --config configs/OC2-mini_Foraging_cyclamen.yaml --headless
+```
+
+Mission names are `DirGate`, `XOR`, `Homing`, `Foraging`, and `Sheltering`.
+Use separate `--log_dir` and `--checkpoint_dir` for additional repeats. Resume
+with the same mini config and `--checkpoint <path>/option_critic_2_final.pt`.
+Mini uses **actor architecture 5, training schema 7**; full OC2 uses architecture
+4, schema 7. Cross-architecture training resumes are rejected. Do not resume
+a full OC2 checkpoint into a mini experiment.
+
+Submit ten independent mini designs per mission from the project root on HPC:
+
+```bash
+mkdir -p logs
+sbatch scripts/hpc/train_oc2_mini_dirgate.slurm
+sbatch scripts/hpc/train_oc2_mini_xor.slurm
+sbatch scripts/hpc/train_oc2_mini_homing.slurm
+sbatch scripts/hpc/train_oc2_mini_foraging.slurm
+sbatch scripts/hpc/train_oc2_mini_sheltering.slurm
+```
+
+These launchers use distinct `OC2-mini_<Mission>_cyclamen_v1_hpc_<seed>` run and
+checkpoint directories, and the existing common launcher without extra retries.
+
+Playback automatically reconstructs mini from its checkpoint:
+
+```bash
+python scripts/play.py --config configs/OC2-mini_Foraging_cyclamen.yaml --checkpoint checkpoints/OC2-mini_Foraging_cyclamen/option_critic_2_final.pt
+```
+
+The existing evaluator also loads mini through the OC2 interface. Keep its
+outputs separate from full OC2:
+
+```bash
+python scripts/evaluate_behavior_time.py --mission foraging --methods oc2 --oc2-config configs/OC2-mini_Foraging_cyclamen.yaml --oc2-pattern "OC2-mini_Foraging_cyclamen_v1_hpc_{index}/option_critic_2_final.pt" --num-runs 10 --episodes-per-checkpoint 20 --output-dir analysis/oc2_mini_foraging
+```
+
+Run `python scripts/validate_oc2_mini.py` for memory-independence, gradient-path,
+checkpoint, config, and counterfactual trainer regression tests. This variant
+tests whether reduced motor capacity encourages useful composition; it does
+**not** guarantee diverse options or equal usage. Compare mission reward,
+actual option changes/dwell times, and forced-single-option/termination
+ablations across seeds before concluding that the hierarchy is useful.
 
 ## Sensor Suite
 
@@ -497,14 +578,33 @@ python scripts/evaluate_behavior_time.py --mission sheltering --checkpoint-root 
 This writes CSV summaries and plots under `analysis/<mission>_behavior_time/`.
 If `poca_final.pt` or `option_critic_final.pt` is missing for a run, the script
 falls back to the latest numbered checkpoint in that run directory.
-For speed, all available controllers for a method are evaluated concurrently in
-one vectorized IsaacLab environment by default. The script reuses that single
-IsaacLab environment for Cyclamen and OC-Cyclamen to avoid slow or fragile
-stage teardown/recreation between methods. Use `--batch-size N` to limit
-concurrency, or `--sequential` for one checkpoint at a time while still reusing
-the same IsaacLab environment.
+For speed, controller and episode replicas are evaluated concurrently in one
+vectorized IsaacLab environment. Use `--episodes-per-checkpoint N` for repeated
+matched scenarios and `--batch-size N` to limit concurrent controllers. The
+CSV output includes one row per episode and a `controller_summary.csv` that
+averages episodes within each independently trained checkpoint. Use the latter
+as the statistical unit. Dandelion and OC2 use continuous wheel actions and
+must be evaluated separately from the discrete Cyclamen/OC1 environment.
 Use `--deterministic` for argmax actions and thresholded OC terminations;
 the default is stochastic playback, matching `scripts/play.py`.
+
+Run the complete Directional Gate Option-Critic validation battery with 20
+matched stochastic episodes for each of 10 checkpoints:
+
+```bash
+python scripts/run_option_critic_validation.py --mission dirgate --checkpoint-root checkpoints --output-root analysis/dirgate_option_critic_tests
+```
+
+The battery evaluates Dandelion, Cyclamen, learned/disabled/fixed termination
+for OC1 and OC2, and all six OC2 options forced for a complete episode. Each
+condition is isolated under `raw/`; consolidated tables, figures, paired tests,
+and `REPORT.md` are written under `report/`. Add `--skip-existing` to resume
+without rerunning completed conditions. Rebuild only the consolidated report
+with:
+
+```bash
+python scripts/report_option_critic_validation.py --input-root analysis/dirgate_option_critic_tests
+```
 
 GUI playback keeps normal viewport fidelity by default: native resolution,
 scene materials, a 60 Hz swarm animation, and the terminal/editor status HUD.

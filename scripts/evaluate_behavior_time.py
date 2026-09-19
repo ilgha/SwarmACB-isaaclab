@@ -2,13 +2,13 @@
 # Copyright (c) 2025 SwarmACB Project
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Headless behavior, performance, and persistence evaluation for Cyclamen controllers.
+"""Headless behavior, performance, and persistence evaluation for swarm controllers.
 
-The script evaluates one episode per checkpoint and measures how much robot-time
-is spent in each of the six fixed behavior modules. It also compares episode
-reward and temporal persistence, measured from uninterrupted behavior dwell
-segments. It supports both classical Cyclamen POCA checkpoints and fixed-option
-Option-Critic checkpoints, for any implemented benchmark mission.
+The script evaluates matched episodes per checkpoint and measures reward,
+behavior/option usage, termination, and uninterrupted dwell segments. It
+supports Dandelion, classical Cyclamen POCA, fixed-option Option-Critic (OC1),
+and learned intra-option Option-Critic (OC2) for every benchmark mission.
+Continuous-action methods must be evaluated in separate invocations.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from isaaclab.app import AppLauncher
 from _isaac_launch import apply_windows_kit_defaults
 
 
-BEHAVIOR_NAMES = [
+FIXED_BEHAVIOR_NAMES = [
     "Stop",
     "Exploration",
     "Attraction",
@@ -31,6 +31,9 @@ BEHAVIOR_NAMES = [
     "Phototaxis",
     "Anti-phototaxis",
 ]
+# Kept for the legacy single-checkpoint helper below. The vectorized evaluator
+# uses result-specific labels so learned options are never named as fixed modules.
+BEHAVIOR_NAMES = FIXED_BEHAVIOR_NAMES
 
 MISSION_PRESETS = {
     "dirgate": {
@@ -72,7 +75,7 @@ MISSION_PRESETS = {
 
 
 parser = argparse.ArgumentParser(
-    description="Evaluate behavior time for Cyclamen and fixed-option OC-Cyclamen checkpoints."
+    description="Evaluate Cyclamen, fixed-option OC1, or learned-option OC2 checkpoints."
 )
 parser.add_argument(
     "--mission",
@@ -88,12 +91,34 @@ parser.add_argument(
     help="Classical Cyclamen config. Defaults to configs/<Mission>_cyclamen.yaml.",
 )
 parser.add_argument(
+    "--dandelion-config",
+    type=str,
+    default=None,
+    help="Dandelion config. Defaults to configs/<Mission>_dandelion.yaml.",
+)
+parser.add_argument(
     "--oc-config",
     type=str,
     default=None,
     help="OC-Cyclamen config. Defaults to configs/OC_<Mission>_cyclamen.yaml.",
 )
+parser.add_argument(
+    "--oc2-config",
+    type=str,
+    default=None,
+    help="OC2 config. Defaults to configs/OC2_<Mission>_cyclamen.yaml.",
+)
 parser.add_argument("--checkpoint-root", type=str, default="checkpoints")
+parser.add_argument(
+    "--methods",
+    nargs="+",
+    choices=("dandelion", "cyclamen", "oc1", "oc2"),
+    default=("cyclamen", "oc1"),
+    help=(
+        "Methods to evaluate. OC2 must be run alone because its environment "
+        "uses continuous primitive wheel actions."
+    ),
+)
 parser.add_argument(
     "--classical-pattern",
     type=str,
@@ -102,6 +127,15 @@ parser.add_argument(
         "Checkpoint path pattern relative to --checkpoint-root. Supports "
         "{mission}, {prefix}, {index}, {i}, and {run}. Defaults to "
         "{prefix}_cyclamen_hpc_{index}/poca_final.pt."
+    ),
+)
+parser.add_argument(
+    "--dandelion-pattern",
+    type=str,
+    default=None,
+    help=(
+        "Dandelion checkpoint pattern relative to --checkpoint-root. Defaults to "
+        "{prefix}_dandelion_hpc_{index}/poca_final.pt."
     ),
 )
 parser.add_argument(
@@ -114,7 +148,22 @@ parser.add_argument(
         "OC_{prefix}_cyclamen_hpc_{index}/option_critic_final.pt."
     ),
 )
+parser.add_argument(
+    "--oc2-pattern",
+    type=str,
+    default=None,
+    help=(
+        "OC2 checkpoint pattern relative to --checkpoint-root. Defaults to "
+        "OC2_{prefix}_cyclamen_aoc_hpc_{index}/option_critic_2_final.pt."
+    ),
+)
 parser.add_argument("--num-runs", type=int, default=10)
+parser.add_argument(
+    "--episodes-per-checkpoint",
+    type=int,
+    default=1,
+    help="Matched evaluation episodes for every trained checkpoint.",
+)
 parser.add_argument(
     "--batch-size",
     type=int,
@@ -138,6 +187,24 @@ parser.add_argument(
     "--deterministic",
     action="store_true",
     help="Use argmax actions and threshold OC termination at 0.5. Default is stochastic playback.",
+)
+parser.add_argument(
+    "--termination-mode",
+    choices=("learned", "never", "fixed"),
+    default="learned",
+    help="OC termination intervention used during evaluation.",
+)
+parser.add_argument(
+    "--fixed-option-duration-s",
+    type=float,
+    default=35.0,
+    help="Option duration in seconds when --termination-mode=fixed.",
+)
+parser.add_argument(
+    "--force-option",
+    type=int,
+    default=-1,
+    help="For OC2, hold this learned option for the entire episode; -1 disables forcing.",
 )
 parser.add_argument(
     "--allow-missing",
@@ -170,8 +237,12 @@ import torch
 
 import SwarmACB_isaac.tasks  # noqa: F401
 from SwarmACB_isaac.tasks.direct.agents.config_loader import load_config
+from SwarmACB_isaac.tasks.direct.agents.learned_option_critic_networks import (
+    LearnedOptionActor,
+)
 from SwarmACB_isaac.tasks.direct.agents.option_critic_networks import FixedOptionManager
 from SwarmACB_isaac.tasks.direct.agents.poca_networks import (
+    Actor,
     DiscreteActor,
     RecurrentDiscreteActor,
     checkpoint_memory_size,
@@ -198,24 +269,51 @@ def _default_classical_config() -> str:
     return f"configs/{_mission_prefix()}_cyclamen.yaml"
 
 
+def _default_dandelion_config() -> str:
+    return f"configs/{_mission_prefix()}_dandelion.yaml"
+
+
 def _default_oc_config() -> str:
     return f"configs/OC_{_mission_prefix()}_cyclamen.yaml"
+
+
+def _default_oc2_config() -> str:
+    return f"configs/OC2_{_mission_prefix()}_cyclamen.yaml"
 
 
 def _classical_config() -> str:
     return args.classical_config or _default_classical_config()
 
 
+def _dandelion_config() -> str:
+    return args.dandelion_config or _default_dandelion_config()
+
+
 def _oc_config() -> str:
     return args.oc_config or _default_oc_config()
+
+
+def _oc2_config() -> str:
+    return args.oc2_config or _default_oc2_config()
 
 
 def _classical_pattern() -> str:
     return args.classical_pattern or "{prefix}_cyclamen_hpc_{index}/poca_final.pt"
 
 
+def _dandelion_pattern() -> str:
+    return args.dandelion_pattern or "{prefix}_dandelion_hpc_{index}/poca_final.pt"
+
+
 def _oc_pattern() -> str:
     return args.oc_pattern or "OC_{prefix}_cyclamen_hpc_{index}/option_critic_final.pt"
+
+
+def _oc2_pattern() -> str:
+    return (
+        args.oc2_pattern
+        or "OC2_{prefix}_cyclamen_aoc_hpc_{index}/option_critic_2_final.pt"
+    )
 
 
 def _output_dir() -> Path:
@@ -236,13 +334,20 @@ def _resolve_env_cfg(task_id: str):
     return getattr(mod, cls_name)()
 
 
-def _load_env(config_path: str, num_envs: int):
+def _load_env(config_path: str, num_envs: int, learned_options: bool = False):
     _run_name, variant, cfg, env_overrides = load_config(config_path)
     decision_period = max(1, int(getattr(cfg, "decision_period", 1)))
     task_id = args.task or _task_from_overrides(env_overrides) or _mission_preset()["task"]
     env_cfg = _resolve_env_cfg(task_id)
+    env_cfg.seed = None if args.seed < 0 else args.seed
     if hasattr(env_cfg, "update_variant"):
         env_cfg.update_variant(variant)
+    if learned_options:
+        if not hasattr(env_cfg, "use_continuous_actions"):
+            raise ValueError(
+                f"Task {task_id} does not expose the continuous action interface required by OC2."
+            )
+        env_cfg.use_continuous_actions(full_observations=True)
     env_cfg.scene.num_envs = num_envs
     for key, value in env_overrides.items():
         if key == "num_envs":
@@ -260,6 +365,9 @@ def _load_env(config_path: str, num_envs: int):
 def _reset_env(env, seed: int | None):
     if seed is None:
         return env.reset()
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     try:
         return env.reset(seed=seed)
     except TypeError:
@@ -292,6 +400,8 @@ def _latest_checkpoint_fallback(path: Path) -> Path | None:
         candidates = sorted(path.parent.glob("poca_*.pt"), key=_checkpoint_step)
     elif path.name == "option_critic_final.pt":
         candidates = sorted(path.parent.glob("option_critic_*.pt"), key=_checkpoint_step)
+    elif path.name == "option_critic_2_final.pt":
+        candidates = sorted(path.parent.glob("option_critic_2_*.pt"), key=_checkpoint_step)
     else:
         candidates = []
     candidates = [candidate for candidate in candidates if candidate.name != path.name]
@@ -337,6 +447,29 @@ def _build_policy(ckpt: dict, obs_dim: int, device: torch.device):
     recurrent = bool(ckpt.get("recurrent", False))
     memory_size = checkpoint_memory_size(ckpt)
 
+    if trainer_type == "learned_option_critic":
+        actor = LearnedOptionActor.from_checkpoint(ckpt, device)
+        if actor.obs_dim != obs_dim:
+            raise RuntimeError(
+                f"OC2 checkpoint expects obs_dim={actor.obs_dim}, but the "
+                f"environment produced obs_dim={obs_dim}."
+            )
+        actor.eval()
+        return {
+            "trainer_type": trainer_type,
+            "model": actor,
+            "recurrent": True,
+            "continuous": True,
+            "memory_size": actor.hidden_size,
+            "num_actions": actor.num_options,
+            "act_dim": actor.act_dim,
+            "option_epsilon": float(ckpt.get(
+                "current_option_epsilon",
+                ckpt.get("option_epsilon_final", 0.1),
+            )),
+            "action_transform": ckpt.get("action_transform", "identity_normalized"),
+        }
+
     if trainer_type == "option_critic":
         manager = FixedOptionManager(
             obs_dim, num_options, hidden_dim, num_layers, memory_size,
@@ -347,12 +480,25 @@ def _build_policy(ckpt: dict, obs_dim: int, device: torch.device):
             "trainer_type": trainer_type,
             "model": manager,
             "recurrent": True,
+            "continuous": False,
             "memory_size": memory_size,
             "num_actions": num_options,
         }
 
     if not discrete:
-        raise ValueError("This behavior-time evaluator expects discrete fixed-module Cyclamen checkpoints.")
+        actor = Actor(obs_dim, ckpt.get("act_dim", 2), hidden_dim, num_layers).to(device)
+        actor.load_state_dict(ckpt["actor"])
+        actor.eval()
+        return {
+            "trainer_type": trainer_type,
+            "model": actor,
+            "recurrent": False,
+            "continuous": True,
+            "memory_size": 0,
+            "num_actions": 1,
+            "act_dim": int(ckpt.get("act_dim", 2)),
+            "action_transform": "clip_minus3_3_divide3",
+        }
 
     if recurrent:
         actor = RecurrentDiscreteActor(
@@ -366,6 +512,7 @@ def _build_policy(ckpt: dict, obs_dim: int, device: torch.device):
         "trainer_type": trainer_type,
         "model": actor,
         "recurrent": recurrent,
+        "continuous": False,
         "memory_size": memory_size,
         "num_actions": num_actions,
     }
@@ -376,15 +523,15 @@ def _count_actions(action_ids: torch.Tensor, active_mask: torch.Tensor, counts: 
     if active_actions.numel() == 0:
         return
     counts += torch.bincount(
-        active_actions.reshape(-1).clamp(min=0, max=len(BEHAVIOR_NAMES) - 1),
-        minlength=len(BEHAVIOR_NAMES),
+        active_actions.reshape(-1).clamp(min=0, max=counts.numel() - 1),
+        minlength=counts.numel(),
     ).to(counts)
 
 
 def _count_actions_for_env(action_ids: torch.Tensor, counts: torch.Tensor):
     counts += torch.bincount(
-        action_ids.reshape(-1).clamp(min=0, max=len(BEHAVIOR_NAMES) - 1),
-        minlength=len(BEHAVIOR_NAMES),
+        action_ids.reshape(-1).clamp(min=0, max=counts.numel() - 1),
+        minlength=counts.numel(),
     ).to(counts)
 
 
@@ -426,7 +573,25 @@ def _usage_entropy(fractions: torch.Tensor) -> tuple[float, float]:
     if valid.numel() == 0:
         return 0.0, 0.0
     entropy = -(valid * valid.log()).sum().item()
-    return entropy, entropy / math.log(len(BEHAVIOR_NAMES))
+    normalizer = math.log(fractions.numel()) if fractions.numel() > 1 else 1.0
+    return entropy, entropy / normalizer
+
+
+def _termination_intervention(
+    learned_terminate: torch.Tensor,
+    valid_current: torch.Tensor,
+    option_age: torch.Tensor,
+    decision_dt: float,
+) -> torch.Tensor:
+    if args.force_option >= 0 or args.termination_mode == "never":
+        return torch.zeros_like(learned_terminate)
+    if args.termination_mode == "fixed":
+        duration_decisions = max(
+            1,
+            round(args.fixed_option_duration_s / decision_dt),
+        )
+        return valid_current & (option_age >= duration_decisions)
+    return learned_terminate
 
 
 def _record_persistence_step(
@@ -476,12 +641,432 @@ def _finalize_persistence_env(
     lengths.zero_()
 
 
+def _evaluate_checkpoints_parallel(
+    env,
+    controller_specs: list[dict],
+    decision_dt: float,
+    decision_period: int,
+    seed: int | None,
+    replicas_per_controller: int,
+) -> list[dict]:
+    """Evaluate multiple episodes and controllers in one vectorized simulation."""
+    obs_dict, _ = _reset_env(env, seed)
+    unwrapped = env.unwrapped
+    device = unwrapped.device
+    agents = unwrapped.cfg.possible_agents
+    num_agents = len(agents)
+    controller_count = len(controller_specs)
+    evaluation_count = controller_count * replicas_per_controller
+    if unwrapped.num_envs < evaluation_count:
+        raise ValueError(
+            f"Parallel evaluation needs {evaluation_count} envs, got {unwrapped.num_envs}."
+        )
+
+    policies = []
+    for controller_index, spec in enumerate(controller_specs):
+        env_start = controller_index * replicas_per_controller
+        env_end = env_start + replicas_per_controller
+        checkpoint_path = spec["checkpoint"]
+        obs_dim = obs_dict[agents[0]][env_start].reshape(-1).shape[-1]
+        ckpt = torch.load(checkpoint_path, map_location=device)
+        policy = _build_policy(ckpt, obs_dim, device)
+        policy.update({
+            "method": spec["method"],
+            "checkpoint": checkpoint_path,
+            "run_index": _infer_run_index(checkpoint_path),
+            "env_start": env_start,
+            "env_end": env_end,
+        })
+        recurrent_batch = replicas_per_controller * num_agents
+        if policy["trainer_type"] in ("option_critic", "learned_option_critic"):
+            policy["memory_h"], policy["memory_c"] = policy["model"].initial_state(
+                recurrent_batch,
+                device,
+            )
+            policy["current_options"] = torch.full(
+                (replicas_per_controller, num_agents),
+                -1,
+                dtype=torch.long,
+                device=device,
+            )
+            policy["option_age"] = torch.zeros(
+                (replicas_per_controller, num_agents),
+                dtype=torch.long,
+                device=device,
+            )
+        elif policy["recurrent"]:
+            policy["memory_h"], policy["memory_c"] = policy["model"].initial_state(
+                recurrent_batch,
+                device,
+            )
+            policy["current_options"] = None
+            policy["option_age"] = None
+        else:
+            policy["memory_h"] = policy["memory_c"] = None
+            policy["current_options"] = None
+            policy["option_age"] = None
+        policies.append(policy)
+
+    continuous_batch = all(policy["continuous"] for policy in policies)
+    if any(policy["continuous"] != continuous_batch for policy in policies):
+        raise ValueError("Continuous and discrete policies require separate environments.")
+    learned_batch = all(
+        policy["trainer_type"] == "learned_option_critic" for policy in policies
+    )
+    num_categories = policies[0]["num_actions"]
+    if any(policy["num_actions"] != num_categories for policy in policies):
+        raise ValueError("All checkpoints in a parallel batch need matching action/option counts.")
+    if learned_batch:
+        behavior_names = [f"Learned option {index}" for index in range(num_categories)]
+    elif continuous_batch:
+        behavior_names = ["Flat continuous policy"]
+    else:
+        behavior_names = FIXED_BEHAVIOR_NAMES[:num_categories]
+
+    counts = torch.zeros((evaluation_count, num_categories), dtype=torch.float64, device=device)
+    ep_reward = torch.zeros(evaluation_count, device=device)
+    active_envs = torch.ones(evaluation_count, dtype=torch.bool, device=device)
+    episode_lengths = torch.zeros(evaluation_count, dtype=torch.long, device=device)
+    prev_actions = torch.full(
+        (evaluation_count, num_agents), -1, dtype=torch.long, device=device,
+    )
+    dwell_steps = torch.zeros(
+        (evaluation_count, num_agents), dtype=torch.long, device=device,
+    )
+    switch_counts = torch.zeros(evaluation_count, dtype=torch.float64, device=device)
+    termination_counts = torch.zeros_like(switch_counts)
+    termination_opportunities = torch.zeros_like(switch_counts)
+    termination_probability_sums = torch.zeros_like(switch_counts)
+    termination_entropy_sums = torch.zeros_like(switch_counts)
+    dwell_segments: list[list[tuple[int, int]]] = [
+        [] for _ in range(evaluation_count)
+    ]
+
+    with torch.no_grad():
+        while bool(active_envs.any().item()):
+            action_ids = torch.zeros(
+                (evaluation_count, num_agents), dtype=torch.long, device=device,
+            )
+            continuous_actions = None
+            if continuous_batch:
+                continuous_actions = torch.zeros(
+                    (evaluation_count, num_agents, policies[0]["act_dim"]),
+                    dtype=obs_dict[agents[0]].dtype,
+                    device=device,
+                )
+
+            for policy in policies:
+                start, end = policy["env_start"], policy["env_end"]
+                active = active_envs[start:end]
+                if not bool(active.any().item()):
+                    continue
+                obs = torch.stack(
+                    [obs_dict[agent][start:end] for agent in agents],
+                    dim=1,
+                )
+                obs = obs.reshape(replicas_per_controller, num_agents, -1)
+                flat_obs = obs.reshape(-1, obs.shape[-1])
+                model = policy["model"]
+
+                if policy["trainer_type"] == "learned_option_critic":
+                    (
+                        _selector_logits,
+                        option_values,
+                        termination_logits,
+                        action_means,
+                        action_stds,
+                        _attentions,
+                        next_memory,
+                    ) = model.step(flat_obs, (policy["memory_h"], policy["memory_c"]))
+                    policy["memory_h"], policy["memory_c"] = (
+                        next_memory[0].detach(),
+                        next_memory[1].detach(),
+                    )
+                    proposed = (
+                        option_values.argmax(dim=-1)
+                        if args.deterministic
+                        else model.option_dist(
+                            option_values,
+                            epsilon=policy["option_epsilon"],
+                        ).sample()
+                    ).view(replicas_per_controller, num_agents)
+                    if args.force_option >= 0:
+                        if args.force_option >= policy["num_actions"]:
+                            raise ValueError(
+                                f"Forced option {args.force_option} is outside "
+                                f"[0, {policy['num_actions'] - 1}]."
+                            )
+                        proposed.fill_(args.force_option)
+
+                    current = policy["current_options"]
+                    force_new = (current < 0) & active.unsqueeze(-1)
+                    valid = (current >= 0) & active.unsqueeze(-1)
+                    beta_logits = model.selected_termination_logits(
+                        termination_logits,
+                        current.clamp(min=0).reshape(-1),
+                    ).view(replicas_per_controller, num_agents)
+                    beta_prob = torch.sigmoid(beta_logits)
+                    clipped = beta_prob.clamp(1e-6, 1.0 - 1e-6)
+                    termination_opportunities[start:end] += valid.sum(dim=1).double()
+                    termination_probability_sums[start:end] += (beta_prob * valid).sum(dim=1).double()
+                    termination_entropy_sums[start:end] += (
+                        (-clipped * clipped.log() - (1.0 - clipped) * (1.0 - clipped).log())
+                        * valid
+                    ).sum(dim=1).double()
+                    learned_terminate = (
+                        beta_logits > 0.0
+                        if args.deterministic
+                        else torch.distributions.Bernoulli(logits=beta_logits).sample().bool()
+                    ) & active.unsqueeze(-1)
+                    terminate = _termination_intervention(
+                        learned_terminate,
+                        valid,
+                        policy["option_age"],
+                        decision_dt,
+                    )
+                    termination_counts[start:end] += (terminate & valid).sum(dim=1).double()
+                    boundary = terminate | force_new
+                    current = torch.where(boundary, proposed, current)
+                    policy["current_options"] = current
+                    policy["option_age"] = torch.where(
+                        boundary,
+                        torch.ones_like(policy["option_age"]),
+                        policy["option_age"] + active.unsqueeze(-1).long(),
+                    )
+                    action_ids[start:end] = current
+                    action_dist = model.selected_action_dist(
+                        action_means,
+                        action_stds,
+                        current.reshape(-1),
+                    )
+                    raw_actions = action_dist.mean if args.deterministic else action_dist.sample()
+                    if policy["action_transform"] == "clip_minus3_3_divide3":
+                        raw_actions = raw_actions.clamp(-3.0, 3.0) / 3.0
+                    elif policy["action_transform"] != "identity_normalized":
+                        raise RuntimeError(
+                            f"Unsupported OC2 action transform {policy['action_transform']!r}."
+                        )
+                    continuous_actions[start:end] = raw_actions.view(
+                        replicas_per_controller,
+                        num_agents,
+                        policy["act_dim"],
+                    )
+
+                elif policy["trainer_type"] == "option_critic":
+                    option_logits, termination_logits, next_memory = model.step(
+                        flat_obs,
+                        (policy["memory_h"], policy["memory_c"]),
+                    )
+                    policy["memory_h"], policy["memory_c"] = (
+                        next_memory[0].detach(),
+                        next_memory[1].detach(),
+                    )
+                    proposed = (
+                        option_logits.argmax(dim=-1)
+                        if args.deterministic
+                        else torch.distributions.Categorical(logits=option_logits).sample()
+                    ).view(replicas_per_controller, num_agents)
+                    current = policy["current_options"]
+                    force_new = (current < 0) & active.unsqueeze(-1)
+                    valid = (current >= 0) & active.unsqueeze(-1)
+                    beta_logits = termination_logits.gather(
+                        -1,
+                        current.clamp(min=0).reshape(-1).unsqueeze(-1),
+                    ).squeeze(-1).view(replicas_per_controller, num_agents)
+                    beta_prob = torch.sigmoid(beta_logits)
+                    clipped = beta_prob.clamp(1e-6, 1.0 - 1e-6)
+                    termination_opportunities[start:end] += valid.sum(dim=1).double()
+                    termination_probability_sums[start:end] += (beta_prob * valid).sum(dim=1).double()
+                    termination_entropy_sums[start:end] += (
+                        (-clipped * clipped.log() - (1.0 - clipped) * (1.0 - clipped).log())
+                        * valid
+                    ).sum(dim=1).double()
+                    learned_terminate = (
+                        beta_logits > 0.0
+                        if args.deterministic
+                        else torch.distributions.Bernoulli(logits=beta_logits).sample().bool()
+                    ) & active.unsqueeze(-1)
+                    terminate = _termination_intervention(
+                        learned_terminate,
+                        valid,
+                        policy["option_age"],
+                        decision_dt,
+                    )
+                    termination_counts[start:end] += (terminate & valid).sum(dim=1).double()
+                    boundary = terminate | force_new
+                    current = torch.where(boundary, proposed, current)
+                    policy["current_options"] = current
+                    policy["option_age"] = torch.where(
+                        boundary,
+                        torch.ones_like(policy["option_age"]),
+                        policy["option_age"] + active.unsqueeze(-1).long(),
+                    )
+                    action_ids[start:end] = current
+
+                elif policy["continuous"]:
+                    dist = model.get_dist(flat_obs)
+                    raw_actions = dist.mean if args.deterministic else dist.sample()
+                    continuous_actions[start:end] = raw_actions.clamp(-3.0, 3.0).div(3.0).view(
+                        replicas_per_controller,
+                        num_agents,
+                        policy["act_dim"],
+                    )
+
+                elif policy["recurrent"]:
+                    logits, next_memory = model.step(
+                        flat_obs,
+                        (policy["memory_h"], policy["memory_c"]),
+                    )
+                    policy["memory_h"], policy["memory_c"] = (
+                        next_memory[0].detach(),
+                        next_memory[1].detach(),
+                    )
+                    flat_actions = (
+                        logits.argmax(dim=-1)
+                        if args.deterministic
+                        else torch.distributions.Categorical(logits=logits).sample()
+                    )
+                    action_ids[start:end] = flat_actions.view(replicas_per_controller, num_agents)
+                else:
+                    dist = model.get_dist(flat_obs)
+                    flat_actions = dist.probs.argmax(dim=-1) if args.deterministic else dist.sample()
+                    action_ids[start:end] = flat_actions.view(replicas_per_controller, num_agents)
+
+                for local_index in active.nonzero(as_tuple=False).flatten().tolist():
+                    env_index = start + local_index
+                    _count_actions_for_env(action_ids[env_index], counts[env_index])
+                    _record_persistence_step(
+                        env_index,
+                        action_ids[env_index],
+                        prev_actions,
+                        dwell_steps,
+                        dwell_segments,
+                        switch_counts,
+                    )
+
+            action_dict = {
+                agent: (
+                    continuous_actions[:, agent_index]
+                    if continuous_batch
+                    else action_ids[:, agent_index].unsqueeze(-1)
+                )
+                for agent_index, agent in enumerate(agents)
+            }
+            decision_active = active_envs.clone()
+            done = torch.zeros_like(active_envs)
+            for _ in range(decision_period):
+                obs_dict, reward_dict, terminated_dict, truncated_dict, _info = env.step(action_dict)
+                ep_reward += reward_dict[agents[0]][:evaluation_count] * decision_active.float()
+                episode_lengths[decision_active] += 1
+                step_done = (
+                    terminated_dict[agents[0]] | truncated_dict[agents[0]]
+                )[:evaluation_count]
+                newly_done_step = decision_active & step_done
+                done |= newly_done_step
+                if bool(newly_done_step.any().item()):
+                    for agent in agents:
+                        action_dict[agent][newly_done_step] = 0
+                decision_active &= ~step_done
+                if not bool(decision_active.any().item()):
+                    break
+            newly_done = active_envs & done
+            for env_index in newly_done.nonzero(as_tuple=False).flatten().tolist():
+                _finalize_persistence_env(
+                    env_index,
+                    prev_actions,
+                    dwell_steps,
+                    dwell_segments,
+                )
+            active_envs &= ~done
+
+    results = []
+    for env_index in range(evaluation_count):
+        controller_index = env_index // replicas_per_controller
+        episode_index = env_index % replicas_per_controller
+        policy = policies[controller_index]
+        total_counts = counts[env_index].sum().clamp(min=1.0)
+        seconds = counts[env_index] * decision_dt
+        fractions = counts[env_index] / total_counts
+        entropy, normalized_entropy = _usage_entropy(fractions)
+        segment_steps = [steps for _category, steps in dwell_segments[env_index]]
+        segment_seconds = [steps * decision_dt for steps in segment_steps]
+        per_behavior_steps = [
+            [steps for category, steps in dwell_segments[env_index] if category == target]
+            for target in range(num_categories)
+        ]
+        option_method = policy["trainer_type"] in ("option_critic", "learned_option_critic")
+        termination_denominator = max(1.0, termination_opportunities[env_index].item())
+        results.append({
+            "mission": _mission_display(),
+            "method": policy["method"],
+            "run_index": policy["run_index"],
+            "episode_index": episode_index,
+            "evaluation_seed": seed,
+            "termination_mode": args.termination_mode if option_method else "not_applicable",
+            "forced_option": args.force_option if option_method else -1,
+            "checkpoint": str(policy["checkpoint"]),
+            "reward_mean": ep_reward[env_index].item(),
+            "episode_steps_mean": episode_lengths[env_index].float().item(),
+            "total_robot_seconds": seconds.sum().item(),
+            "switch_count": switch_counts[env_index].item(),
+            "switch_rate": switch_counts[env_index].item() / total_counts.item(),
+            "termination_count": termination_counts[env_index].item() if option_method else math.nan,
+            "termination_rate": (
+                termination_counts[env_index].item() / termination_denominator
+                if option_method else math.nan
+            ),
+            "mean_termination_probability": (
+                termination_probability_sums[env_index].item() / termination_denominator
+                if option_method else math.nan
+            ),
+            "termination_entropy": (
+                termination_entropy_sums[env_index].item() / termination_denominator
+                if option_method else math.nan
+            ),
+            "same_option_reselection_fraction": (
+                max(0.0, termination_counts[env_index].item() - switch_counts[env_index].item())
+                / max(1.0, termination_counts[env_index].item())
+                if option_method else math.nan
+            ),
+            "segment_count": len(segment_steps),
+            "mean_dwell_steps": _mean(segment_steps),
+            "median_dwell_steps": _median(segment_steps),
+            "mean_dwell_seconds": _mean(segment_seconds),
+            "median_dwell_seconds": _median(segment_seconds),
+            "behavior_usage_entropy": entropy,
+            "behavior_usage_entropy_norm": normalized_entropy,
+            "per_behavior_mean_dwell_seconds": [
+                _mean([steps * decision_dt for steps in values])
+                for values in per_behavior_steps
+            ],
+            "per_behavior_median_dwell_seconds": [
+                _median([steps * decision_dt for steps in values])
+                for values in per_behavior_steps
+            ],
+            "dwell_segments": [
+                {
+                    "behavior_id": category,
+                    "behavior": behavior_names[category],
+                    "dwell_steps": steps,
+                    "dwell_seconds": steps * decision_dt,
+                }
+                for category, steps in dwell_segments[env_index]
+            ],
+            "counts": counts[env_index].cpu().tolist(),
+            "seconds": seconds.cpu().tolist(),
+            "fractions": fractions.cpu().tolist(),
+            "behavior_names": behavior_names,
+        })
+    return results
+
+
 def _evaluate_checkpoints_batch(
     env,
     controller_specs: list[dict],
     decision_dt: float,
     decision_period: int,
     seed: int | None,
+    episode_index: int = 0,
 ) -> list[dict]:
     obs_dict, _ = _reset_env(env, seed)
     unwrapped = env.unwrapped
@@ -505,7 +1090,7 @@ def _evaluate_checkpoints_batch(
         policy["method"] = spec["method"]
         policy["checkpoint"] = checkpoint_path
         policy["run_index"] = _infer_run_index(checkpoint_path)
-        if policy["trainer_type"] == "option_critic":
+        if policy["trainer_type"] in ("option_critic", "learned_option_critic"):
             memory_h, memory_c = policy["model"].initial_state(num_agents, device)
             policy["memory_h"] = memory_h
             policy["memory_c"] = memory_c
@@ -515,19 +1100,45 @@ def _evaluate_checkpoints_batch(
                 dtype=torch.long,
                 device=device,
             )
+            policy["option_age"] = torch.zeros(
+                num_agents,
+                dtype=torch.long,
+                device=device,
+            )
         elif policy["recurrent"]:
             memory_h, memory_c = policy["model"].initial_state(num_agents, device)
             policy["memory_h"] = memory_h
             policy["memory_c"] = memory_c
             policy["current_options"] = None
+            policy["option_age"] = None
         else:
             policy["memory_h"] = None
             policy["memory_c"] = None
             policy["current_options"] = None
+            policy["option_age"] = None
         policies.append(policy)
 
+    continuous_batch = all(policy["continuous"] for policy in policies)
+    if any(policy["continuous"] != continuous_batch for policy in policies):
+        raise ValueError("Continuous and discrete policies require separate environments.")
+    learned_batch = all(
+        policy["trainer_type"] == "learned_option_critic" for policy in policies
+    )
+    num_categories = policies[0]["num_actions"]
+    if any(policy["num_actions"] != num_categories for policy in policies):
+        raise ValueError("All checkpoints in one batch must expose the same number of options/actions.")
+    behavior_names = (
+        [f"Learned option {index}" for index in range(num_categories)]
+        if learned_batch
+        else (
+            ["Flat continuous policy"]
+            if continuous_batch
+            else FIXED_BEHAVIOR_NAMES[:num_categories]
+        )
+    )
+
     counts = torch.zeros(
-        (active_count, len(BEHAVIOR_NAMES)),
+        (active_count, num_categories),
         dtype=torch.float64,
         device=device,
     )
@@ -546,6 +1157,10 @@ def _evaluate_checkpoints_batch(
         device=device,
     )
     switch_counts = torch.zeros(active_count, dtype=torch.float64, device=device)
+    termination_counts = torch.zeros(active_count, dtype=torch.float64, device=device)
+    termination_opportunities = torch.zeros(active_count, dtype=torch.float64, device=device)
+    termination_probability_sums = torch.zeros(active_count, dtype=torch.float64, device=device)
+    termination_entropy_sums = torch.zeros(active_count, dtype=torch.float64, device=device)
     dwell_segments: list[list[tuple[int, int]]] = [[] for _ in range(active_count)]
 
     with torch.no_grad():
@@ -555,6 +1170,13 @@ def _evaluate_checkpoints_batch(
                 dtype=torch.long,
                 device=device,
             )
+            continuous_actions = None
+            if continuous_batch:
+                continuous_actions = torch.zeros(
+                    (num_envs, num_agents, policies[0]["act_dim"]),
+                    dtype=obs_dict[agents[0]].dtype,
+                    device=device,
+                )
 
             for env_index, policy in enumerate(policies):
                 if not bool(active_envs[env_index].item()):
@@ -562,7 +1184,94 @@ def _evaluate_checkpoints_batch(
 
                 model = policy["model"]
                 obs = _obs_for_env(obs_dict, agents, env_index)
-                if policy["trainer_type"] == "option_critic":
+                if policy["trainer_type"] == "learned_option_critic":
+                    (
+                        _selector_logits,
+                        option_values,
+                        termination_logits,
+                        action_means,
+                        action_stds,
+                        _attentions,
+                        next_memory,
+                    ) = model.step(obs, (policy["memory_h"], policy["memory_c"]))
+                    policy["memory_h"] = next_memory[0].detach()
+                    policy["memory_c"] = next_memory[1].detach()
+                    if args.deterministic:
+                        proposed = option_values.argmax(dim=-1)
+                    else:
+                        proposed = model.option_dist(
+                            option_values,
+                            epsilon=policy["option_epsilon"],
+                        ).sample()
+                    if args.force_option >= 0:
+                        if args.force_option >= policy["num_actions"]:
+                            raise ValueError(
+                                f"Forced option {args.force_option} is outside "
+                                f"[0, {policy['num_actions'] - 1}]."
+                            )
+                        proposed.fill_(args.force_option)
+
+                    current_options = policy["current_options"]
+                    force_new = current_options < 0
+                    valid_current = ~force_new
+                    safe_current = current_options.clamp(min=0)
+                    beta_logits = model.selected_termination_logits(
+                        termination_logits,
+                        safe_current,
+                    )
+                    beta_prob = torch.sigmoid(beta_logits)
+                    if bool(valid_current.any().item()):
+                        valid_prob = beta_prob[valid_current]
+                        termination_opportunities[env_index] += valid_prob.numel()
+                        termination_probability_sums[env_index] += valid_prob.sum().double()
+                        clipped_prob = valid_prob.clamp(1e-6, 1.0 - 1e-6)
+                        termination_entropy_sums[env_index] += (
+                            -clipped_prob * clipped_prob.log()
+                            - (1.0 - clipped_prob) * (1.0 - clipped_prob).log()
+                        ).sum().double()
+                    if args.deterministic:
+                        learned_terminate = beta_logits > 0.0
+                    else:
+                        learned_terminate = torch.distributions.Bernoulli(
+                            logits=beta_logits,
+                        ).sample().bool()
+                    terminate = _termination_intervention(
+                        learned_terminate,
+                        valid_current,
+                        policy["option_age"],
+                        decision_dt,
+                    )
+                    termination_counts[env_index] += (terminate & valid_current).sum().double()
+                    boundary = terminate | force_new
+                    current_options = torch.where(
+                        boundary,
+                        proposed,
+                        current_options,
+                    )
+                    policy["current_options"] = current_options
+                    policy["option_age"] = torch.where(
+                        boundary,
+                        torch.ones_like(policy["option_age"]),
+                        policy["option_age"] + 1,
+                    )
+                    action_ids[env_index] = current_options
+
+                    action_dist = model.selected_action_dist(
+                        action_means,
+                        action_stds,
+                        current_options,
+                    )
+                    raw_actions = action_dist.mean if args.deterministic else action_dist.sample()
+                    action_transform = policy["action_transform"]
+                    if action_transform == "clip_minus3_3_divide3":
+                        raw_actions = raw_actions.clamp(-3.0, 3.0) / 3.0
+                    elif action_transform != "identity_normalized":
+                        raise RuntimeError(
+                            f"Unsupported OC2 action transform {action_transform!r}."
+                        )
+                    continuous_actions[env_index] = raw_actions
+
+                elif policy["trainer_type"] == "option_critic":
                     option_logits, termination_logits, next_memory = model.step(
                         obs,
                         (policy["memory_h"], policy["memory_c"]),
@@ -577,21 +1286,54 @@ def _evaluate_checkpoints_batch(
 
                     current_options = policy["current_options"]
                     force_new = current_options < 0
+                    valid_current = ~force_new
                     safe_current = current_options.clamp(min=0)
                     beta_logits = termination_logits.gather(
                         -1,
                         safe_current.unsqueeze(-1),
                     ).squeeze(-1)
+                    beta_prob = torch.sigmoid(beta_logits)
+                    if bool(valid_current.any().item()):
+                        valid_prob = beta_prob[valid_current]
+                        termination_opportunities[env_index] += valid_prob.numel()
+                        termination_probability_sums[env_index] += valid_prob.sum().double()
+                        clipped_prob = valid_prob.clamp(1e-6, 1.0 - 1e-6)
+                        termination_entropy_sums[env_index] += (
+                            -clipped_prob * clipped_prob.log()
+                            - (1.0 - clipped_prob) * (1.0 - clipped_prob).log()
+                        ).sum().double()
                     if args.deterministic:
-                        terminate = torch.sigmoid(beta_logits) > 0.5
+                        learned_terminate = beta_logits > 0.0
                     else:
-                        terminate = torch.distributions.Bernoulli(
+                        learned_terminate = torch.distributions.Bernoulli(
                             logits=beta_logits,
                         ).sample().bool()
-                    switch = terminate | force_new
-                    current_options = torch.where(switch, proposed, current_options)
+                    terminate = _termination_intervention(
+                        learned_terminate,
+                        valid_current,
+                        policy["option_age"],
+                        decision_dt,
+                    )
+                    termination_counts[env_index] += (terminate & valid_current).sum().double()
+                    boundary = terminate | force_new
+                    current_options = torch.where(
+                        boundary,
+                        proposed,
+                        current_options,
+                    )
                     policy["current_options"] = current_options
+                    policy["option_age"] = torch.where(
+                        boundary,
+                        torch.ones_like(policy["option_age"]),
+                        policy["option_age"] + 1,
+                    )
                     action_ids[env_index] = current_options
+
+                elif policy["continuous"]:
+                    dist = model.get_dist(obs)
+                    raw_actions = dist.mean if args.deterministic else dist.sample()
+                    continuous_actions[env_index] = raw_actions.clamp(-3.0, 3.0) / 3.0
+                    action_ids[env_index] = 0
 
                 elif policy["recurrent"]:
                     logits, next_memory = model.step(
@@ -622,10 +1364,16 @@ def _evaluate_checkpoints_batch(
                     switch_counts,
                 )
 
-            action_dict = {
-                agent: action_ids[:, i].unsqueeze(-1)
-                for i, agent in enumerate(agents)
-            }
+            if continuous_batch:
+                action_dict = {
+                    agent: continuous_actions[:, i]
+                    for i, agent in enumerate(agents)
+                }
+            else:
+                action_dict = {
+                    agent: action_ids[:, i].unsqueeze(-1)
+                    for i, agent in enumerate(agents)
+                }
             decision_active = active_envs.clone()
             done = torch.zeros_like(active_envs)
             for _ in range(decision_period):
@@ -664,18 +1412,46 @@ def _evaluate_checkpoints_batch(
         segment_seconds = [steps * decision_dt for steps in segment_steps]
         per_behavior_steps = [
             [steps for behavior_id, steps in dwell_segments[env_index] if behavior_id == target_id]
-            for target_id in range(len(BEHAVIOR_NAMES))
+            for target_id in range(num_categories)
         ]
+        termination_denominator = max(1.0, termination_opportunities[env_index].item())
+        option_method = policy["trainer_type"] in ("option_critic", "learned_option_critic")
         results.append({
             "mission": _mission_display(),
             "method": policy["method"],
             "run_index": policy["run_index"],
+            "episode_index": episode_index,
+            "evaluation_seed": seed,
+            "termination_mode": args.termination_mode if option_method else "not_applicable",
+            "forced_option": args.force_option if option_method else -1,
             "checkpoint": str(policy["checkpoint"]),
             "reward_mean": ep_reward[env_index].item(),
             "episode_steps_mean": episode_lengths[env_index].float().item(),
             "total_robot_seconds": seconds.sum().item(),
             "switch_count": switch_counts[env_index].item(),
             "switch_rate": switch_counts[env_index].item() / total_counts.item(),
+            "termination_count": (
+                termination_counts[env_index].item() if option_method else math.nan
+            ),
+            "termination_rate": (
+                termination_counts[env_index].item() / termination_denominator
+                if option_method else math.nan
+            ),
+            "mean_termination_probability": (
+                termination_probability_sums[env_index].item() / termination_denominator
+                if option_method else math.nan
+            ),
+            "termination_entropy": (
+                termination_entropy_sums[env_index].item() / termination_denominator
+                if option_method else math.nan
+            ),
+            "same_option_reselection_fraction": (
+                max(
+                    0.0,
+                    termination_counts[env_index].item() - switch_counts[env_index].item(),
+                ) / max(1.0, termination_counts[env_index].item())
+                if option_method else math.nan
+            ),
             "segment_count": len(segment_steps),
             "mean_dwell_steps": _mean(segment_steps),
             "median_dwell_steps": _median(segment_steps),
@@ -694,7 +1470,7 @@ def _evaluate_checkpoints_batch(
             "dwell_segments": [
                 {
                     "behavior_id": behavior_id,
-                    "behavior": BEHAVIOR_NAMES[behavior_id],
+                    "behavior": behavior_names[behavior_id],
                     "dwell_steps": steps,
                     "dwell_seconds": steps * decision_dt,
                 }
@@ -703,6 +1479,7 @@ def _evaluate_checkpoints_batch(
             "counts": counts[env_index].cpu().tolist(),
             "seconds": seconds.cpu().tolist(),
             "fractions": fractions.cpu().tolist(),
+            "behavior_names": behavior_names,
         })
     return results
 
@@ -857,9 +1634,77 @@ def _evaluate_checkpoint(
     }
 
 
+def _aggregate_controller_results(results: list[dict]) -> list[dict]:
+    grouped: dict[tuple, list[dict]] = {}
+    for row in results:
+        key = (
+            row["method"],
+            row["run_index"],
+            row["checkpoint"],
+            row["termination_mode"],
+            row["forced_option"],
+        )
+        grouped.setdefault(key, []).append(row)
+
+    scalar_metrics = (
+        "reward_mean",
+        "episode_steps_mean",
+        "total_robot_seconds",
+        "switch_count",
+        "switch_rate",
+        "termination_count",
+        "termination_rate",
+        "mean_termination_probability",
+        "termination_entropy",
+        "same_option_reselection_fraction",
+        "segment_count",
+        "mean_dwell_steps",
+        "median_dwell_steps",
+        "mean_dwell_seconds",
+        "median_dwell_seconds",
+        "behavior_usage_entropy",
+        "behavior_usage_entropy_norm",
+    )
+    aggregated = []
+    for rows in grouped.values():
+        out = dict(rows[0])
+        for metric in scalar_metrics:
+            values = [
+                float(row[metric])
+                for row in rows
+                if math.isfinite(float(row[metric]))
+            ]
+            out[metric] = _mean(values) if values else math.nan
+        for metric in (
+            "counts",
+            "seconds",
+            "fractions",
+            "per_behavior_mean_dwell_seconds",
+            "per_behavior_median_dwell_seconds",
+        ):
+            out[metric] = [
+                _mean([float(row[metric][index]) for row in rows])
+                for index in range(len(rows[0][metric]))
+            ]
+        rewards = [float(row["reward_mean"]) for row in rows]
+        out["episodes_evaluated"] = len(rows)
+        out["reward_episode_std"] = _std(rewards)
+        out["reward_episode_min"] = min(rewards)
+        out["reward_episode_max"] = max(rewards)
+        out["episode_index"] = -1
+        out["evaluation_seed"] = "multiple"
+        out["dwell_segments"] = []
+        aggregated.append(out)
+    return sorted(aggregated, key=lambda row: (row["method"], row["run_index"]))
+
+
 def _write_csv(results: list[dict], output_dir: Path):
+    behavior_names = results[0]["behavior_names"]
+    if any(row["behavior_names"] != behavior_names for row in results):
+        raise ValueError("Cannot combine fixed behavior labels and learned option labels in one report.")
     long_path = output_dir / "behavior_time_long.csv"
     summary_path = output_dir / "behavior_time_summary.csv"
+    controller_path = output_dir / "controller_summary.csv"
     dwell_path = output_dir / "behavior_dwell_segments.csv"
     method_path = output_dir / "method_comparison_summary.csv"
 
@@ -870,7 +1715,11 @@ def _write_csv(results: list[dict], output_dir: Path):
                 "method",
                 "mission",
                 "run_index",
+                "episode_index",
+                "evaluation_seed",
                 "checkpoint",
+                "termination_mode",
+                "forced_option",
                 "behavior_id",
                 "behavior",
                 "count",
@@ -879,17 +1728,23 @@ def _write_csv(results: list[dict], output_dir: Path):
                 "reward_mean",
                 "episode_steps_mean",
                 "switch_rate",
+                "termination_rate",
+                "mean_termination_probability",
                 "mean_dwell_seconds",
             ],
         )
         writer.writeheader()
         for row in results:
-            for behavior_id, behavior in enumerate(BEHAVIOR_NAMES):
+            for behavior_id, behavior in enumerate(behavior_names):
                 writer.writerow({
                     "method": row["method"],
                     "mission": row["mission"],
                     "run_index": row["run_index"],
+                    "episode_index": row["episode_index"],
+                    "evaluation_seed": row["evaluation_seed"],
                     "checkpoint": row["checkpoint"],
+                    "termination_mode": row["termination_mode"],
+                    "forced_option": row["forced_option"],
                     "behavior_id": behavior_id,
                     "behavior": behavior,
                     "count": row["counts"][behavior_id],
@@ -898,6 +1753,8 @@ def _write_csv(results: list[dict], output_dir: Path):
                     "reward_mean": row["reward_mean"],
                     "episode_steps_mean": row["episode_steps_mean"],
                     "switch_rate": row["switch_rate"],
+                    "termination_rate": row["termination_rate"],
+                    "mean_termination_probability": row["mean_termination_probability"],
                     "mean_dwell_seconds": row["mean_dwell_seconds"],
                 })
 
@@ -905,12 +1762,21 @@ def _write_csv(results: list[dict], output_dir: Path):
         "method",
         "mission",
         "run_index",
+        "episode_index",
+        "evaluation_seed",
         "checkpoint",
+        "termination_mode",
+        "forced_option",
         "reward_mean",
         "episode_steps_mean",
         "total_robot_seconds",
         "switch_count",
         "switch_rate",
+        "termination_count",
+        "termination_rate",
+        "mean_termination_probability",
+        "termination_entropy",
+        "same_option_reselection_fraction",
         "segment_count",
         "mean_dwell_steps",
         "median_dwell_steps",
@@ -919,7 +1785,7 @@ def _write_csv(results: list[dict], output_dir: Path):
         "behavior_usage_entropy",
         "behavior_usage_entropy_norm",
     ]
-    for behavior in BEHAVIOR_NAMES:
+    for behavior in behavior_names:
         key = _behavior_key(behavior)
         fieldnames += [
             f"{key}_seconds",
@@ -936,12 +1802,21 @@ def _write_csv(results: list[dict], output_dir: Path):
                 "method": row["method"],
                 "mission": row["mission"],
                 "run_index": row["run_index"],
+                "episode_index": row["episode_index"],
+                "evaluation_seed": row["evaluation_seed"],
                 "checkpoint": row["checkpoint"],
+                "termination_mode": row["termination_mode"],
+                "forced_option": row["forced_option"],
                 "reward_mean": row["reward_mean"],
                 "episode_steps_mean": row["episode_steps_mean"],
                 "total_robot_seconds": row["total_robot_seconds"],
                 "switch_count": row["switch_count"],
                 "switch_rate": row["switch_rate"],
+                "termination_count": row["termination_count"],
+                "termination_rate": row["termination_rate"],
+                "mean_termination_probability": row["mean_termination_probability"],
+                "termination_entropy": row["termination_entropy"],
+                "same_option_reselection_fraction": row["same_option_reselection_fraction"],
                 "segment_count": row["segment_count"],
                 "mean_dwell_steps": row["mean_dwell_steps"],
                 "median_dwell_steps": row["median_dwell_steps"],
@@ -950,12 +1825,39 @@ def _write_csv(results: list[dict], output_dir: Path):
                 "behavior_usage_entropy": row["behavior_usage_entropy"],
                 "behavior_usage_entropy_norm": row["behavior_usage_entropy_norm"],
             }
-            for behavior_id, behavior in enumerate(BEHAVIOR_NAMES):
+            for behavior_id, behavior in enumerate(behavior_names):
                 key = _behavior_key(behavior)
                 out[f"{key}_seconds"] = row["seconds"][behavior_id]
                 out[f"{key}_fraction"] = row["fractions"][behavior_id]
                 out[f"{key}_mean_dwell_seconds"] = row["per_behavior_mean_dwell_seconds"][behavior_id]
                 out[f"{key}_median_dwell_seconds"] = row["per_behavior_median_dwell_seconds"][behavior_id]
+            writer.writerow(out)
+
+    controller_results = _aggregate_controller_results(results)
+    controller_fieldnames = fieldnames + [
+        "episodes_evaluated",
+        "reward_episode_std",
+        "reward_episode_min",
+        "reward_episode_max",
+    ]
+    with controller_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=controller_fieldnames)
+        writer.writeheader()
+        for row in controller_results:
+            out = {
+                key: row[key]
+                for key in fieldnames
+                if key in row
+            }
+            for behavior_id, behavior in enumerate(behavior_names):
+                key = _behavior_key(behavior)
+                out[f"{key}_seconds"] = row["seconds"][behavior_id]
+                out[f"{key}_fraction"] = row["fractions"][behavior_id]
+                out[f"{key}_mean_dwell_seconds"] = row["per_behavior_mean_dwell_seconds"][behavior_id]
+                out[f"{key}_median_dwell_seconds"] = row["per_behavior_median_dwell_seconds"][behavior_id]
+            for key in controller_fieldnames:
+                if key in row and key not in out:
+                    out[key] = row[key]
             writer.writerow(out)
 
     with dwell_path.open("w", newline="", encoding="utf-8") as f:
@@ -965,7 +1867,11 @@ def _write_csv(results: list[dict], output_dir: Path):
                 "method",
                 "mission",
                 "run_index",
+                "episode_index",
+                "evaluation_seed",
                 "checkpoint",
+                "termination_mode",
+                "forced_option",
                 "behavior_id",
                 "behavior",
                 "dwell_steps",
@@ -979,16 +1885,24 @@ def _write_csv(results: list[dict], output_dir: Path):
                     "method": row["method"],
                     "mission": row["mission"],
                     "run_index": row["run_index"],
+                    "episode_index": row["episode_index"],
+                    "evaluation_seed": row["evaluation_seed"],
                     "checkpoint": row["checkpoint"],
+                    "termination_mode": row["termination_mode"],
+                    "forced_option": row["forced_option"],
                     **segment,
                 })
 
-    methods = list(dict.fromkeys(row["method"] for row in results))
+    methods = list(dict.fromkeys(row["method"] for row in controller_results))
     metric_names = [
         "reward_mean",
         "episode_steps_mean",
         "total_robot_seconds",
         "switch_rate",
+        "termination_rate",
+        "mean_termination_probability",
+        "termination_entropy",
+        "same_option_reselection_fraction",
         "mean_dwell_seconds",
         "median_dwell_seconds",
         "behavior_usage_entropy_norm",
@@ -1000,26 +1914,34 @@ def _write_csv(results: list[dict], output_dir: Path):
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for method in methods:
-            method_rows = [row for row in results if row["method"] == method]
+            method_rows = [row for row in controller_results if row["method"] == method]
             out = {
                 "method": method,
                 "mission": _mission_display(),
                 "num_runs": len(method_rows),
             }
             for metric in metric_names:
-                values = [float(row[metric]) for row in method_rows]
-                out[f"{metric}_mean"] = _mean(values)
-                out[f"{metric}_std"] = _std(values)
+                values = [
+                    float(row[metric])
+                    for row in method_rows
+                    if math.isfinite(float(row[metric]))
+                ]
+                out[f"{metric}_mean"] = _mean(values) if values else math.nan
+                out[f"{metric}_std"] = _std(values) if values else math.nan
             writer.writerow(out)
 
-    return long_path, summary_path, dwell_path, method_path
+    return long_path, summary_path, controller_path, dwell_path, method_path
 
 
 def _plot_results(results: list[dict], output_dir: Path):
+    results = _aggregate_controller_results(results)
+    behavior_names = results[0]["behavior_names"]
+    if any(row["behavior_names"] != behavior_names for row in results):
+        raise ValueError("Cannot plot fixed behaviors and learned options on the same categorical axis.")
     colors = ["#6b7280", "#2563eb", "#16a34a", "#ef4444", "#f59e0b", "#7c3aed"]
     method_colors = ["#2563eb", "#dc2626", "#16a34a", "#7c3aed", "#f59e0b"]
     methods = list(dict.fromkeys(row["method"] for row in results))
-    x = torch.arange(len(BEHAVIOR_NAMES), dtype=torch.float64)
+    x = torch.arange(len(behavior_names), dtype=torch.float64)
     width = 0.34 if len(methods) <= 2 else 0.8 / max(1, len(methods))
 
     def _plot_metric_by_method(ax, metric: str, ylabel: str, title: str):
@@ -1027,9 +1949,13 @@ def _plot_results(results: list[dict], output_dir: Path):
         means = []
         stds = []
         for method in methods:
-            values = [float(row[metric]) for row in results if row["method"] == method]
-            means.append(_mean(values))
-            stds.append(_std(values))
+            values = [
+                float(row[metric])
+                for row in results
+                if row["method"] == method and math.isfinite(float(row[metric]))
+            ]
+            means.append(_mean(values) if values else math.nan)
+            stds.append(_std(values) if values else 0.0)
         ax.bar(
             positions,
             means,
@@ -1039,7 +1965,11 @@ def _plot_results(results: list[dict], output_dir: Path):
             alpha=0.82,
         )
         for method_index, method in enumerate(methods):
-            values = [float(row[metric]) for row in results if row["method"] == method]
+            values = [
+                float(row[metric])
+                for row in results
+                if row["method"] == method and math.isfinite(float(row[metric]))
+            ]
             if not values:
                 continue
             if len(values) == 1:
@@ -1080,9 +2010,9 @@ def _plot_results(results: list[dict], output_dir: Path):
             alpha=0.86,
         )
     ax.set_xticks(x.numpy())
-    ax.set_xticklabels(BEHAVIOR_NAMES, rotation=20, ha="right")
+    ax.set_xticklabels(behavior_names, rotation=20, ha="right")
     ax.set_ylabel("Fraction of robot-time")
-    ax.set_title(f"{_mission_display()} Cyclamen Behavior Usage")
+    ax.set_title(f"{_mission_display()} Behavior / Option Usage")
     ax.set_ylim(0, max(0.05, ax.get_ylim()[1]))
     ax.grid(axis="y", alpha=0.25)
     ax.legend()
@@ -1094,7 +2024,7 @@ def _plot_results(results: list[dict], output_dir: Path):
     fig, ax = plt.subplots(figsize=(13, 6))
     labels = [f"{row['method']}\n{row['run_index']}" for row in results]
     bottoms = torch.zeros(len(results), dtype=torch.float64)
-    for behavior_id, behavior in enumerate(BEHAVIOR_NAMES):
+    for behavior_id, behavior in enumerate(behavior_names):
         values = torch.tensor([row["seconds"][behavior_id] for row in results], dtype=torch.float64)
         ax.bar(labels, values.numpy(), bottom=bottoms.numpy(), label=behavior, color=colors[behavior_id])
         bottoms += values
@@ -1124,8 +2054,8 @@ def _plot_results(results: list[dict], output_dir: Path):
     _plot_metric_by_method(
         axes[0],
         "switch_rate",
-        "Behavior switches / robot-step",
-        f"{_mission_display()} Switch Rate",
+        "True changes / robot-decision",
+        f"{_mission_display()} True Behavior / Option Switch Rate",
     )
     _plot_metric_by_method(
         axes[1],
@@ -1168,41 +2098,112 @@ def _plot_results(results: list[dict], output_dir: Path):
     fig.savefig(reward_persistence_path, dpi=180)
     plt.close(fig)
 
-    return (
+    paths = [
         mean_path,
         stacked_path,
         performance_path,
         persistence_path,
         reward_persistence_path,
-    )
+    ]
+
+    option_results = [
+        row for row in results if math.isfinite(float(row["termination_rate"]))
+    ]
+    if option_results:
+        fig, axes = plt.subplots(1, 3, figsize=(16, 5.2))
+        _plot_metric_by_method(
+            axes[0],
+            "termination_rate",
+            "Terminations / opportunity",
+            "Sampled Termination Rate",
+        )
+        _plot_metric_by_method(
+            axes[1],
+            "mean_termination_probability",
+            "Mean beta",
+            "Mean Termination Probability",
+        )
+        _plot_metric_by_method(
+            axes[2],
+            "termination_entropy",
+            "Bernoulli entropy (nats)",
+            "Termination Entropy",
+        )
+        fig.suptitle(f"{_mission_display()} Option Termination Diagnostics")
+        fig.tight_layout()
+        termination_path = output_dir / "termination_diagnostics.png"
+        fig.savefig(termination_path, dpi=180)
+        plt.close(fig)
+        paths.append(termination_path)
+
+    return tuple(paths)
 
 
 def main():
+    selected_methods = list(dict.fromkeys(args.methods))
+    continuous_methods = {"dandelion", "oc2"}
+    if continuous_methods.intersection(selected_methods) and len(selected_methods) != 1:
+        raise ValueError(
+            "Dandelion and OC2 must be evaluated separately from fixed-action "
+            "methods. Use the same --seed for matched scenarios."
+        )
+    if args.episodes_per_checkpoint < 1:
+        raise ValueError("--episodes-per-checkpoint must be at least 1.")
+    if args.fixed_option_duration_s <= 0.0:
+        raise ValueError("--fixed-option-duration-s must be positive.")
+    if args.force_option >= 0 and selected_methods != ["oc2"]:
+        raise ValueError("--force-option is only valid with --methods oc2.")
     output_dir = _output_dir()
     output_dir.mkdir(parents=True, exist_ok=True)
     classical_config = _classical_config()
+    dandelion_config = _dandelion_config()
     oc_config = _oc_config()
+    oc2_config = _oc2_config()
     classical_pattern = _classical_pattern()
+    dandelion_pattern = _dandelion_pattern()
     oc_pattern = _oc_pattern()
+    oc2_pattern = _oc2_pattern()
 
     print(
         f"[BehaviorTime] Mission={_mission_display()} "
-        f"classical_config={classical_config} oc_config={oc_config}",
+        f"methods={selected_methods}",
         flush=True,
     )
 
-    method_specs = [
-        (
+    available_specs = {
+        "dandelion": (
+            "Dandelion",
+            dandelion_config,
+            dandelion_pattern,
+        ),
+        "cyclamen": (
             "Cyclamen",
             classical_config,
-            _validate_checkpoints(_make_checkpoint_paths(classical_pattern), "Cyclamen"),
+            classical_pattern,
         ),
-        (
-            "OC-Cyclamen",
+        "oc1": (
+            "OC1-Cyclamen",
             oc_config,
-            _validate_checkpoints(_make_checkpoint_paths(oc_pattern), "OC-Cyclamen"),
+            oc_pattern,
         ),
-    ]
+        "oc2": (
+            "OC2-Cyclamen",
+            oc2_config,
+            oc2_pattern,
+        ),
+    }
+    method_specs = []
+    for method in selected_methods:
+        display_name, config_path, pattern = available_specs[method]
+        if method == "oc2":
+            _name, _variant, evaluation_cfg, _overrides = load_config(config_path)
+            if getattr(evaluation_cfg, "reactive_intra_options", False):
+                display_name = "OC2-mini-Cyclamen"
+        checkpoints = _validate_checkpoints(
+            _make_checkpoint_paths(pattern),
+            display_name,
+        )
+        method_specs.append((display_name, config_path, checkpoints))
 
     controller_specs: list[dict] = []
     for method, config_path, checkpoints in method_specs:
@@ -1219,11 +2220,8 @@ def main():
     if not controller_specs:
         raise RuntimeError("No evaluations completed.")
 
-    # Avoid creating a second IsaacLab environment in the same process: evaluate
-    # both methods in one vectorized env by default. This is also the fastest path.
-    base_config = classical_config if any(
-        spec["method"] == "Cyclamen" for spec in controller_specs
-    ) else controller_specs[0]["config"]
+    base_config = controller_specs[0]["config"]
+    continuous_actions = selected_methods[0] in continuous_methods
     requested_batch_size = args.num_envs if args.num_envs is not None else args.batch_size
     if args.sequential:
         requested_batch_size = 1
@@ -1232,9 +2230,16 @@ def main():
     batch_size = max(1, min(requested_batch_size, len(controller_specs)))
 
     results: list[dict] = []
-    env, variant, decision_dt, decision_period = _load_env(base_config, batch_size)
+    parallel_replicas = args.episodes_per_checkpoint
+    parallel_env_count = batch_size * parallel_replicas
+    env, variant, decision_dt, decision_period = _load_env(
+        base_config,
+        parallel_env_count,
+        learned_options=continuous_actions,
+    )
     print(
-        f"[BehaviorTime] Reusing one IsaacLab env: envs={batch_size} "
+        f"[BehaviorTime] Reusing one IsaacLab env: envs={parallel_env_count} "
+        f"controllers_per_batch={batch_size} replicas={parallel_replicas} "
         f"config={base_config} variant={variant} "
         f"decision_period={decision_period} decision_dt={decision_dt:.3f}s",
         flush=True,
@@ -1242,7 +2247,6 @@ def main():
     try:
         for start in range(0, len(controller_specs), batch_size):
             batch = controller_specs[start:start + batch_size]
-            batch_seed = None if args.seed < 0 else args.seed + start
             method_counts = {}
             for spec in batch:
                 method_counts[spec["method"]] = method_counts.get(spec["method"], 0) + 1
@@ -1252,23 +2256,35 @@ def main():
                 f"{method_summary}",
                 flush=True,
             )
-            batch_results = _evaluate_checkpoints_batch(
+            batch_seed = None if args.seed < 0 else args.seed
+            batch_results = _evaluate_checkpoints_parallel(
                 env,
                 batch,
                 decision_dt,
                 decision_period,
                 batch_seed,
+                replicas_per_controller=parallel_replicas,
             )
-            for result in batch_results:
-                results.append(result)
-                print(
-                    f"[BehaviorTime] {result['method']} run={result['run_index']}: "
-                    f"reward={result['reward_mean']:.2f} "
-                    f"switch={result['switch_rate']:.3f} "
-                    f"dwell={result['mean_dwell_seconds']:.2f}s "
-                    f"fractions={[round(v, 3) for v in result['fractions']]}",
-                    flush=True,
-                )
+            results.extend(batch_results)
+            controller_means = _aggregate_controller_results(batch_results)
+            mean_reward = _mean([row["reward_mean"] for row in controller_means])
+            print(
+                f"[BehaviorTime] Batch {start // batch_size + 1}: "
+                f"completed={len(batch_results)} evaluations "
+                f"controller_mean_reward={mean_reward:.2f}",
+                flush=True,
+            )
+            if args.episodes_per_checkpoint == 1:
+                for result in batch_results:
+                    print(
+                        f"  {result['method']} run={result['run_index']}: "
+                        f"reward={result['reward_mean']:.2f} "
+                        f"true_switch={result['switch_rate']:.3f} "
+                        f"termination={result['termination_rate']:.3f} "
+                        f"dwell={result['mean_dwell_seconds']:.2f}s "
+                        f"fractions={[round(v, 3) for v in result['fractions']]}",
+                        flush=True,
+                    )
     finally:
         env.close()
 

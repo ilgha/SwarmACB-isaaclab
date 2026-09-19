@@ -44,6 +44,11 @@ def apply_network_settings(
             "option_num_layers",
             cfg.option_num_layers,
         )
+    if hasattr(cfg, "reactive_intra_options"):
+        reactive = network.get("reactive_intra_options", cfg.reactive_intra_options)
+        if not isinstance(reactive, bool):
+            raise ValueError("reactive_intra_options must be a YAML boolean")
+        cfg.reactive_intra_options = reactive
 
     memory = network.get("memory", {})
     cfg.recurrent = bool(memory) or variant == "cyclamen"
