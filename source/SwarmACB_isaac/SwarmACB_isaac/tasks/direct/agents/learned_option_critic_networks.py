@@ -24,7 +24,8 @@ from .poca_networks import LinearEncoder, _linear_layer, _mlagents_lstm
 
 LEARNED_OPTION_CRITIC_VERSION = 4
 REACTIVE_OPTION_CRITIC_VERSION = 5
-SUPPORTED_LEARNED_OPTION_CRITIC_VERSIONS = (2, 3, 4, 5)
+LINEAR_OPTION_CRITIC_VERSION = 6
+SUPPORTED_LEARNED_OPTION_CRITIC_VERSIONS = (2, 3, 4, 5, 6)
 
 
 def option_transition_probs(
@@ -119,6 +120,8 @@ class LearnedOptionActor(nn.Module):
     OC2-mini (``reactive_intra_options``) uses memoryless masks and motor
     features. Only option values and terminations consume recurrent features;
     there is no global manager LSTM in this variant.
+    OC2-nano additionally uses affine motor heads directly on attended sensors,
+    bypassing the hidden sensor encoder in the wheel path only.
     """
 
     def __init__(
@@ -141,6 +144,7 @@ class LearnedOptionActor(nn.Module):
         epsilon_greedy_selector: bool = True,
         squash_actions: bool = False,
         reactive_intra_options: bool = False,
+        linear_intra_options: bool = False,
     ):
         super().__init__()
         self.obs_dim = int(obs_dim)
@@ -159,6 +163,7 @@ class LearnedOptionActor(nn.Module):
         self.epsilon_greedy_selector = bool(epsilon_greedy_selector)
         self.squash_actions = bool(squash_actions)
         self.reactive_intra_options = bool(reactive_intra_options)
+        self.linear_intra_options = bool(linear_intra_options)
         self.manager_obs_dim = 4 if self.obs_dim == 24 else self.obs_dim
 
         if self.obs_dim not in (4, 24):
@@ -182,11 +187,13 @@ class LearnedOptionActor(nn.Module):
         if self.option_selector_temperature <= 0.0:
             raise ValueError("option_selector_temperature must be positive")
 
+        if self.linear_intra_options and not self.reactive_intra_options:
+            raise ValueError("linear_intra_options requires reactive_intra_options")
         if self.reactive_intra_options:
             if self.memory_size <= 0 or self.memory_size % 2:
                 raise ValueError("ML-Agents memory_size must be a positive even integer")
             if separate_selector or not epsilon_greedy_selector or squash_actions:
-                raise ValueError("OC2-mini requires epsilon-soft Q selection and normal wheel actions")
+                raise ValueError("Reactive options require epsilon-soft Q selection and normal wheel actions")
             self.manager_hidden_size = 0
         else:
             self.manager_encoder = LinearEncoder(
@@ -255,7 +262,7 @@ class LearnedOptionActor(nn.Module):
             ])
         self.action_heads = nn.ModuleList([
             _linear_layer(
-                self.option_hidden,
+                self.obs_dim if self.linear_intra_options else self.option_hidden,
                 self.act_dim,
                 kernel_init="kaiming_normal",
                 kernel_gain=0.1,
@@ -367,7 +374,10 @@ class LearnedOptionActor(nn.Module):
             separate_selector=(version == 3),
             epsilon_greedy_selector=(version >= 4),
             squash_actions=squash_actions,
-            reactive_intra_options=(version == REACTIVE_OPTION_CRITIC_VERSION),
+            reactive_intra_options=(version in (
+                REACTIVE_OPTION_CRITIC_VERSION, LINEAR_OPTION_CRITIC_VERSION,
+            )),
+            linear_intra_options=(version == LINEAR_OPTION_CRITIC_VERSION),
         ).to(device)
         actor.load_state_dict(checkpoint["actor"])
         return actor
@@ -522,7 +532,10 @@ class LearnedOptionActor(nn.Module):
             # selection. Architecture-v2 checkpoints also shared this output,
             # but interpreted it through a softmax distribution.
             selector_logits = option_values
-        if self.reactive_intra_options:
+        if self.linear_intra_options:
+            # Nano has no motor hidden layer; Q/beta retain their encoder/LSTM.
+            motor_features = attended_obs
+        elif self.reactive_intra_options:
             motor_features = option_encoded.view(
                 batch_size, self.num_options, sequence_length, self.option_hidden,
             ).permute(0, 2, 1, 3)

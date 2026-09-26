@@ -396,6 +396,73 @@ tests whether reduced motor capacity encourages useful composition; it does
 actual option changes/dwell times, and forced-single-option/termination
 ablations across seeds before concluding that the hierarchy is useful.
 
+## OC2-nano: No Motor Hidden Layer
+
+`OC2-nano_cyclamen` is the next capacity ablation of mini. It learns six
+continuous wheel policies, not predefined behavior modules. For each option:
+
+```text
+current 24D sensors x learned attention mask -> Linear(24, 2) -> wheel means
+```
+
+There is **no hidden layer, activation, or recurrent state in the motor head**.
+Each option has 48 motor weights, two biases, and two learned log standard
+deviations: 312 motor distribution parameters across six options. The Gaussian
+sampling and `clip(-3, 3) / 3` wheel action transform are unchanged.
+
+Attention remains mini's memoryless learned network. Thus nano is affine in
+the **attended sensors**, not globally linear in the raw sensors. Q and beta
+retain mini's 128-unit sensor encoder, per-option memory, and recurrent fusion;
+the centralized counterfactual critics are unchanged. Motor gradients bypass
+the Q/beta sensor encoder, but motor and high-level losses still share the
+attention network. The whole local actor still has 90,388 parameters, including
+attention, Q and beta; 312 is only the motor distribution parameter count.
+This tests both removing a motor hidden layer and removing
+that encoder sharing; it is not a parameter-count-matched ablation.
+
+The five `configs/OC2-nano_<Mission>_cyclamen.yaml` files copy mini's settings
+and add `network_settings.linear_intra_options: true` (which requires
+`reactive_intra_options: true`). Do **not** set `option_num_layers: 0`: that
+setting also configures the Q/beta encoders and is not the nano motor switch.
+Optimizer settings, attention losses, six options, mission durations, training
+budgets, and decision cadence are kept fixed for comparison.
+
+Start a fresh local training run:
+
+```bash
+python scripts/train.py --config configs/OC2-nano_Foraging_cyclamen.yaml --headless
+```
+
+Use `DirGate`, `XOR`, `Homing`, `Foraging`, or `Sheltering` in the config name.
+Nano uses **actor architecture 6, training schema 7**. Resume only a nano
+checkpoint with its matching config using `--checkpoint <path>`; mini/full OC2
+checkpoints are not compatible for training resume. Existing playback remains
+supported for those older architectures.
+
+Submit ten independent nano designs per mission on HPC:
+
+```bash
+mkdir -p logs
+sbatch scripts/hpc/train_oc2_nano_dirgate.slurm
+sbatch scripts/hpc/train_oc2_nano_xor.slurm
+sbatch scripts/hpc/train_oc2_nano_homing.slurm
+sbatch scripts/hpc/train_oc2_nano_foraging.slurm
+sbatch scripts/hpc/train_oc2_nano_sheltering.slurm
+```
+
+Run/checkpoint directories are `OC2-nano_<Mission>_cyclamen_v1_hpc_<seed>`;
+these launchers use the unchanged shared HPC launcher. Playback and evaluation:
+
+```bash
+python scripts/play.py --config configs/OC2-nano_Foraging_cyclamen.yaml --checkpoint checkpoints/OC2-nano_Foraging_cyclamen/option_critic_2_final.pt
+python scripts/evaluate_behavior_time.py --mission foraging --methods oc2 --oc2-config configs/OC2-nano_Foraging_cyclamen.yaml --oc2-pattern "OC2-nano_Foraging_cyclamen_v1_hpc_{index}/option_critic_2_final.pt" --num-runs 10 --episodes-per-checkpoint 20 --output-dir analysis/oc2_nano_foraging
+```
+
+Run `python scripts/validate_oc2_nano.py` for affine-map, gradient isolation,
+memory independence, config, checkpoint/resume, and counterfactual update tests.
+Lower motor capacity is an experiment, not a guarantee of useful diversity.
+Compare reward and option/termination interventions across seeds against mini.
+
 ## Sensor Suite
 
 Each e-puck has:

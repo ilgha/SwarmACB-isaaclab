@@ -88,6 +88,7 @@ def audit_config(
     learned_oc: bool = False,
     num_options: int = 6,
     reactive_intra_options: bool = False,
+    linear_intra_options: bool = False,
 ) -> None:
     run_name, block = one_behavior(path, audit)
     prefix = path.name
@@ -135,6 +136,11 @@ def audit_config(
             num_options,
         )
     if learned_oc:
+        audit.equal(
+            f"{prefix}.linear_intra_options",
+            network.get("linear_intra_options", False),
+            linear_intra_options,
+        )
         audit.equal(
             f"{prefix}.reactive_intra_options",
             network.get("reactive_intra_options", False),
@@ -232,6 +238,7 @@ def audit_config(
         resolved.option_num_layers = 1
         resolved.option_memory_size = 128
         resolved.reactive_intra_options = False
+        resolved.linear_intra_options = False
     network_config.apply_network_settings(
         resolved,
         network,
@@ -269,6 +276,11 @@ def audit_config(
             num_options,
         )
     if learned_oc:
+        audit.equal(
+            f"{prefix}.resolved_linear_intra_options",
+            resolved.linear_intra_options,
+            linear_intra_options,
+        )
         audit.equal(
             f"{prefix}.resolved_reactive_intra_options",
             resolved.reactive_intra_options,
@@ -558,6 +570,19 @@ def main() -> int:
             network_config,
             learned_oc=True,
             reactive_intra_options=True,
+        )
+        nano_filename = f"OC2-nano_{mission}_cyclamen.yaml"
+        expected_files.add(nano_filename)
+        audit_config(
+            config_dir / nano_filename,
+            mission,
+            "cyclamen",
+            True,
+            audit,
+            network_config,
+            learned_oc=True,
+            reactive_intra_options=True,
+            linear_intra_options=True,
         )
 
     actual_files = {path.name for path in config_dir.glob("*.yaml")}

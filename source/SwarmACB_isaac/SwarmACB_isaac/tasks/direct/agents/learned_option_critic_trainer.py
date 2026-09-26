@@ -32,6 +32,7 @@ from .learned_option_critic_buffer import LearnedOptionRolloutBuffer
 from .learned_option_critic_networks import (
     LEARNED_OPTION_CRITIC_VERSION,
     REACTIVE_OPTION_CRITIC_VERSION,
+    LINEAR_OPTION_CRITIC_VERSION,
     LearnedOptionActor,
     option_transition_probs,
     termination_objective,
@@ -159,6 +160,7 @@ class LearnedOptionCriticConfig:
     option_num_layers: int = 2
     option_memory_size: int = 64
     reactive_intra_options: bool = False
+    linear_intra_options: bool = False
     initial_termination_probability: float = 0.27
     initial_log_std: float = 0.0
     min_log_std: float = -2.5
@@ -178,6 +180,8 @@ class LearnedOptionCriticTrainer:
 
     @property
     def checkpoint_version(self) -> int:
+        if self.cfg.linear_intra_options:
+            return LINEAR_OPTION_CRITIC_VERSION
         return (
             REACTIVE_OPTION_CRITIC_VERSION
             if self.cfg.reactive_intra_options else self.CHECKPOINT_VERSION
@@ -347,8 +351,15 @@ class LearnedOptionCriticTrainer:
             epsilon_greedy_selector=True,
             squash_actions=False,
             reactive_intra_options=cfg.reactive_intra_options,
+            linear_intra_options=cfg.linear_intra_options,
         ).to(self.device)
-        if cfg.reactive_intra_options:
+        if cfg.linear_intra_options:
+            print(
+                f"[LearnedOC] OC2-nano: attended sensors -> {self.obs_dim}x{self.act_dim} "
+                "affine motor heads (no hidden layer); "
+                "attention, Q and termination unchanged from mini"
+            )
+        elif cfg.reactive_intra_options:
             print(
                 "[LearnedOC] OC2-mini: reactive attention and wheel policies; "
                 f"motor MLP={cfg.option_num_layers}x{cfg.option_hidden_dim}; "
@@ -552,6 +563,7 @@ class LearnedOptionCriticTrainer:
             f"schema={self.TRAINING_CHECKPOINT_VERSION}; "
             f"actor_architecture={self.checkpoint_version}; "
             f"reactive_intra_options={cfg.reactive_intra_options}; "
+            f"linear_intra_options={cfg.linear_intra_options}; "
             "bootstrap=sampled_joint_option_q; termination=next_peer_options",
             0,
         )
@@ -2223,6 +2235,7 @@ class LearnedOptionCriticTrainer:
             "option_critic_phase": 2,
             "learned_option_critic_version": self.checkpoint_version,
             "reactive_intra_options": self.cfg.reactive_intra_options,
+            "linear_intra_options": self.cfg.linear_intra_options,
             "training_checkpoint_version": self.TRAINING_CHECKPOINT_VERSION,
             "return_bootstrap": "sampled_joint_option_q",
             "termination_peer_context": "next_behavior_options",
@@ -2330,7 +2343,7 @@ class LearnedOptionCriticTrainer:
             raise RuntimeError(
                 f"Checkpoint uses learned Option-Critic version {version}; "
                 f"this trainer expects version {self.checkpoint_version}. "
-                "OC2 and OC2-mini have different actor architectures; use "
+                "OC2, OC2-mini and OC2-nano have different actor architectures; use "
                 "the matching config to resume, or start fresh training."
             )
         training_version = int(

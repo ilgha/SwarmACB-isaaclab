@@ -2197,7 +2197,9 @@ def main():
         display_name, config_path, pattern = available_specs[method]
         if method == "oc2":
             _name, _variant, evaluation_cfg, _overrides = load_config(config_path)
-            if getattr(evaluation_cfg, "reactive_intra_options", False):
+            if getattr(evaluation_cfg, "linear_intra_options", False):
+                display_name = "OC2-nano-Cyclamen"
+            elif getattr(evaluation_cfg, "reactive_intra_options", False):
                 display_name = "OC2-mini-Cyclamen"
         checkpoints = _validate_checkpoints(
             _make_checkpoint_paths(pattern),

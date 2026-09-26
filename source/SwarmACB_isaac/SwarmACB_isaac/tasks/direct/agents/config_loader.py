@@ -289,8 +289,12 @@ def print_config(run_name: str, variant: str, cfg: Any, env_ov: dict):
     if hasattr(cfg, "option_hidden_dim"):
         print(f"    option_hidden       : {cfg.option_hidden_dim}")
         print(f"    option_layers       : {cfg.option_num_layers}")
-        if getattr(cfg, "reactive_intra_options", False):
+        if getattr(cfg, "linear_intra_options", False):
+            print("    actor_mode          : OC2-nano (affine wheels on attended sensors)")
+            print("    motor_hidden_layers : 0 (option_hidden/layers configure Q/beta)")
+        elif getattr(cfg, "reactive_intra_options", False):
             print("    actor_mode          : OC2-mini (reactive masks and wheel policies)")
+        if getattr(cfg, "reactive_intra_options", False):
             print("    recurrent_outputs   : option values and termination only")
     if hasattr(cfg, "num_options"):
         option_label = (

@@ -49,6 +49,13 @@ def apply_network_settings(
         if not isinstance(reactive, bool):
             raise ValueError("reactive_intra_options must be a YAML boolean")
         cfg.reactive_intra_options = reactive
+    if hasattr(cfg, "linear_intra_options"):
+        linear = network.get("linear_intra_options", cfg.linear_intra_options)
+        if not isinstance(linear, bool):
+            raise ValueError("linear_intra_options must be a YAML boolean")
+        if linear and not cfg.reactive_intra_options:
+            raise ValueError("linear_intra_options requires reactive_intra_options")
+        cfg.linear_intra_options = linear
 
     memory = network.get("memory", {})
     cfg.recurrent = bool(memory) or variant == "cyclamen"
