@@ -1,0 +1,18 @@
+# One synchronous campaign, one shared library, five task-specific managers.
+# Paths below are relative to this YAML. Use --exclude DirGate for a transfer fold.
+oc3:
+  name: OC3_cyclamen_v1
+  missions:
+    DirGate: OC2-mini_DirGate_cyclamen.yaml
+    XOR: OC2-mini_XOR_cyclamen.yaml
+    Homing: OC2-mini_Homing_cyclamen.yaml
+    Foraging: OC2-mini_Foraging_cyclamen.yaml
+    Sheltering: OC2-mini_Sheltering_cyclamen.yaml
+  steps_per_mission: 120000000
+  num_envs_per_mission: 1
+  rollout_steps: 1000
+  checkpoint_rounds: 10
+  keep_checkpoints: 3
+  worker_threads: 2
+  worker_timeout_s: 1800
+  reward_scales: {}  # Explicit positive multipliers; mission scores remain raw.

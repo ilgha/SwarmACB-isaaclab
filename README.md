@@ -43,7 +43,7 @@ SwarmACB_isaac/
     manual_control_isaac.py     # Isaac Sim viewport manual control / fast viewer
     hpc/                        # Cluster helper scripts
   source/SwarmACB_isaac/SwarmACB_isaac/tasks/direct/
-    agents/                     # POCA and both Option-Critic phases
+    agents/                     # POCA, OC1/OC2 and multimission OC3
     epuck/                      # E-puck sensors and behavior modules
     missions/
       directional_gate/
@@ -462,6 +462,112 @@ Run `python scripts/validate_oc2_nano.py` for affine-map, gradient isolation,
 memory independence, config, checkpoint/resume, and counterfactual update tests.
 Lower motor capacity is an experiment, not a guarantee of useful diversity.
 Compare reward and option/termination interventions across seeds against mini.
+
+## OC3: Shared Multimission Options
+
+OC3 learns **one library of six reactive motor policies** across the selected
+missions. It starts from OC2-mini: shared reactive attention, a one-hidden-layer
+128-unit motor encoder, six wheel heads and six learned pairs of action standard
+deviations. Each mission has its own recurrent option values, six terminations,
+and centralized counterfactual critics. All robots share network weights but keep
+independent options and memories. Mission identity selects the task-specific
+networks; it is not an input to the shared sensor-to-wheel mapping.
+
+`scripts/train_oc3.py` coordinates isolated headless Isaac workers, one per
+mission, on the requested device. It reuses OC2's arrival-state termination
+objective, counterfactual action credit, epsilon-soft option selection and
+recurrent rollout handling. This is an AOC-derived swarm experiment, not a
+guarantee of diversity or a literal reproduction of single-agent AOC.
+
+### Training Semantics
+
+- Every round collects equal numbers of fresh robot decisions per mission from
+  one synchronized policy version. Mission buffers, rewards and histories never
+  mix. Episode durations, dynamics, sensors and decision frequency are unchanged.
+- Action advantages are normalized within each mission. Critic targets and the
+  termination signal retain their task reward units. Optional `reward_scales`
+  are explicit positive multipliers; unscaled episode returns are still logged.
+- Each paired minibatch averages equally weighted, per-task clipped motor
+  gradients into **one shared Adam optimizer**. Private optimizers never own
+  shared parameters. Each mission updates its private networks and critics.
+- Episode boundaries produce different numbers of padded sequences. Each epoch
+  uses the minimum available minibatch count across missions, with independent
+  reshuffling. Extra chunks are not reused to give one task more updates.
+- If any mission exceeds the policy KL threshold, all actor updates stop for
+  that round, including the shared library; task critics continue. There is no
+  added usage-balancing objective, forced option assignment or replay buffer.
+
+The default `configs/OC3_cyclamen.yaml` uses one environment per mission and
+120 million robot decisions **per mission**: 600 million in an all-five campaign
+or 480 million when one is excluded. This is equal decision exposure, not equal
+episode counts. One Isaac process per mission consumes more memory than OC2;
+profile a pilot before launching the full array. Five GPU workers approach the
+16 GB VRAM limit on the local RTX 5080; the cluster's 48 GB cards have more room.
+`--device cpu` keeps the networks and environment tensors on CPU for a
+lower-VRAM local check (Isaac may still initialize its graphics backend).
+
+```bash
+# Inspect resolved missions and budget without starting Isaac.
+python scripts/train_oc3.py --dry-run
+
+# All five missions, for characterizing the seen-task repertoire.
+python scripts/train_oc3.py --headless
+
+# Transfer fold: learn the library without Directional Gate.
+python scripts/train_oc3.py --exclude DirGate --headless --log_dir runs/OC3_without_DirGate --checkpoint_dir checkpoints/OC3_without_DirGate
+
+# Short two-mission execution check, not a learning-performance experiment.
+python scripts/train_oc3.py --missions DirGate Foraging --steps-per-mission 8000 --rollout-steps 200 --headless --log_dir runs/OC3_smoke --checkpoint_dir checkpoints/OC3_smoke
+```
+
+### Resume and Transfer
+
+Resume using the same config, mission selection, device, seed and step-budget overrides,
+adding `--checkpoint <checkpoint_dir>/oc3_latest.pt`. The bundle restores library,
+private networks, optimizer states, random-generator states and progress counters.
+**Simulator episodes restart:** old recurrent states are never attached to new
+layouts, and this is not a bitwise continuation of an interrupted simulation.
+Only completed rounds are checkpointed. Existing campaign directories reject
+accidental fresh starts.
+
+`option_library.pt` exports the full learned motor/attention mapping and its input
+contract. For Phase 4, freeze it and train new task-specific networks:
+
+```bash
+python scripts/train_oc3.py --missions DirGate --transfer checkpoints/OC3_without_DirGate/option_library.pt --headless --log_dir runs/OC3_transfer_DirGate --checkpoint_dir checkpoints/OC3_transfer_DirGate
+```
+
+The transfer command rejects a mission already used to learn the source library.
+All-five pretraining cannot substantiate unseen-mission transfer. A complete
+leave-one-out study learns a fresh four-mission library for each held-out mission.
+Six available slots do not imply six useful or interpretable skills; assess
+option-removal sensitivity and frozen transfer, not occupancy alone.
+
+Each final `<mission>/option_critic_2_final.pt` is an inference export usable with
+the existing `play.py` and matching `configs/OC2-mini_<mission>_cyclamen.yaml`.
+Do not resume OC2 training from these exports; resume OC3 from its bundle.
+
+### HPC and Diagnostics
+
+```bash
+# Ten independent all-five libraries.
+sbatch scripts/hpc/train_oc3.slurm
+
+# Ten independent libraries excluding Directional Gate.
+sbatch scripts/hpc/train_oc3.slurm DirGate
+
+python scripts/validate_oc3.py
+tensorboard --logdir runs/OC3_cyclamen_v1
+```
+
+Task subdirectories log unscaled episode/group returns, option usage, mean termination
+probability, termination-event rate, **actual option-ID change rate**, wheel
+clipping/noise, losses and gradient norms. The `shared` subdirectory records
+aggregate progress and global actor early stops. Each task has a `worker.log`.
+Startup/worker failures abort the campaign; they are not silently skipped.
+The return tags retain OC2's definitions. In occupancy missions these can be
+time-accumulated occupancy, not a final robot count; compare within each mission
+and use the evaluation scripts for the benchmark's final performance metric.
 
 ## Sensor Suite
 

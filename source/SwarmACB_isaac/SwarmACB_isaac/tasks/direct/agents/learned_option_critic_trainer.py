@@ -1508,6 +1508,30 @@ class LearnedOptionCriticTrainer:
             values - values.mean()
         ) / (values.std(unbiased=False) + 1e-10)
 
+    def loss_objectives(self, losses):
+        """Shared objective construction for single- and multi-mission updates."""
+        cfg = self.cfg
+        terms = {
+            "objective_intra_option": cfg.intra_option_coef * losses["intra_option_loss"],
+            "objective_selector": cfg.selector_coef * losses["selector_loss"],
+            "objective_local_option_value": cfg.local_option_value_coef * losses["local_option_value_loss"],
+            "objective_termination": cfg.termination_coef * losses["termination_loss"],
+            "objective_termination_prior": self.current_termination_prior_coef * losses["termination_prior_loss"],
+            "objective_option_balance": self.current_option_balance_coef * losses["option_balance_loss"],
+            "objective_attention_diversity": cfg.attention_diversity_coef * losses["attention_diversity_loss"],
+            "objective_attention_temporal": cfg.attention_temporal_coef * losses["attention_temporal_loss"],
+            "objective_action_entropy": -self.current_beta * losses["action_entropy"],
+            "objective_option_entropy": -cfg.option_entropy_coef * losses["option_entropy"],
+            "objective_termination_entropy": -cfg.termination_entropy_coef * losses["termination_entropy"],
+        }
+        critic_loss = (
+            cfg.value_coef * losses["value_loss"]
+            + cfg.action_baseline_coef * losses["action_baseline_loss"]
+            + cfg.option_value_coef * losses["joint_option_value_loss"]
+            + cfg.option_baseline_coef * losses["option_baseline_loss"]
+        )
+        return terms, critic_loss
+
     def update(self) -> dict:
         self._apply_schedules()
         active = self.buffer.ptr
@@ -1617,57 +1641,8 @@ class LearnedOptionCriticTrainer:
                         f"{1.5 * cfg.target_kl:.4f}; centralized critics "
                         "continue"
                     )
-                actor_terms = {
-                    "objective_intra_option": (
-                        cfg.intra_option_coef * losses["intra_option_loss"]
-                    ),
-                    "objective_selector": (
-                        cfg.selector_coef * losses["selector_loss"]
-                    ),
-                    "objective_local_option_value": (
-                        cfg.local_option_value_coef
-                        * losses["local_option_value_loss"]
-                    ),
-                    "objective_termination": (
-                        cfg.termination_coef * losses["termination_loss"]
-                    ),
-                    "objective_termination_prior": (
-                        self.current_termination_prior_coef
-                        * losses["termination_prior_loss"]
-                    ),
-                    "objective_option_balance": (
-                        self.current_option_balance_coef
-                        * losses["option_balance_loss"]
-                    ),
-                    "objective_attention_diversity": (
-                        cfg.attention_diversity_coef
-                        * losses["attention_diversity_loss"]
-                    ),
-                    "objective_attention_temporal": (
-                        cfg.attention_temporal_coef
-                        * losses["attention_temporal_loss"]
-                    ),
-                    "objective_action_entropy": (
-                        -self.current_beta * losses["action_entropy"]
-                    ),
-                    "objective_option_entropy": (
-                        -cfg.option_entropy_coef * losses["option_entropy"]
-                    ),
-                    "objective_termination_entropy": (
-                        -cfg.termination_entropy_coef
-                        * losses["termination_entropy"]
-                    ),
-                }
+                actor_terms, critic_loss = self.loss_objectives(losses)
                 actor_loss = sum(actor_terms.values())
-                critic_loss = (
-                    cfg.value_coef * losses["value_loss"]
-                    + cfg.action_baseline_coef
-                    * losses["action_baseline_loss"]
-                    + cfg.option_value_coef
-                    * losses["joint_option_value_loss"]
-                    + cfg.option_baseline_coef
-                    * losses["option_baseline_loss"]
-                )
 
                 if not torch.isfinite(actor_loss):
                     bad_losses = {
@@ -2332,6 +2307,8 @@ class LearnedOptionCriticTrainer:
 
     def load_checkpoint(self, path: str | Path):
         checkpoint = torch.load(path, map_location=self.device)
+        if checkpoint.get("oc3_inference_export"):
+            raise RuntimeError("Use train_oc3.py and the OC3 bundle to resume; this export is for playback only")
         if checkpoint.get("trainer_type") != "learned_option_critic":
             raise RuntimeError(
                 "Checkpoint is not a learned Option-Critic Phase 2 model."

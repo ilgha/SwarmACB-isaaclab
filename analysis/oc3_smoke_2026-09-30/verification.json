@@ -1,0 +1,44 @@
+{
+  "checkpoints": {
+    "per_mission_decisions": 1280,
+    "aggregate_decisions": 2560,
+    "rounds": 2,
+    "version": 6,
+    "frozen": false,
+    "all_exports_match_shared_library": true
+  },
+  "all_checkpoints": {
+    "per_mission_decisions": 8000,
+    "aggregate_decisions": 40000,
+    "rounds": 2,
+    "version": 15,
+    "frozen": false,
+    "all_exports_match_shared_library": true
+  },
+  "cpu_checkpoints": {
+    "per_mission_decisions": 8000,
+    "aggregate_decisions": 40000,
+    "rounds": 2,
+    "version": 15,
+    "frozen": false,
+    "all_exports_match_shared_library": true
+  },
+  "resume_checkpoints": {
+    "per_mission_decisions": 8000,
+    "aggregate_decisions": 40000,
+    "rounds": 2,
+    "version": 12,
+    "frozen": false,
+    "all_exports_match_shared_library": true
+  },
+  "transfer_checkpoints": {
+    "per_mission_decisions": 8000,
+    "aggregate_decisions": 8000,
+    "rounds": 2,
+    "version": 15,
+    "frozen": true,
+    "all_exports_match_shared_library": true
+  },
+  "frozen_transfer_bitwise_unchanged": true,
+  "resume_optimizer_steps_advanced": true
+}

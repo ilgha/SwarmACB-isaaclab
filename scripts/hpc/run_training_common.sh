@@ -3,6 +3,8 @@ set -euo pipefail
 
 CONFIG_PATH="${1:?Usage: run_training_common.sh CONFIG_PATH RUN_NAME}"
 RUN_NAME="${2:?Usage: run_training_common.sh CONFIG_PATH RUN_NAME}"
+TRAIN_SCRIPT="${3:-scripts/train.py}"
+TRAIN_ARGS=("${@:4}")
 
 PROJECT_DIR="${PROJECT_DIR:-/home/ulb/iridia_robo/igharbi/SwarmACB-isaaclab}"
 CONTAINER="${CONTAINER:-/srv/apps/shared/containers/isaacsim.sif}"
@@ -61,6 +63,7 @@ APPTAINER_ARGS=(
     --env "SWARM_RUN_DIR=$RUN_DIR"
     --env "SWARM_CHECKPOINT_DIR=$CHECKPOINT_DIR"
     --env "SWARM_SEED=$RUN_SUFFIX"
+    --env "SWARM_TRAIN_SCRIPT=$TRAIN_SCRIPT"
 )
 
 if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
@@ -111,12 +114,12 @@ source /root/isaac_env/bin/activate
 export LD_LIBRARY_PATH="$SWARM_PROJECT_DIR/.syslibs/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
 export PYTHONPATH="$SWARM_PROJECT_DIR/source/SwarmACB_isaac:${PYTHONPATH:-}"
 cd "$SWARM_PROJECT_DIR"
-exec python -u scripts/train.py \
+exec python -u "$SWARM_TRAIN_SCRIPT" \
     --config "$SWARM_CONFIG_PATH" \
     --headless \
     --seed "$SWARM_SEED" \
     --log_dir "$SWARM_RUN_DIR" \
-    --checkpoint_dir "$SWARM_CHECKPOINT_DIR"
+    --checkpoint_dir "$SWARM_CHECKPOINT_DIR" "$@"
 '
 
 status=1
@@ -126,7 +129,7 @@ for ((attempt = 1; attempt <= APPTAINER_LAUNCH_ATTEMPTS; attempt++)); do
 
     set +e
     apptainer "${APPTAINER_ARGS[@]}" "$CONTAINER" \
-        bash --noprofile --norc -c "$CONTAINER_COMMAND"
+        bash --noprofile --norc -c "$CONTAINER_COMMAND" bash "${TRAIN_ARGS[@]}"
     status=$?
     set -e
 

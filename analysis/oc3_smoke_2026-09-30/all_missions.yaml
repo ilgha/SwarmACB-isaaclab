@@ -1,0 +1,16 @@
+oc3:
+  name: OC3_all_missions_smoke
+  missions:
+    DirGate: ../../configs/OC2-mini_DirGate_cyclamen.yaml
+    XOR: ../../configs/OC2-mini_XOR_cyclamen.yaml
+    Homing: ../../configs/OC2-mini_Homing_cyclamen.yaml
+    Foraging: ../../configs/OC2-mini_Foraging_cyclamen.yaml
+    Sheltering: ../../configs/OC2-mini_Sheltering_cyclamen.yaml
+  steps_per_mission: 8000
+  num_envs_per_mission: 1
+  rollout_steps: 200
+  checkpoint_rounds: 1
+  keep_checkpoints: 3
+  worker_threads: 2
+  worker_timeout_s: 180
+  reward_scales: {}
