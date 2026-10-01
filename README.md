@@ -572,6 +572,23 @@ and Slurm accounting before attributing it to RAM, VRAM or a simulator crash.
 `#SBATCH --mem=48G` is the whole job's host RAM allocation, not GPU VRAM or RAM
 per mission. The multiple Isaac processes share that job allocation.
 
+`worker_threads` now limits PyTorch and the Kit tasking, TBB and physics pools.
+BLAS/OpenMP and default Rayon/Tokio pool budgets are set **before spawning** each
+worker, so imports during multiprocessing startup inherit them. PyTorch inter-op
+parallelism is one. These are per-pool budgets, not a cap on all OS threads;
+Isaac still creates auxiliary threads, and native libraries can override defaults.
+The worker log records the effective Kit settings and, on Linux, its thread count
+and `RLIMIT_NPROC`. No host limits, Slurm resources or learning objectives are changed.
+
+The cluster failure `failed to spawn thread: ... code: 11 ... Resource temporarily
+unavailable` followed by `SIGABRT` occurs in Omniverse Client startup, before the
+mission is created. This confirms thread-creation failure, not which OS limit was
+hit. The previous launcher limited only PyTorch; unrestricted native pools from
+multiple Isaac instances could exhaust thread/process resources. The explicit
+pool budgets address that omission. A cluster pilot is still required; if it fails
+again, retain the log and ask the administrators to inspect the job/user PID and
+thread limits rather than blindly increasing the RAM request.
+
 ```bash
 # Replace these IDs/paths with those printed by the failed job.
 sacct -j <array_job>_<seed> --format=JobID,State,ExitCode,ReqMem,MaxRSS,Elapsed

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import importlib
 import io
 import os
@@ -13,6 +14,51 @@ import types
 
 
 ROOT = Path(__file__).resolve().parents[1]
+THREAD_ENV_VARS = (
+    "OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "RAYON_NUM_THREADS",
+    "TOKIO_WORKER_THREADS",
+)
+KIT_THREAD_SETTINGS = (
+    "/plugins/carb.tasking.plugin/threadCount",
+    "/plugins/omni.tbb.globalcontrol/maxThreadCount",
+    "/persistent/physics/numThreads",
+)
+
+
+@contextmanager
+def worker_thread_environment(threads):
+    """Cap native pools before spawn imports torch/NumPy to unpickle arguments."""
+    if not isinstance(threads, int) or isinstance(threads, bool) or threads < 1:
+        raise ValueError("worker_threads must be a positive integer")
+    previous = {key: os.environ.get(key) for key in THREAD_ENV_VARS}
+    try:
+        os.environ.update({key: str(threads) for key in THREAD_ENV_VARS})
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def worker_kit_args(threads):
+    return " ".join(f"--{key}={threads}" for key in KIT_THREAD_SETTINGS)
+
+
+def log_thread_resources(log):
+    """Best-effort Linux diagnostics; never raise or change resource limits."""
+    if sys.platform != "linux":
+        return
+    try:
+        import resource
+        limits = resource.getrlimit(resource.RLIMIT_NPROC)
+        with open("/proc/self/status", encoding="utf-8") as stream:
+            status = " ".join(line.strip() for line in stream if line.startswith(("Threads:", "VmRSS:")))
+        log.write(f"[OC3] Process resources: {status}; RLIMIT_NPROC soft/hard={limits}\n")
+    except (OSError, ValueError) as error:
+        log.write(f"[OC3] Process resource diagnostics unavailable: {error}\n")
 
 
 def agents_module(name):
@@ -38,7 +84,7 @@ def receive(connection):
     return torch.load(io.BytesIO(connection.recv_bytes()), map_location="cpu", weights_only=False)
 
 
-def log_tail(path, max_bytes=32768, max_lines=100):
+def log_tail(path, max_bytes=32768, max_lines=160):
     """Bound diagnostic output without reading an entire training log."""
     try:
         with open(path, "rb") as stream:
@@ -61,18 +107,27 @@ def worker_main(connection, spec, library_state, frozen, device, threads, log_pa
         import faulthandler
         faulthandler.enable(file=log, all_threads=True)
         log.write(f"[OC3] {spec['name']}: worker pid={os.getpid()} starting on {device}\n")
+        log.write(f"[OC3] Native pool budget={threads} per pool; "
+                  f"environment={{{', '.join(f'{key}={os.environ.get(key)}' for key in THREAD_ENV_VARS)}}}\n")
+        log_thread_resources(log)
         import argparse
         import random
         import numpy as np
         import torch
         torch.set_num_threads(threads)
+        torch.set_num_interop_threads(1)
         from isaaclab.app import AppLauncher
         from _isaac_launch import apply_windows_kit_defaults
-        args = argparse.Namespace(headless=True, device=device, kit_args="")
+        args = argparse.Namespace(headless=True, device=device, kit_args=worker_kit_args(threads))
         apply_windows_kit_defaults(args, "OC3")
         log.write(f"[OC3] {spec['name']}: launching Isaac AppLauncher\n")
         launcher = AppLauncher(args)
         app = launcher.app
+        import carb
+        settings = carb.settings.get_settings()
+        log.write(f"[OC3] Active Kit thread settings: "
+                  f"{ {key: settings.get(key) for key in KIT_THREAD_SETTINGS} }\n")
+        log_thread_resources(log)
         log.write(f"[OC3] {spec['name']}: Isaac app ready; registering tasks\n")
         import gymnasium as gym
         sys.path.insert(0, str(ROOT / "source/SwarmACB_isaac"))
@@ -111,6 +166,7 @@ def worker_main(connection, spec, library_state, frozen, device, threads, log_pa
             raise ValueError("Episode length must be divisible by the action decision period")
         learner = multi.MissionLearner(trainer, library_state, frozen)
         log.write(f"[OC3] {spec['name']} ready on {device}\n")
+        log_thread_resources(log)
         send(connection, {"ready": True})
         while True:
             request = receive(connection)
@@ -167,8 +223,14 @@ class Worker:
             args=(child, spec, library_state, frozen, device, threads, self.log_path),
             name=f"OC3-{self.name}",
         )
-        self.process.start()
-        child.close()
+        try:
+            with worker_thread_environment(threads):
+                self.process.start()
+        except BaseException:
+            self.connection.close()
+            raise
+        finally:
+            child.close()
 
     def send(self, command, **kwargs):
         self.pending_command = command
