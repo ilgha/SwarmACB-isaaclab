@@ -565,6 +565,24 @@ probability, termination-event rate, **actual option-ID change rate**, wheel
 clipping/noise, losses and gradient norms. The `shared` subdirectory records
 aggregate progress and global actor early stops. Each task has a `worker.log`.
 Startup/worker failures abort the campaign; they are not silently skipped.
+The main error log includes the failed worker's PID, exit code, pending command
+and last log lines. Native fatal-signal tracebacks are enabled where supported.
+An EOF alone only means that the worker connection closed; inspect its output
+and Slurm accounting before attributing it to RAM, VRAM or a simulator crash.
+`#SBATCH --mem=48G` is the whole job's host RAM allocation, not GPU VRAM or RAM
+per mission. The multiple Isaac processes share that job allocation.
+
+```bash
+# Replace these IDs/paths with those printed by the failed job.
+sacct -j <array_job>_<seed> --format=JobID,State,ExitCode,ReqMem,MaxRSS,Elapsed
+tail -n 150 runs/<campaign>/<mission>/worker.log
+```
+
+Preserve failed run directories when investigating. A fresh launch into an
+existing campaign is rejected even if startup failed; use new output directories
+or move the failed campaign directories aside. Resume from an OC3 bundle only
+when a completed-round checkpoint exists.
+
 The return tags retain OC2's definitions. In occupancy missions these can be
 time-accumulated occupancy, not a final robot count; compare within each mission
 and use the evaluation scripts for the benchmark's final performance metric.

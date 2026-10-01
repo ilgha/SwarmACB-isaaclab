@@ -6,6 +6,7 @@ import importlib
 import io
 import os
 from pathlib import Path
+import signal
 import sys
 import traceback
 import types
@@ -37,6 +38,18 @@ def receive(connection):
     return torch.load(io.BytesIO(connection.recv_bytes()), map_location="cpu", weights_only=False)
 
 
+def log_tail(path, max_bytes=32768, max_lines=100):
+    """Bound diagnostic output without reading an entire training log."""
+    try:
+        with open(path, "rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, stream.tell() - max_bytes))
+            text = stream.read(max_bytes).decode("utf-8", errors="replace")
+        return "\n".join(text.splitlines()[-max_lines:]) or "(worker log is empty)"
+    except OSError as error:
+        return f"(worker log unavailable: {error})"
+
+
 def worker_main(connection, spec, library_state, frozen, device, threads, log_path):
     app = env = trainer = None
     try:
@@ -45,6 +58,9 @@ def worker_main(connection, spec, library_state, frozen, device, threads, log_pa
         os.dup2(log.fileno(), 1)
         os.dup2(log.fileno(), 2)
         sys.stdout = sys.stderr = log
+        import faulthandler
+        faulthandler.enable(file=log, all_threads=True)
+        log.write(f"[OC3] {spec['name']}: worker pid={os.getpid()} starting on {device}\n")
         import argparse
         import random
         import numpy as np
@@ -54,8 +70,10 @@ def worker_main(connection, spec, library_state, frozen, device, threads, log_pa
         from _isaac_launch import apply_windows_kit_defaults
         args = argparse.Namespace(headless=True, device=device, kit_args="")
         apply_windows_kit_defaults(args, "OC3")
+        log.write(f"[OC3] {spec['name']}: launching Isaac AppLauncher\n")
         launcher = AppLauncher(args)
         app = launcher.app
+        log.write(f"[OC3] {spec['name']}: Isaac app ready; registering tasks\n")
         import gymnasium as gym
         sys.path.insert(0, str(ROOT / "source/SwarmACB_isaac"))
         import SwarmACB_isaac.tasks  # noqa: F401
@@ -82,7 +100,9 @@ def worker_main(connection, spec, library_state, frozen, device, threads, log_pa
                 setattr(env_cfg, key, value)
             else:
                 raise ValueError(f"Unknown environment setting {key}")
+        log.write(f"[OC3] {spec['name']}: creating environment {spec['task']}\n")
         env = gym.make(spec["task"], cfg=env_cfg)
+        log.write(f"[OC3] {spec['name']}: environment ready; creating trainer\n")
         trainer = training.LearnedOptionCriticTrainer(env, cfg)
         if trainer.num_agents != 20:
             raise ValueError("OC3 benchmark collection expects 20 robots per environment")
@@ -139,6 +159,7 @@ class Worker:
     def __init__(self, context, spec, library_state, frozen, device, threads, timeout):
         self.name = spec["name"]
         self.timeout = timeout
+        self.pending_command = "initialization"
         self.log_path = str(Path(spec["trainer"]["log_dir"]) / "worker.log")
         self.connection, child = context.Pipe()
         self.process = context.Process(
@@ -150,24 +171,49 @@ class Worker:
         child.close()
 
     def send(self, command, **kwargs):
-        send(self.connection, {"command": command, **kwargs})
+        self.pending_command = command
+        try:
+            send(self.connection, {"command": command, **kwargs})
+        except (EOFError, OSError) as error:
+            raise RuntimeError(self.failure_details("connection failed", wait=True)) from error
+
+    def failure_details(self, reason, wait=False):
+        # EOF can arrive just before the OS makes the exit status available.
+        if wait:
+            self.process.join(timeout=1)
+        code = self.process.exitcode
+        status = "not available (process may still be exiting)" if code is None else str(code)
+        if os.name == "posix" and code is not None and code < 0:
+            try:
+                status += f" ({signal.Signals(-code).name})"
+            except ValueError:
+                pass
+        return (
+            f"{self.name} worker {reason} during {self.pending_command}; "
+            f"pid={self.process.pid}, exitcode={status}\n"
+            f"Worker log: {self.log_path}\n"
+            f"--- last worker log lines ---\n{log_tail(self.log_path)}\n"
+            "--- end worker log ---"
+        )
 
     def receive(self):
-        if not self.connection.poll(self.timeout):
-            raise TimeoutError(f"{self.name} worker timeout; see {self.log_path}")
         try:
+            if not self.connection.poll(self.timeout):
+                raise TimeoutError(self.failure_details("timed out"))
             reply = receive(self.connection)
+        except TimeoutError:
+            raise
         except (EOFError, OSError) as error:
-            raise RuntimeError(f"{self.name} worker exited; see {self.log_path}") from error
+            raise RuntimeError(self.failure_details("connection closed", wait=True)) from error
         if "error" in reply:
-            raise RuntimeError(f"{self.name} worker failed:\n{reply['error']}")
+            raise RuntimeError(f"{self.failure_details('failed')}\n{reply['error']}")
         return reply.get("result", reply)
 
     def close(self):
         try:
             if self.process.is_alive():
                 self.send("close")
-        except (OSError, EOFError):
+        except (OSError, EOFError, RuntimeError):
             pass
         self.process.join(15)
         if self.process.is_alive():
